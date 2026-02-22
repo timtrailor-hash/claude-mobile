@@ -726,12 +726,13 @@ body {
     }
 
     function loadStatus() {
-        fetch('/printer-status').then(function(r) { return r.json(); }).then(function(data) {
+        fetch('/printer-status', {cache: 'no-store'}).then(function(r) { return r.json(); }).then(function(data) {
             var now = new Date();
             lastUpdate = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
             var html = '<div class="refresh-bar">';
             html += '<span>Updated: ' + lastUpdate + '</span>';
             html += '<button onclick="window.refreshPrinters()">Refresh</button>';
+            html += ' <button onclick="window.hardRefresh()" style="font-size:10px;opacity:0.7;">Reload App</button>';
             html += '</div>';
             html += renderPrinterCard(data.sv08, 'Sovol SV08 Max', '#88f', 'sovol_camera.jpg', 'sovol_thumbnail.png');
             html += renderPrinterCard(data.a1, 'Bambu A1', '#52b788', 'a1_camera.jpg', '');
@@ -743,6 +744,7 @@ body {
 
     function refreshPrinters() { loadStatus(); }
     window.refreshPrinters = refreshPrinters;
+    window.hardRefresh = function() { window.location.reload(true); };
 
     function startAutoRefresh() {
         if (autoTimer) clearInterval(autoTimer);
