@@ -663,8 +663,23 @@ body {
             h += '<div class="progress-wrap">';
             h += '<div class="progress-label"><span>Progress</span><span style="color:' + accent + ';font-weight:600;">' + (typeof prog === 'number' && prog % 1 !== 0 ? prog.toFixed(1) : prog) + '%</span></div>';
             h += '<div class="progress-bar"><div class="progress-fill" style="background:linear-gradient(90deg,#2d6a4f,' + accent + ');width:' + prog + '%;"></div></div>';
-            if (p.layer && p.total_layers) {
-                h += '<div style="font-size:10px;color:#888;margin-top:2px;">Layer ' + p.layer + ' / ' + p.total_layers + '</div>';
+            if (p.current_layer && p.total_layers) {
+                h += '<div style="font-size:10px;color:#888;margin-top:2px;">Layer ' + p.current_layer + ' / ' + p.total_layers + ' (' + (p.layer_progress || 0) + '%)</div>';
+            }
+            h += '</div>';
+        }
+
+        // Speed analysis (SV08)
+        if (p.speed_factor && p.speed_factor > 1.0) {
+            var spd_color = p.speed_warning ? '#e55' : '#4a7';
+            h += '<div style="margin:6px 0;padding:6px 8px;background:#1a1a2e;border-radius:8px;border-left:3px solid ' + spd_color + ';">';
+            h += '<div style="font-size:11px;color:#888;">SPEED</div>';
+            h += '<div style="font-size:13px;color:#ddd;">Set: <b>' + Math.round(p.speed_factor * 100) + '%</b>';
+            if (p.effective_speed) h += ' &middot; Effective: <b style="color:' + spd_color + ';">' + p.effective_speed + 'x</b>';
+            if (p.max_useful_pct) h += ' &middot; Max useful: <b>' + p.max_useful_pct + '%</b>';
+            h += '</div>';
+            if (p.speed_warning) {
+                h += '<div style="font-size:11px;color:#e55;margin-top:3px;">' + esc(p.speed_warning) + '</div>';
             }
             h += '</div>';
         }
@@ -1096,13 +1111,15 @@ def printer_status():
 
     # --- SV08 via Moonraker ---
     try:
-        url = 'http://192.168.87.38:7125/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan'
+        url = 'http://192.168.87.38:7125/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report'
         with urllib.request.urlopen(url, timeout=4) as r:
             data = json.loads(r.read())['result']['status']
         ps = data.get('print_stats', {})
         ds = data.get('display_status', {})
         bed = data.get('heater_bed', {})
         ext = data.get('extruder', {})
+        gm = data.get('gcode_move', {})
+        mr = data.get('motion_report', {})
 
         sv = {
             'state': (ps.get('state', 'unknown') or 'unknown').capitalize(),
@@ -1114,7 +1131,16 @@ def printer_status():
             'nozzle_target': round(ext.get('target', 0), 1),
             'bed_temp': round(bed.get('temperature', 0), 1),
             'bed_target': round(bed.get('target', 0), 1),
+            'speed_factor': gm.get('speed_factor', 1.0),
+            'live_velocity': round(mr.get('live_velocity', 0), 1),
         }
+
+        # Layer progress
+        info = ps.get('info', {})
+        sv['current_layer'] = info.get('current_layer', 0)
+        sv['total_layers'] = info.get('total_layer', 0)
+        if sv['total_layers'] > 0:
+            sv['layer_progress'] = round(sv['current_layer'] / sv['total_layers'] * 100, 1)
 
         # Metadata for current file
         if sv['filename']:
@@ -1173,6 +1199,19 @@ def printer_status():
             eta = datetime.now() + timedelta(seconds=remaining)
             sv['remaining_str'] = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
             sv['eta_str'] = eta.strftime('%a %d %b %H:%M')
+
+        # Effective speed analysis
+        est = sv.get('estimated_time', 0)
+        prog = sv.get('progress', 0)
+        spd = sv.get('speed_factor', 1.0)
+        if est > 0 and dur > 0 and prog > 1:
+            effective = (est * (prog / 100)) / dur
+            sv['effective_speed'] = round(effective, 2)
+            sv['speed_efficiency'] = round((effective / spd) * 100) if spd > 0 else 0
+            max_useful = min(spd, effective * 1.1)
+            sv['max_useful_pct'] = round(max_useful * 100)
+            if spd > 1.2 and effective < spd * 0.6:
+                sv['speed_warning'] = f"Speed set to {int(spd * 100)}% but only achieving {effective:.1f}x — max useful: {sv['max_useful_pct']}%"
 
         # Filament calculations
         fil_used_m = sv.get('filament_used_mm', 0) / 1000
