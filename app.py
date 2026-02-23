@@ -463,6 +463,25 @@ body {
         if (currentAbortController) currentAbortController.abort();
         try { fetch('/cancel', {method: 'POST'}); } catch(e) {}
         addMsg('msg system', '<span style="color:#c9a96e;">Cancelled</span>');
+        // Force reset — Safari may not fire .finally() after abort
+        setTimeout(finishSend, 300);
+    }
+
+    var staleTimer = null;
+    function finishSend() {
+        if (!sending) return;
+        sending = false;
+        stopWorkingIndicator();
+        currentAbortController = null;
+        setButtonMode('send');
+        inputEl.focus();
+        if (staleTimer) { clearInterval(staleTimer); staleTimer = null; }
+        if (messageQueue.length > 0) {
+            var next = messageQueue.shift();
+            var tag = next.div && next.div.querySelector('.queue-tag');
+            if (tag) tag.remove();
+            setTimeout(function() { sendMessage(next.text, next.images, true); }, 300);
+        }
     }
 
     function sendMessage(text, images, fromQueue) {
@@ -470,6 +489,13 @@ body {
         wasCancelled = false;
         setButtonMode('cancel');
         startWorkingIndicator();
+        // Safety: if no activity for 30s after stream ends, recover from stuck state
+        if (staleTimer) clearInterval(staleTimer);
+        staleTimer = setInterval(function() {
+            if (!sending) { clearInterval(staleTimer); staleTimer = null; return; }
+            var idle = Date.now() - lastActivityTime;
+            if (idle > 30000) { finishSend(); }
+        }, 5000);
 
         if (!fromQueue) {
             var displayText = text;
@@ -527,6 +553,9 @@ body {
                                 scrollToBottom();
                             } else if (data.type === 'cost') {
                                 addMsg('cost', data.content);
+                                // Cost is always the final event — force cleanup in case
+                                // Safari doesn't close the stream properly
+                                setTimeout(finishSend, 500);
                             } else if (data.type === 'error') {
                                 addMsg('msg system', '<span style="color:#e55">' + escapeHtml(data.content) + '</span>');
                             }
@@ -541,17 +570,7 @@ body {
                 addMsg('msg system', '<span style="color:#e55">Connection error</span>');
             }
         }).finally(function() {
-            sending = false;
-            stopWorkingIndicator();
-            currentAbortController = null;
-            setButtonMode('send');
-            inputEl.focus();
-            if (messageQueue.length > 0) {
-                var next = messageQueue.shift();
-                var tag = next.div && next.div.querySelector('.queue-tag');
-                if (tag) tag.remove();
-                setTimeout(function() { sendMessage(next.text, next.images, true); }, 300);
-            }
+            finishSend();
         });
     }
 
