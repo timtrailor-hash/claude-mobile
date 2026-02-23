@@ -1460,7 +1460,7 @@ def printer_status():
                         for cl in cal:
                             if cl['layer'] == cur_layer:
                                 sv['layer_alpha'] = cl['calibrated_alpha']
-                                sv['layer_optimal_speed'] = cl['optimal_speed_pct']
+                                sv['layer_optimal_speed'] = min(cl['optimal_speed_pct'], 200)
                                 break
 
                         # Profile-based ETA (calibrated) — promote as primary
