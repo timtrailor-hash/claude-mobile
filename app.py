@@ -1075,8 +1075,9 @@ def chat():
             sid = client_session_id or current_session_id
             cmd.extend(['--resume', sid])
 
-        # Send immediate keepalive
-        yield ": keepalive\n\n"
+        # Send 2KB padding to prime Safari's ReadableStream buffer.
+        # iOS Safari won't start delivering chunks until ~1KB is received.
+        yield ": " + "x" * 2048 + "\n\n"
 
         try:
             proc = subprocess.Popen(
@@ -1111,14 +1112,15 @@ def chat():
                             try:
                                 event = json.loads(line)
                                 for sse in process_event(event):
-                                    yield sse
+                                    # Pad SSE events to defeat Safari buffering
+                                    yield sse + ": " + "x" * 256 + "\n\n"
                             except json.JSONDecodeError:
                                 pass
                     else:
-                        yield ": keepalive\n\n"
+                        yield ": " + "x" * 256 + "\n\n"
                         time.sleep(0.5)
                 except (BlockingIOError, OSError):
-                    yield ": keepalive\n\n"
+                    yield ": " + "x" * 256 + "\n\n"
                     time.sleep(0.5)
 
             # Read remaining output
