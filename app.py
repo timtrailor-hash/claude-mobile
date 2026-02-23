@@ -518,6 +518,8 @@ body {
                             } else if (data.type === 'tool') {
                                 hadToolOutput = true;
                                 touchWorkingIndicator(data.content);
+                            } else if (data.type === 'activity') {
+                                touchWorkingIndicator();
                             } else if (data.type === 'text') {
                                 if (!assistantDiv) assistantDiv = addMsg('msg assistant', '');
                                 fullText += data.content;
@@ -637,6 +639,106 @@ body {
         return '#888';
     }
 
+    window.toggleAutoSpeed = function(enabled) {
+        fetch('/printer-auto-speed', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: enabled})
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.ok) loadStatus();
+        });
+    };
+
+    function renderSpeedGraph(graph, currentLayer, currentPct) {
+        var W = 280, H = 100, PAD_L = 30, PAD_R = 8, PAD_T = 14, PAD_B = 20;
+        var gW = W - PAD_L - PAD_R;
+        var gH = H - PAD_T - PAD_B;
+        var n = graph.length;
+        if (n < 2) return '';
+
+        // Find y range
+        var minY = 200, maxY = 50;
+        for (var i = 0; i < n; i++) {
+            var v = graph[i].optimal_pct;
+            if (v < minY) minY = v;
+            if (v > maxY) maxY = v;
+        }
+        minY = Math.max(50, Math.floor(minY / 10) * 10 - 10);
+        maxY = Math.ceil(maxY / 10) * 10 + 10;
+        var yRange = maxY - minY || 1;
+
+        function xPos(idx) { return PAD_L + (idx / (n - 1)) * gW; }
+        function yPos(val) { return PAD_T + gH - ((val - minY) / yRange) * gH; }
+
+        var svg = '<div style="margin:6px 0;padding:6px 8px;background:#1a1a2e;border-radius:8px;">';
+        svg += '<div style="font-size:10px;color:#888;margin-bottom:4px;">SPEED PROFILE (optimal % per layer)</div>';
+        svg += '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" style="display:block;">';
+
+        // Grid lines
+        var gridSteps = [minY, Math.round(minY + yRange * 0.33), Math.round(minY + yRange * 0.66), maxY];
+        for (var g = 0; g < gridSteps.length; g++) {
+            var gy = yPos(gridSteps[g]);
+            svg += '<line x1="' + PAD_L + '" y1="' + gy + '" x2="' + (W - PAD_R) + '" y2="' + gy + '" stroke="#333" stroke-width="0.5"/>';
+            svg += '<text x="' + (PAD_L - 3) + '" y="' + (gy + 3) + '" fill="#666" font-size="8" text-anchor="end">' + gridSteps[g] + '</text>';
+        }
+
+        // 100% reference line
+        if (minY <= 100 && maxY >= 100) {
+            var y100 = yPos(100);
+            svg += '<line x1="' + PAD_L + '" y1="' + y100 + '" x2="' + (W - PAD_R) + '" y2="' + y100 + '" stroke="#555" stroke-width="0.5" stroke-dasharray="3,3"/>';
+        }
+
+        // Current layer vertical line
+        var curIdx = 0;
+        for (var i = 0; i < n; i++) {
+            if (graph[i].layer <= currentLayer) curIdx = i;
+        }
+        var cx = xPos(curIdx);
+        svg += '<line x1="' + cx + '" y1="' + PAD_T + '" x2="' + cx + '" y2="' + (H - PAD_B) + '" stroke="#88f" stroke-width="1" stroke-dasharray="2,2"/>';
+
+        // Past layers path (solid green)
+        var pastPath = '';
+        var futurePath = '';
+        for (var i = 0; i < n; i++) {
+            var px = xPos(i);
+            var py = yPos(graph[i].optimal_pct);
+            if (i <= curIdx) {
+                pastPath += (pastPath ? 'L' : 'M') + px.toFixed(1) + ',' + py.toFixed(1);
+            }
+            if (i >= curIdx) {
+                futurePath += (futurePath ? 'L' : 'M') + px.toFixed(1) + ',' + py.toFixed(1);
+            }
+        }
+        if (pastPath) svg += '<path d="' + pastPath + '" fill="none" stroke="#4a7" stroke-width="1.5"/>';
+        if (futurePath) svg += '<path d="' + futurePath + '" fill="none" stroke="#4a7" stroke-width="1" stroke-dasharray="3,2" opacity="0.6"/>';
+
+        // Current position dot
+        var cy = yPos(graph[curIdx] ? graph[curIdx].optimal_pct : 100);
+        svg += '<circle cx="' + cx + '" cy="' + cy + '" r="3" fill="#88f" stroke="#fff" stroke-width="0.5"/>';
+
+        // Actual current speed dot (if different)
+        if (currentPct) {
+            var ay = yPos(currentPct);
+            svg += '<circle cx="' + cx + '" cy="' + ay + '" r="2.5" fill="#c9a96e" stroke="#fff" stroke-width="0.5"/>';
+        }
+
+        // X-axis labels
+        var xLabels = [0, Math.round(n * 0.25), Math.round(n * 0.5), Math.round(n * 0.75), n - 1];
+        for (var i = 0; i < xLabels.length; i++) {
+            var li = xLabels[i];
+            if (li >= n) li = n - 1;
+            svg += '<text x="' + xPos(li) + '" y="' + (H - 4) + '" fill="#666" font-size="7" text-anchor="middle">' + graph[li].layer + '</text>';
+        }
+
+        svg += '</svg>';
+        svg += '<div style="font-size:9px;color:#666;display:flex;gap:10px;margin-top:2px;">';
+        svg += '<span><span style="color:#4a7;">&#9644;</span> Optimal</span>';
+        svg += '<span><span style="color:#88f;">&#9679;</span> Current layer</span>';
+        svg += '<span><span style="color:#c9a96e;">&#9679;</span> Actual speed</span>';
+        svg += '</div></div>';
+        return svg;
+    }
+
     function renderPrinterCard(p, name, accent, camImg, thumbImg) {
         var h = '<div class="printer-card">';
         h += '<div class="card-header">';
@@ -687,19 +789,44 @@ body {
             h += '</div>';
         }
 
-        // Speed analysis (SV08)
-        if (p.speed_factor && p.speed_factor > 1.0) {
+        // Speed analysis + auto-speed toggle (SV08)
+        if (p.speed_factor) {
             var spd_color = p.speed_warning ? '#e55' : '#4a7';
             h += '<div style="margin:6px 0;padding:6px 8px;background:#1a1a2e;border-radius:8px;border-left:3px solid ' + spd_color + ';">';
+            h += '<div style="display:flex;justify-content:space-between;align-items:center;">';
             h += '<div style="font-size:11px;color:#888;">SPEED</div>';
-            h += '<div style="font-size:13px;color:#ddd;">Set: <b>' + Math.round(p.speed_factor * 100) + '%</b>';
-            if (p.effective_speed) h += ' &middot; Effective: <b style="color:' + spd_color + ';">' + p.effective_speed + 'x</b>';
-            if (p.max_useful_pct) h += ' &middot; Max useful: <b>' + p.max_useful_pct + '%</b>';
+            // Auto-speed toggle
+            if (p.auto_speed_enabled !== undefined) {
+                var togOn = p.auto_speed_enabled;
+                var togColor = togOn ? '#4a7' : '#666';
+                h += '<div style="display:flex;align-items:center;gap:6px;">';
+                h += '<span style="font-size:10px;color:#888;">Auto</span>';
+                h += '<div onclick="window.toggleAutoSpeed(' + (togOn ? 'false' : 'true') + ')" style="cursor:pointer;width:36px;height:20px;border-radius:10px;background:' + togColor + ';position:relative;transition:background .2s;">';
+                h += '<div style="width:16px;height:16px;border-radius:50%;background:#fff;position:absolute;top:2px;' + (togOn ? 'right:2px;' : 'left:2px;') + 'transition:all .2s;"></div>';
+                h += '</div>';
+                h += '</div>';
+            }
             h += '</div>';
+            h += '<div style="font-size:13px;color:#ddd;margin-top:3px;">Set: <b>' + Math.round(p.speed_factor * 100) + '%</b>';
+            if (p.effective_speed) h += ' &middot; Effective: <b style="color:' + spd_color + ';">' + p.effective_speed + 'x</b>';
+            if (p.layer_optimal_speed) h += ' &middot; Optimal: <b style="color:#88f;">' + p.layer_optimal_speed + '%</b>';
+            else if (p.max_useful_pct) h += ' &middot; Max useful: <b>' + p.max_useful_pct + '%</b>';
+            h += '</div>';
+            if (p.layer_alpha !== undefined) {
+                h += '<div style="font-size:11px;color:#888;margin-top:2px;">\u03b1=' + p.layer_alpha.toFixed(3) + ' (layer ' + (p.current_layer || '?') + ')</div>';
+            }
             if (p.speed_warning) {
                 h += '<div style="font-size:11px;color:#e55;margin-top:3px;">' + esc(p.speed_warning) + '</div>';
             }
+            if (p.speed_adjusted) {
+                h += '<div style="font-size:11px;color:#4a7;margin-top:3px;">Auto-adjusted to ' + p.speed_adjusted_to + '%</div>';
+            }
             h += '</div>';
+        }
+
+        // Speed graph (per-layer optimal speeds)
+        if (p.speed_graph && p.speed_graph.length > 1) {
+            h += renderSpeedGraph(p.speed_graph, p.current_layer || 0, p.current_speed_pct || 100);
         }
 
         // Filament feed warning
@@ -721,7 +848,8 @@ body {
         if (p.eta_str) {
             var conf = p.eta_confidence || '';
             var confDot = conf === 'high' ? ' \u2705' : conf === 'medium' ? ' \u26A0' : conf === 'low' ? ' ~' : '';
-            h += '<span class="lbl">ETA</span><span class="val-good">' + esc(p.eta_str) + confDot + '</span>';
+            var method = (p.eta_method || '').indexOf('profile') >= 0 ? ' <span style="font-size:9px;color:#4a7;">[profile]</span>' : '';
+            h += '<span class="lbl">ETA</span><span class="val-good">' + esc(p.eta_str) + confDot + method + '</span>';
         }
         if (p.filament_used_m) {
             var fil = p.filament_used_m + 'm / ' + p.filament_total_m + 'm';
@@ -1066,8 +1194,28 @@ def process_event(event):
             cost_str = f"${cost:.4f} | {duration/1000:.1f}s | {turns} turn(s)"
             yield f"data: {json.dumps({'type': 'cost', 'content': cost_str})}\n\n"
 
+    elif etype == 'user':
+        # Tool results, permission approvals, synthetic messages — send activity pulse
+        # so frontend knows Claude is still working during long tool sequences
+        msg = event.get('message', {})
+        tool_result = event.get('tool_use_result')
+        if tool_result:
+            # Completed tool — extract name if available
+            yield f"data: {json.dumps({'type': 'activity', 'content': 'tool_result'})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'activity', 'content': 'processing'})}\n\n"
+
+    elif etype == 'system':
+        # Background task notifications, permission mode changes, etc.
+        subtype = event.get('subtype', '')
+        if subtype and subtype != 'init':
+            yield f"data: {json.dumps({'type': 'activity', 'content': subtype})}\n\n"
+
+    elif etype == 'rate_limit_event':
+        # Rate limit info — just keep the connection alive
+        yield f"data: {json.dumps({'type': 'activity', 'content': 'rate_limited'})}\n\n"
+
     else:
-        # Log unhandled event types for debugging
         import sys
         print(f"[UNHANDLED EVENT] type={etype} keys={list(event.keys())}", file=sys.stderr, flush=True)
 
@@ -1250,6 +1398,7 @@ def printer_status():
                 commanded_speed=sv.get('commanded_speed', 0),
                 current_layer=sv.get('current_layer', 0),
                 total_layers=sv.get('total_layers', 0),
+                filename=sv.get('filename', ''),
             )
             if 'error' not in eta_data:
                 sv['remaining_str'] = eta_data['remaining_str']
@@ -1268,6 +1417,120 @@ def printer_status():
                 eta = datetime.now() + timedelta(seconds=remaining)
                 sv['remaining_str'] = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
                 sv['eta_str'] = eta.strftime('%a %d %b %H:%M')
+
+        # ── Gcode profile integration (auto-speed, per-layer data, calibrated ETA) ──
+        try:
+            from gcode_profile import (load_profile, load_auto_speed,
+                                       calibrate_profile, calibrated_eta_remaining,
+                                       get_layer_info, set_printer_speed,
+                                       save_auto_speed)
+            profile = load_profile(sv.get('filename'))
+            auto_cfg = load_auto_speed()
+            sv['auto_speed_enabled'] = auto_cfg.get('enabled', False)
+            sv['auto_speed_mode'] = auto_cfg.get('mode', 'optimal')
+
+            if profile and sv.get('state', '').lower() == 'printing':
+                sv['profile_available'] = True
+                cur_layer = sv.get('current_layer', 0)
+                total_layers_p = sv.get('total_layers', 0)
+                spd = sv.get('speed_factor', 1.0)
+
+                # Get measured alpha from persistence
+                measured_alpha = None
+                alpha_file = '/tmp/printer_status/current_alpha.json'
+                try:
+                    if os.path.exists(alpha_file):
+                        with open(alpha_file) as af:
+                            alpha_data = json.load(af)
+                        stored = alpha_data.get('alpha')
+                        if stored and stored > 0.01:
+                            measured_alpha = stored
+                except Exception:
+                    pass
+
+                # Calibrate profile
+                if measured_alpha and measured_alpha > 0.01 and cur_layer > 2:
+                    cal = calibrate_profile(profile, measured_alpha, cur_layer,
+                                            spd, elapsed_time_s=dur)
+                    if cal:
+                        sv['profile_calibrated'] = True
+
+                        # Current layer info
+                        for cl in cal:
+                            if cl['layer'] == cur_layer:
+                                sv['layer_alpha'] = cl['calibrated_alpha']
+                                sv['layer_optimal_speed'] = cl['optimal_speed_pct']
+                                break
+
+                        # Profile-based ETA (calibrated) — promote as primary
+                        progress_in_layer = 0.5
+                        if total_layers_p > 0 and cur_layer > 0:
+                            progress_in_layer = max(0.1, min(0.9,
+                                (sv.get('progress', 0) / 100 - cur_layer / total_layers_p)
+                                / (1.0 / total_layers_p) if total_layers_p > 0 else 0.5
+                            ))
+                        cal_remaining = calibrated_eta_remaining(
+                            cal, cur_layer, progress_in_layer)
+                        if cal_remaining > 0:
+                            cal_eta = datetime.now() + timedelta(seconds=cal_remaining)
+                            sv['remaining_str'] = f"{int(cal_remaining // 3600)}h {int((cal_remaining % 3600) // 60)}m"
+                            sv['eta_str'] = cal_eta.strftime('%a %d %b %H:%M')
+                            sv['eta_method'] = f"profile(cal,\u03b1={measured_alpha:.2f})"
+                            sv['eta_confidence'] = 'high'
+
+                        # Auto-speed adjustment
+                        if auto_cfg.get('enabled') and cur_layer >= auto_cfg.get('skip_first_layers', 2):
+                            target_pct = None
+                            for cl in cal:
+                                if cl['layer'] == cur_layer:
+                                    target_pct = cl['optimal_speed_pct']
+                                    break
+                            if target_pct:
+                                if auto_cfg.get('mode') == 'conservative':
+                                    target_pct = max(round(target_pct * 0.95),
+                                                     auto_cfg.get('min_speed_pct', 80))
+                                target_pct = max(auto_cfg.get('min_speed_pct', 80),
+                                                 min(target_pct, auto_cfg.get('max_speed_pct', 200)))
+                                current_pct = round(spd * 100)
+                                last = auto_cfg.get('last_adjustment', {})
+                                if (last.get('layer') != cur_layer and
+                                        abs(target_pct - current_pct) > 5):
+                                    if set_printer_speed(target_pct):
+                                        auto_cfg['last_adjustment'] = {
+                                            'layer': cur_layer, 'speed': target_pct,
+                                            'from_speed': current_pct,
+                                            'timestamp': datetime.now().isoformat()
+                                        }
+                                        save_auto_speed(auto_cfg)
+                                        sv['speed_adjusted'] = True
+                                        sv['speed_adjusted_to'] = target_pct
+
+                # Build speed graph data: per-layer optimal speeds from profile
+                speed_graph = []
+                for l in profile.get('layers', []):
+                    entry = {
+                        'layer': l['layer'],
+                        'optimal_pct': l.get('optimal_speed_pct', 100),
+                        'alpha': round(l.get('alpha', 1.0), 3),
+                    }
+                    if l['layer'] <= cur_layer:
+                        entry['status'] = 'past'
+                    elif l['layer'] == cur_layer:
+                        entry['status'] = 'current'
+                    else:
+                        entry['status'] = 'future'
+                    speed_graph.append(entry)
+
+                # Overlay actual speed adjustments from auto_speed history
+                last_adj = auto_cfg.get('last_adjustment', {})
+                if last_adj.get('layer') is not None:
+                    sv['last_speed_layer'] = last_adj['layer']
+                    sv['last_speed_pct'] = last_adj.get('speed', 100)
+
+                sv['speed_graph'] = speed_graph
+                sv['current_speed_pct'] = round(spd * 100)
+        except Exception:
+            pass
 
         # Effective speed analysis
         est = sv.get('estimated_time', 0) or 0
@@ -1449,6 +1712,24 @@ def printer_image(name):
     if not os.path.exists(path):
         return 'Not found', 404
     return send_from_directory(img_dir, name)
+
+
+@app.route('/printer-auto-speed', methods=['POST'])
+def printer_auto_speed():
+    """Toggle auto-speed on/off or set mode."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    try:
+        from gcode_profile import load_auto_speed, save_auto_speed
+        data = request.get_json(force=True) if request.data else {}
+        cfg = load_auto_speed()
+        if 'enabled' in data:
+            cfg['enabled'] = bool(data['enabled'])
+        if 'mode' in data:
+            cfg['mode'] = data['mode'] if data['mode'] in ('optimal', 'conservative') else 'optimal'
+        save_auto_speed(cfg)
+        return jsonify({'ok': True, 'enabled': cfg['enabled'], 'mode': cfg['mode']})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.route('/work-status')
