@@ -656,9 +656,10 @@ body {
         var n = graph.length;
         if (n < 2) return '';
 
-        // Find y range
+        // Cap optimal at 200% and find y range
         var minY = 200, maxY = 50;
         for (var i = 0; i < n; i++) {
+            if (graph[i].optimal_pct > 200) graph[i].optimal_pct = 200;
             var v = graph[i].optimal_pct;
             if (v < minY) minY = v;
             if (v > maxY) maxY = v;
