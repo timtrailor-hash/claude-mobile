@@ -2,6 +2,7 @@
 """Claude Code Mobile — full Claude Code experience in a scrollable mobile web UI."""
 
 import os
+import sys
 import json
 import glob
 import ssl
@@ -281,7 +282,7 @@ body {
 <div class="header">
     <h1>Claude Code</h1>
     <div class="header-buttons">
-        <button onclick="window.location.href='/?t='+Date.now()">&#8635;</button>
+        <button onclick="fetch('/restart',{method:'POST'}).then(()=>setTimeout(()=>window.location.reload(true),2000))">&#8635;</button>
         <button onclick="newSession()">New</button>
     </div>
 </div>
@@ -348,10 +349,12 @@ body {
     var workingDiv = null;
     var workingStart = 0;
     var lastActivityTime = 0;
+    var lastToolLabel = '';
 
     function startWorkingIndicator() {
         workingStart = Date.now();
         lastActivityTime = workingStart;
+        lastToolLabel = '';
         workingDiv = addMsg('msg system', '<span style="color:#c9a96e;">Working...</span>');
         workingTimer = setInterval(function() {
             if (!workingDiv) return;
@@ -360,19 +363,30 @@ body {
             var mins = Math.floor(elapsed / 60);
             var secs = elapsed % 60;
             var timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
-            var status = idle > 15 ? 'Still working' : 'Working';
-            workingDiv.innerHTML = '<span style="color:#c9a96e;">' + status + '... ' + timeStr + '</span>';
+            var dots = ['', '.', '..', '...'][Math.floor(Date.now() / 600) % 4];
+            var label = lastToolLabel ? lastToolLabel : (idle > 10 ? 'Still working' : 'Working');
+            workingDiv.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(label) + dots + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
             scrollToBottom();
-        }, 10000);
+        }, 2000);
     }
 
-    function touchWorkingIndicator() {
+    function touchWorkingIndicator(toolLabel) {
         lastActivityTime = Date.now();
+        if (toolLabel) lastToolLabel = toolLabel;
+        if (workingDiv && toolLabel) {
+            var elapsed = Math.floor((Date.now() - workingStart) / 1000);
+            var mins = Math.floor(elapsed / 60);
+            var secs = elapsed % 60;
+            var timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+            workingDiv.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(toolLabel) + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
+            scrollToBottom();
+        }
     }
 
     function stopWorkingIndicator() {
         if (workingTimer) { clearInterval(workingTimer); workingTimer = null; }
         if (workingDiv) { workingDiv.remove(); workingDiv = null; }
+        lastToolLabel = '';
     }
 
     function autoResize(el) {
@@ -429,8 +443,8 @@ body {
         var text = inputEl.value.trim();
         if (!text) return;
         if (sending) {
-            messageQueue.push({text: text, images: pendingImages.slice()});
-            addMsg('msg user', escapeHtml(text) + ' <span style="color:#c9a96e;font-size:11px;">[queued]</span>');
+            var queuedDiv = addMsg('msg user', escapeHtml(text) + ' <span class="queue-tag" style="color:#c9a96e;font-size:11px;">[queued]</span>');
+            messageQueue.push({text: text, images: pendingImages.slice(), div: queuedDiv});
             inputEl.value = '';
             autoResize(inputEl);
             clearAllImages();
@@ -451,15 +465,17 @@ body {
         addMsg('msg system', '<span style="color:#c9a96e;">Cancelled</span>');
     }
 
-    function sendMessage(text, images) {
+    function sendMessage(text, images, fromQueue) {
         sending = true;
         wasCancelled = false;
         setButtonMode('cancel');
         startWorkingIndicator();
 
-        var displayText = text;
-        if (images && images.length) displayText += ' [' + images.length + ' image(s)]';
-        addMsg('msg user', escapeHtml(displayText));
+        if (!fromQueue) {
+            var displayText = text;
+            if (images && images.length) displayText += ' [' + images.length + ' image(s)]';
+            addMsg('msg user', escapeHtml(displayText));
+        }
 
         var assistantDiv = null;
         var fullText = '';
@@ -492,8 +508,8 @@ body {
                         try {
                             var data = JSON.parse(lines[i].slice(6));
                             gotData = true;
-                            touchWorkingIndicator();
                             if (data.type === 'init') {
+                                touchWorkingIndicator();
                                 sessionId = data.session_id;
                                 if (!sessionInited) {
                                     sessionInited = true;
@@ -501,7 +517,7 @@ body {
                                 }
                             } else if (data.type === 'tool') {
                                 hadToolOutput = true;
-                                addMsg('tool-indicator', escapeHtml(data.content));
+                                touchWorkingIndicator(data.content);
                             } else if (data.type === 'text') {
                                 if (!assistantDiv) assistantDiv = addMsg('msg assistant', '');
                                 fullText += data.content;
@@ -530,7 +546,9 @@ body {
             inputEl.focus();
             if (messageQueue.length > 0) {
                 var next = messageQueue.shift();
-                setTimeout(function() { sendMessage(next.text, next.images); }, 300);
+                var tag = next.div && next.div.querySelector('.queue-tag');
+                if (tag) tag.remove();
+                setTimeout(function() { sendMessage(next.text, next.images, true); }, 300);
             }
         });
     }
@@ -684,6 +702,13 @@ body {
             h += '</div>';
         }
 
+        // Filament feed warning
+        if (p.filament_warning) {
+            h += '<div style="background:#e5522;border:1px solid #e55;border-radius:8px;padding:8px 12px;margin:8px 0;">';
+            h += '<div style="font-size:13px;color:#e55;font-weight:600;">⚠ ' + esc(p.filament_warning) + '</div>';
+            h += '</div>';
+        }
+
         // Details grid
         h += '<div class="detail-grid">';
         if (p.filament_name || p.filament_type) {
@@ -693,7 +718,11 @@ body {
         if (p.start_str) h += '<span class="lbl">Started</span><span>' + esc(p.start_str) + '</span>';
         if (p.duration_str) h += '<span class="lbl">Duration</span><span>' + esc(p.duration_str) + '</span>';
         if (p.remaining_str) h += '<span class="lbl">Remaining</span><span class="val-warn">' + esc(p.remaining_str) + '</span>';
-        if (p.eta_str) h += '<span class="lbl">ETA</span><span class="val-good">' + esc(p.eta_str) + '</span>';
+        if (p.eta_str) {
+            var conf = p.eta_confidence || '';
+            var confDot = conf === 'high' ? ' \u2705' : conf === 'medium' ? ' \u26A0' : conf === 'low' ? ' ~' : '';
+            h += '<span class="lbl">ETA</span><span class="val-good">' + esc(p.eta_str) + confDot + '</span>';
+        }
         if (p.filament_used_m) {
             var fil = p.filament_used_m + 'm / ' + p.filament_total_m + 'm';
             if (p.filament_used_g) fil += ' (' + p.filament_used_g + 'g / ' + p.filament_total_g + 'g)';
@@ -731,8 +760,6 @@ body {
             lastUpdate = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
             var html = '<div class="refresh-bar">';
             html += '<span>Updated: ' + lastUpdate + '</span>';
-            html += '<button onclick="window.refreshPrinters()">Refresh</button>';
-            html += ' <button onclick="window.hardRefresh()" style="font-size:10px;opacity:0.7;">Reload App</button>';
             html += '</div>';
             html += renderPrinterCard(data.sv08, 'Sovol SV08 Max', '#88f', 'sovol_camera.jpg', 'sovol_thumbnail.png');
             html += renderPrinterCard(data.a1, 'Bambu A1', '#52b788', 'a1_camera.jpg', '');
@@ -1111,9 +1138,20 @@ def printer_status():
 
     result = {'sv08': {}, 'a1': {}}
 
-    # --- SV08 via Moonraker ---
+    # --- SV08 via Moonraker (Ethernet .52, fallback WiFi .38) ---
+    sv08_base = None
+    for sv08_ip in ['192.168.87.52', '192.168.87.38']:
+        try:
+            with urllib.request.urlopen(f'http://{sv08_ip}:7125/printer/info', timeout=3) as r:
+                json.loads(r.read())
+            sv08_base = f'http://{sv08_ip}:7125'
+            break
+        except Exception:
+            continue
     try:
-        url = 'http://192.168.87.38:7125/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report'
+        if not sv08_base:
+            raise ConnectionError('Could not connect')
+        url = f'{sv08_base}/printer/objects/query?print_stats&display_status&heater_bed&extruder&fan&gcode_move&motion_report'
         with urllib.request.urlopen(url, timeout=4) as r:
             data = json.loads(r.read())['result']['status']
         ps = data.get('print_stats', {})
@@ -1127,20 +1165,20 @@ def printer_status():
             'state': (ps.get('state', 'unknown') or 'unknown').capitalize(),
             'filename': ps.get('filename', ''),
             'progress': round((ds.get('progress', 0) or 0) * 100, 1),
-            'print_duration': ps.get('print_duration', 0),
-            'filament_used_mm': ps.get('filament_used', 0),
-            'nozzle_temp': round(ext.get('temperature', 0), 1),
-            'nozzle_target': round(ext.get('target', 0), 1),
-            'bed_temp': round(bed.get('temperature', 0), 1),
-            'bed_target': round(bed.get('target', 0), 1),
-            'speed_factor': gm.get('speed_factor', 1.0),
-            'live_velocity': round(mr.get('live_velocity', 0), 1),
+            'print_duration': ps.get('print_duration', 0) or 0,
+            'filament_used_mm': ps.get('filament_used', 0) or 0,
+            'nozzle_temp': round(ext.get('temperature', 0) or 0, 1),
+            'nozzle_target': round(ext.get('target', 0) or 0, 1),
+            'bed_temp': round(bed.get('temperature', 0) or 0, 1),
+            'bed_target': round(bed.get('target', 0) or 0, 1),
+            'speed_factor': gm.get('speed_factor', 1.0) or 1.0,
+            'live_velocity': round(mr.get('live_velocity', 0) or 0, 1),
         }
 
         # Layer progress
         info = ps.get('info', {})
-        sv['current_layer'] = info.get('current_layer', 0)
-        sv['total_layers'] = info.get('total_layer', 0)
+        sv['current_layer'] = info.get('current_layer', 0) or 0
+        sv['total_layers'] = info.get('total_layer', 0) or 0
         if sv['total_layers'] > 0:
             sv['layer_progress'] = round(sv['current_layer'] / sv['total_layers'] * 100, 1)
 
@@ -1148,7 +1186,7 @@ def printer_status():
         if sv['filename']:
             enc = urlquote(sv['filename'])
             try:
-                with urllib.request.urlopen(f'http://192.168.87.38:7125/server/files/metadata?filename={enc}', timeout=4) as r:
+                with urllib.request.urlopen(f'{sv08_base}/server/files/metadata?filename={enc}', timeout=4) as r:
                     meta = json.loads(r.read())['result']
                 sv['estimated_time'] = meta.get('estimated_time', 0)
                 sv['filament_total_mm'] = meta.get('filament_total', 0)
@@ -1166,47 +1204,76 @@ def printer_status():
                     biggest = max(thumbs, key=lambda t: t.get('width', 0) * t.get('height', 0))
                     tp = biggest.get('relative_path', '')
                     if tp:
-                        thumb_url = f'http://192.168.87.38:7125/server/files/gcodes/{urlquote(tp)}'
+                        thumb_url = f'{sv08_base}/server/files/gcodes/{urlquote(tp)}'
                         thumb_path = os.path.join(PRINTER_IMG_DIR, 'sovol_thumbnail.png')
-                        urllib.request.urlretrieve(thumb_url, thumb_path)
+                        with urllib.request.urlopen(thumb_url, timeout=4) as thumb_r:
+                            with open(thumb_path, 'wb') as f:
+                                f.write(thumb_r.read())
                         sv['has_thumbnail'] = True
             except Exception:
                 pass
 
             # Print start time from history
             try:
-                with urllib.request.urlopen('http://192.168.87.38:7125/server/history/list?limit=1&order=desc', timeout=3) as r:
+                with urllib.request.urlopen(f'{sv08_base}/server/history/list?limit=1&order=desc', timeout=3) as r:
                     hist = json.loads(r.read())['result']
                 if hist.get('jobs'):
                     sv['start_time'] = hist['jobs'][0].get('start_time', 0)
             except Exception:
                 pass
 
-        # Camera snapshot
+        # Camera snapshot (with timeout to avoid hanging)
         try:
             cam_path = os.path.join(PRINTER_IMG_DIR, 'sovol_camera.jpg')
-            urllib.request.urlretrieve('http://192.168.87.38/webcam/?action=snapshot', cam_path)
+            with urllib.request.urlopen('http://192.168.87.52:8081/webcam/?action=snapshot', timeout=5) as cam_r:
+                with open(cam_path, 'wb') as f:
+                    f.write(cam_r.read())
             sv['has_camera'] = True
         except Exception:
             pass
 
-        # Calculate times
-        dur = sv.get('print_duration', 0)
+        # Calculate times — smart ETA
+        dur = sv.get('print_duration', 0) or 0
         sv['duration_str'] = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
         if sv.get('start_time'):
             sv['start_str'] = datetime.fromtimestamp(sv['start_time']).strftime('%a %d %b %H:%M')
-        if sv['progress'] > 0:
-            actual_total = dur / (sv['progress'] / 100)
-            remaining = actual_total - dur
-            eta = datetime.now() + timedelta(seconds=remaining)
-            sv['remaining_str'] = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
-            sv['eta_str'] = eta.strftime('%a %d %b %H:%M')
+
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+            from print_eta import calculate_eta, log_snapshot
+            eta_data = calculate_eta(
+                progress_pct=sv.get('progress', 0),
+                print_duration_s=dur,
+                estimated_time_s=sv.get('estimated_time', 0),
+                speed_factor=sv.get('speed_factor', 1.0),
+                live_velocity=sv.get('live_velocity', 0),
+                commanded_speed=sv.get('commanded_speed', 0),
+                current_layer=sv.get('current_layer', 0),
+                total_layers=sv.get('total_layers', 0),
+            )
+            if 'error' not in eta_data:
+                sv['remaining_str'] = eta_data['remaining_str']
+                sv['eta_str'] = eta_data['eta_str']
+                sv['eta_confidence'] = eta_data['confidence']
+                sv['eta_method'] = eta_data['method']
+                if 'effective_speed' in eta_data:
+                    sv['effective_speed'] = eta_data['effective_speed']
+            if sv.get('state', '').lower() == 'printing':
+                log_snapshot(sv)
+        except Exception:
+            # Fallback to naive calculation
+            if sv.get('progress', 0) > 0:
+                actual_total = dur / (sv['progress'] / 100)
+                remaining = actual_total - dur
+                eta = datetime.now() + timedelta(seconds=remaining)
+                sv['remaining_str'] = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+                sv['eta_str'] = eta.strftime('%a %d %b %H:%M')
 
         # Effective speed analysis
-        est = sv.get('estimated_time', 0)
-        prog = sv.get('progress', 0)
-        spd = sv.get('speed_factor', 1.0)
-        if est > 0 and dur > 0 and prog > 1:
+        est = sv.get('estimated_time', 0) or 0
+        prog = sv.get('progress', 0) or 0
+        spd = sv.get('speed_factor', 1.0) or 1.0
+        if est > 0 and dur > 0 and prog > 1 and 'effective_speed' not in sv:
             effective = (est * (prog / 100)) / dur
             sv['effective_speed'] = round(effective, 2)
             sv['speed_efficiency'] = round((effective / spd) * 100) if spd > 0 else 0
@@ -1216,8 +1283,8 @@ def printer_status():
                 sv['speed_warning'] = f"Speed set to {int(spd * 100)}% but only achieving {effective:.1f}x — max useful: {sv['max_useful_pct']}%"
 
         # Filament calculations
-        fil_used_m = sv.get('filament_used_mm', 0) / 1000
-        fil_total_m = sv.get('filament_total_mm', 0) / 1000
+        fil_used_m = (sv.get('filament_used_mm', 0) or 0) / 1000
+        fil_total_m = (sv.get('filament_total_mm', 0) or 0) / 1000
         if fil_total_m > 0:
             sv['filament_used_m'] = round(fil_used_m, 1)
             sv['filament_total_m'] = round(fil_total_m, 1)
@@ -1226,6 +1293,17 @@ def printer_status():
             if wt:
                 sv['filament_used_g'] = round(wt * (fil_used_m / fil_total_m))
                 sv['filament_total_g'] = round(wt)
+
+        # Filament feed monitor — detect stalled extrusion
+        if fil_total_m > 0 and sv.get('progress', 0) > 5 and sv.get('state', '').lower() == 'printing':
+            expected_m = fil_total_m * (sv['progress'] / 100)
+            if expected_m > 0:
+                feed_ratio = fil_used_m / expected_m
+                sv['feed_ratio'] = round(feed_ratio, 2)
+                if feed_ratio < 0.5:
+                    sv['filament_warning'] = (
+                        f"Filament feed issue! Used {fil_used_m:.1f}m but expected ~{expected_m:.1f}m. Check filament path."
+                    )
 
         # Extract model name
         fn = sv.get('filename', '')
@@ -1676,7 +1754,24 @@ def proxy_governors_ws(ws):
         pass
 
 
+@app.route('/restart', methods=['POST'])
+def restart_server():
+    """Restart the Flask server — shut down cleanly before re-exec to avoid port conflict."""
+    import threading, signal
+    def _restart():
+        import time; time.sleep(0.3)
+        # Shut down the Werkzeug server so port 8080 is released
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=_restart, daemon=True).start()
+    return 'Restarting...', 200
+
+
 if __name__ == '__main__':
+    import socket
+    from werkzeug.serving import make_server
+
     topic_count = len(glob.glob(os.path.join(TOPICS_DIR, "*.md")))
     print(f"\n  Claude Code Mobile")
     print(f"  Local:     http://localhost:8080")
@@ -1684,4 +1779,10 @@ if __name__ == '__main__':
     print(f"  Memory:    {topic_count} topic files")
     print(f"  Work dir:  {WORK_DIR}")
     print(f"  Features:  Full CLI, streaming, tool visibility, session continuity\n")
-    app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
+
+    server = make_server('0.0.0.0', 8080, app, threaded=True)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
