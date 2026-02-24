@@ -5,3 +5,6 @@ google_token_work.json
 imap_accounts.json
 slack_config.json
 credentials.py
+wrapper.log
+.work_state.json
+__pycache__/
