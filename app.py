@@ -21,7 +21,39 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 sock = Sock(app)
 
-STREAMLIT_URL = 'http://192.168.87.37:8501'
+# --- Request logging to file ---
+import logging as _logging
+_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wrapper.log')
+_fh = _logging.FileHandler(_log_file)
+_fh.setFormatter(_logging.Formatter('%(asctime)s %(message)s', datefmt='%H:%M:%S'))
+_req_log = _logging.getLogger('wrapper_requests')
+_req_log.addHandler(_fh)
+_req_log.setLevel(_logging.INFO)
+
+@app.after_request
+def _log_request(response):
+    if request.path not in ('/', '/favicon.ico') and not request.path.startswith('/static'):
+        _req_log.info(f'{request.method} {request.path} -> {response.status_code} ({request.remote_addr})')
+    return response
+
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    from printer_config import (SOVOL_IP, SOVOL_WIFI_IP, SOVOL_CAMERA_PORT,
+                                MOONRAKER_PORT, BAMBU_IP, BAMBU_SERIAL,
+                                BAMBU_ACCESS_CODE, BAMBU_MQTT_PORT,
+                                STREAMLIT_IP, STREAMLIT_PORT)
+except ImportError:
+    SOVOL_IP = "[REDACTED — see printer_config.example.py]"
+    SOVOL_WIFI_IP = "[REDACTED — see printer_config.example.py]"
+    SOVOL_CAMERA_PORT = 8081
+    MOONRAKER_PORT = 7125
+    BAMBU_IP = "[REDACTED — see printer_config.example.py]"
+    BAMBU_SERIAL = "[REDACTED — see printer_config.example.py]"
+    BAMBU_ACCESS_CODE = "[REDACTED — see printer_config.example.py]"
+    BAMBU_MQTT_PORT = 8883
+    STREAMLIT_IP = "[REDACTED — see printer_config.example.py]"
+    STREAMLIT_PORT = 8501
+STREAMLIT_URL = f'http://{STREAMLIT_IP}:{STREAMLIT_PORT}'
 
 MEMORY_DIR = os.path.expanduser("~/.claude/projects/-Users-timtrailor-Documents-Claude-code/memory")
 TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
@@ -37,6 +69,52 @@ current_session_id = None
 current_proc = None
 current_proc_lock = __import__('threading').Lock()
 
+# Server-side response buffer — survives client disconnects (iOS Safari backgrounding)
+# Stores the last completed response so the client can recover it on reconnect
+last_response = {"text": "", "cost": "", "session_id": None, "seq": 0}
+last_response_lock = threading.Lock()
+
+# --- Restart-resilient work tracking ---
+# State file persists across restarts so the new instance can reattach
+WORK_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.work_state.json')
+
+def _save_work_state(pid, output_file, session_id):
+    """Save active work state to disk for recovery after restart."""
+    import time as _t
+    state = {'pid': pid, 'output_file': output_file,
+             'session_id': session_id or '', 'started': _t.time()}
+    try:
+        with open(WORK_STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def _clear_work_state():
+    """Remove work state file when processing completes."""
+    try:
+        if os.path.exists(WORK_STATE_FILE):
+            os.unlink(WORK_STATE_FILE)
+    except Exception:
+        pass
+
+def _load_work_state():
+    """Load work state and check if the process is still alive."""
+    if not os.path.exists(WORK_STATE_FILE):
+        return None
+    try:
+        with open(WORK_STATE_FILE) as f:
+            state = json.load(f)
+        pid = state.get('pid')
+        if not pid:
+            return None
+        # Check if process is still alive
+        os.kill(pid, 0)
+        return state
+    except (OSError, json.JSONDecodeError, KeyError):
+        # Process dead or bad state file — clean up
+        _clear_work_state()
+        return None
+
 
 CHAT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -45,6 +123,9 @@ CHAT_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Claude Code</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -114,12 +195,28 @@ body {
     background: #1a3a2a; margin: 0 auto; text-align: center;
     font-size: 12px; color: #7a7; padding: 6px 12px;
 }
+#workingBar {
+    display: none; background: #1a2a1a; border-top: 1px solid #2a4a2a;
+    padding: 6px 14px; font-size: 12px; color: #c9a96e;
+    text-align: center; flex-shrink: 0;
+    animation: fadeInBar 0.2s ease;
+}
+@keyframes fadeInBar { from { opacity: 0; } to { opacity: 1; } }
 .tool-indicator {
     margin-bottom: 6px; padding: 5px 12px; font-size: 12px; color: #c9a96e;
     background: #1a1a3a; border-left: 2px solid #c9a96e;
     border-radius: 0 8px 8px 0; max-width: 92%;
     font-family: 'SF Mono', Menlo, monospace;
 }
+.queue-remove {
+    background: #e55 !important; color: #fff !important; border: none !important;
+    border-radius: 50% !important; width: 22px !important; height: 22px !important;
+    font-size: 14px !important; cursor: pointer; vertical-align: middle;
+    margin-left: 4px; padding: 0 !important; line-height: 22px !important;
+    display: inline-block !important;
+}
+.queue-text { cursor: pointer; text-decoration: underline; text-decoration-style: dotted;
+    text-underline-offset: 3px; text-decoration-color: #c9a96e; }
 .input-area {
     padding: 8px 12px; padding-bottom: max(8px, env(safe-area-inset-bottom));
     background: #16213e; border-top: 1px solid #2a2a4a;
@@ -231,9 +328,21 @@ body {
 }
 /* --- Work tab --- */
 .work-dash {
-    flex: 1; overflow-y: auto; padding: 12px;
+    flex: 1; overflow-y: auto; padding: 0;
     -webkit-overflow-scrolling: touch;
+    display: flex; flex-direction: column;
 }
+.work-subtabs {
+    display: flex; padding: 8px 12px 0; gap: 0; flex-shrink: 0;
+    border-bottom: 1px solid #2a2a4a;
+}
+.work-subtab {
+    flex: 1; padding: 8px 0; text-align: center; font-size: 13px; font-weight: 600;
+    color: #666; background: none; border: none; border-bottom: 2px solid transparent;
+    cursor: pointer; transition: color 0.2s, border-color 0.2s;
+}
+.work-subtab.active { color: #c9a96e; border-bottom-color: #c9a96e; }
+.work-subcontent { flex: 1; overflow-y: auto; padding: 12px; -webkit-overflow-scrolling: touch; }
 .work-section { margin-bottom: 16px; }
 .work-section h3 {
     font-size: 13px; color: #c9a96e; text-transform: uppercase;
@@ -243,6 +352,13 @@ body {
 .work-card {
     background: #16213e; border-radius: 10px; padding: 12px;
     margin-bottom: 8px; border: 1px solid #2a2a4a;
+    cursor: pointer; transition: background 0.15s, border-color 0.15s;
+    -webkit-tap-highlight-color: rgba(201,169,110,0.15);
+}
+.work-card:active { background: #1e2d50; border-color: #3a3a5a; }
+.work-card .wc-acct {
+    display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 6px;
+    border-radius: 8px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.3px;
 }
 .work-card .wc-from {
     font-size: 13px; font-weight: 600; color: #e0e0e0; margin-bottom: 2px;
@@ -268,6 +384,41 @@ body {
 }
 .work-card.cal-card .wc-attendees {
     font-size: 11px; color: #666; margin-top: 4px;
+}
+.work-card.slack-card .wc-channel {
+    font-size: 12px; color: #a78bfa; font-weight: 600; margin-bottom: 2px;
+}
+.work-card.slack-card .wc-user {
+    font-size: 13px; font-weight: 600; color: #e0e0e0; margin-bottom: 2px;
+}
+.work-card.slack-card .wc-text {
+    font-size: 13px; color: #ccc; line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.work-card.slack-card .wc-replies {
+    font-size: 11px; color: #52b788; margin-top: 4px;
+}
+.work-search-bar {
+    display: flex; gap: 8px; padding: 10px 12px; flex-shrink: 0;
+    background: #16213e; border-bottom: 1px solid #2a2a4a;
+}
+.work-search-bar input {
+    flex: 1; background: #2a2a4a; color: #e0e0e0;
+    border: 1px solid #3a3a5a; border-radius: 20px;
+    padding: 8px 16px; font-size: 14px; font-family: inherit;
+}
+.work-search-bar input:focus { outline: none; border-color: #c9a96e; }
+.work-search-bar input::placeholder { color: #555; }
+.work-search-bar button {
+    background: #c9a96e; color: #1a1a2e; border: none;
+    border-radius: 20px; padding: 8px 16px; font-size: 13px; font-weight: 600;
+    cursor: pointer; flex-shrink: 0;
+}
+.work-search-results { padding: 12px; }
+.work-search-results .search-group { margin-bottom: 16px; }
+.work-search-results .search-group h3 {
+    font-size: 12px; color: #c9a96e; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 8px;
 }
 .work-setup {
     text-align: center; padding: 40px 20px; color: #888; font-size: 13px; line-height: 1.6;
@@ -302,6 +453,7 @@ body {
     <div class="messages" id="messages"></div>
     <div class="image-preview" id="imagePreview"></div>
     <input type="file" id="imageInput" accept="image/*" multiple style="display:none" onchange="handleImageSelect(this)">
+    <div id="workingBar"></div>
     <div class="input-area">
         <button class="attach-btn" onclick="document.getElementById('imageInput').click()">&#128247;</button>
         <textarea id="input" rows="1" placeholder="Ask anything..."
@@ -325,8 +477,31 @@ body {
 
 <!-- Work tab -->
 <div id="workTab" class="tab-content">
+    <div style="font-size:10px;color:#555;text-align:right;padding:2px 8px;" id="workDebug">v3</div>
     <div class="work-dash" id="workDash">
         <div class="printer-loading" id="workLoading">Loading work status...</div>
+    </div>
+    <div class="work-dash" id="workDashReady" style="display:none;">
+        <div class="work-search-bar">
+            <input type="text" id="workSearchInput" placeholder="Search emails, calendar, slack..." onkeydown="if(event.key==='Enter')window.workSearch()">
+            <button onclick="window.workSearch()">Search</button>
+        </div>
+        <div class="work-search-results" id="workSearchResults" style="display:none;overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch;"></div>
+        <div class="work-subtabs" id="workSubtabBar">
+            <button class="work-subtab active" id="wsEmails" onclick="window.switchWorkSubtab('emails')">Emails</button>
+            <button class="work-subtab" id="wsDiary" onclick="window.switchWorkSubtab('diary')">Diary</button>
+            <button class="work-subtab" id="wsSlack" onclick="window.switchWorkSubtab('slack')">Slack</button>
+        </div>
+        <div class="work-subcontent" id="workEmails"></div>
+        <div class="work-subcontent" id="workDiary" style="display:none;"></div>
+        <div class="work-subcontent" id="workSlack" style="display:none;"></div>
+        <div id="workAiChat" style="display:none;border-top:1px solid #3a3a5a;margin-top:8px;padding-top:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span style="font-size:12px;color:#a78bfa;font-weight:600;">Claude</span>
+                <button onclick="document.getElementById('workAiChat').style.display='none'" style="background:none;border:none;color:#666;font-size:16px;cursor:pointer;padding:0 4px;">&times;</button>
+            </div>
+            <div id="workAiContent" style="font-size:13px;color:#ddd;line-height:1.5;max-height:300px;overflow-y:auto;-webkit-overflow-scrolling:touch;"></div>
+        </div>
     </div>
 </div>
 
@@ -335,6 +510,7 @@ body {
 <!-- ====== CHAT JS (isolated) ====== -->
 <script>
 (function() {
+    var _tabHidden = false; // Track tab visibility for recovery logic
     var messagesEl = document.getElementById('messages');
     var inputEl = document.getElementById('input');
     var sendBtn = document.getElementById('sendBtn');
@@ -349,43 +525,60 @@ body {
     var workingDiv = null;
     var workingStart = 0;
     var lastActivityTime = 0;
+    var lastToolTime = 0;
     var lastToolLabel = '';
+
+    var workingBarEl = document.getElementById('workingBar');
 
     function startWorkingIndicator() {
         workingStart = Date.now();
         lastActivityTime = workingStart;
+        lastToolTime = workingStart;
         lastToolLabel = '';
-        workingDiv = addMsg('msg system', '<span style="color:#c9a96e;">Working...</span>');
+        workingBarEl.textContent = 'Working...';
+        workingBarEl.style.display = 'block';
+        workingDiv = true; // flag for compat
         workingTimer = setInterval(function() {
             if (!workingDiv) return;
             var elapsed = Math.floor((Date.now() - workingStart) / 1000);
-            var idle = Math.floor((Date.now() - lastActivityTime) / 1000);
+            var toolIdle = Math.floor((Date.now() - lastToolTime) / 1000);
+            var connIdle = Math.floor((Date.now() - lastActivityTime) / 1000);
             var mins = Math.floor(elapsed / 60);
             var secs = elapsed % 60;
             var timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
             var dots = ['', '.', '..', '...'][Math.floor(Date.now() / 600) % 4];
-            var label = lastToolLabel ? lastToolLabel : (idle > 10 ? 'Still working' : 'Working');
-            workingDiv.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(label) + dots + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
-            scrollToBottom();
+            var label;
+            if (connIdle > 25) {
+                label = 'Reconnecting';
+            } else if (lastToolLabel && toolIdle < 15) {
+                label = lastToolLabel;
+            } else {
+                label = elapsed > 10 ? 'Processing' : 'Working';
+            }
+            workingBarEl.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(label) + dots + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
         }, 2000);
     }
 
     function touchWorkingIndicator(toolLabel) {
         lastActivityTime = Date.now();
-        if (toolLabel) lastToolLabel = toolLabel;
+        if (toolLabel) {
+            lastToolLabel = toolLabel;
+            lastToolTime = Date.now();
+        }
         if (workingDiv && toolLabel) {
             var elapsed = Math.floor((Date.now() - workingStart) / 1000);
             var mins = Math.floor(elapsed / 60);
             var secs = elapsed % 60;
             var timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
-            workingDiv.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(toolLabel) + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
-            scrollToBottom();
+            workingBarEl.innerHTML = '<span style="color:#c9a96e;">' + escapeHtml(toolLabel) + ' <span style="opacity:0.5">' + timeStr + '</span></span>';
         }
     }
 
     function stopWorkingIndicator() {
         if (workingTimer) { clearInterval(workingTimer); workingTimer = null; }
-        if (workingDiv) { workingDiv.remove(); workingDiv = null; }
+        workingBarEl.style.display = 'none';
+        workingBarEl.textContent = '';
+        workingDiv = null;
         lastToolLabel = '';
     }
 
@@ -400,7 +593,15 @@ body {
     }
     window.handleKey = handleKey;
 
-    function scrollToBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+    var userScrolledUp = false;
+    messagesEl.addEventListener('scroll', function() {
+        var atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+        userScrolledUp = !atBottom;
+    });
+    function scrollToBottom(force) {
+        if (!force && userScrolledUp) return;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
 
     function escapeHtml(text) {
         return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -416,12 +617,12 @@ body {
         return html;
     }
 
-    function addMsg(cls, html) {
+    function addMsg(cls, html, forceScroll) {
         var div = document.createElement('div');
         div.className = cls;
         div.innerHTML = html;
         messagesEl.appendChild(div);
-        scrollToBottom();
+        scrollToBottom(forceScroll);
         return div;
     }
 
@@ -443,8 +644,13 @@ body {
         var text = inputEl.value.trim();
         if (!text) return;
         if (sending) {
-            var queuedDiv = addMsg('msg user', escapeHtml(text) + ' <span class="queue-tag" style="color:#c9a96e;font-size:11px;">[queued]</span>');
-            messageQueue.push({text: text, images: pendingImages.slice(), div: queuedDiv});
+            var qIdx = messageQueue.length;
+            var queuedDiv = addMsg('msg user',
+                '<span class="queue-text" data-queue-idx="' + qIdx + '">' +
+                escapeHtml(text) + '</span>' +
+                ' <span class="queue-tag" style="color:#c9a96e;font-size:11px;">[queued]</span>' +
+                ' <button class="queue-remove" data-queue-idx="' + qIdx + '">&times;</button>');
+            messageQueue.push({text: text, images: pendingImages.slice(), div: queuedDiv, idx: qIdx});
             inputEl.value = '';
             autoResize(inputEl);
             clearAllImages();
@@ -489,18 +695,34 @@ body {
         wasCancelled = false;
         setButtonMode('cancel');
         startWorkingIndicator();
-        // Safety: if no activity for 30s after stream ends, recover from stuck state
+        // Safety: if no data (not even keepalives) for 120s, recover from stuck state.
+        // Server sends data keepalives every 2s, but Safari batches/throttles SSE delivery
+        // so pings may not arrive for extended periods. 120s is safe — if truly no data
+        // for 2 full minutes, the connection is dead. Skip while tab is hidden.
         if (staleTimer) clearInterval(staleTimer);
         staleTimer = setInterval(function() {
             if (!sending) { clearInterval(staleTimer); staleTimer = null; return; }
+            if (_tabHidden) return; // Don't fire while backgrounded — visibilitychange handles it
             var idle = Date.now() - lastActivityTime;
-            if (idle > 30000) { finishSend(); }
-        }, 5000);
+            if (idle > 120000) {
+                // Try to recover missed response before giving up
+                fetch('/last-response').then(function(r) { return r.json(); }).then(function(data) {
+                    if (data.text && data.seq > lastSeenSeq) {
+                        lastSeenSeq = data.seq;
+                        var div = addMsg('msg assistant', '', true);
+                        div.innerHTML = formatOutput(data.text);
+                        if (data.cost) addMsg('cost', data.cost);
+                        scrollToBottom(true);
+                    }
+                }).catch(function() {});
+                finishSend();
+            }
+        }, 10000);
 
         if (!fromQueue) {
             var displayText = text;
             if (images && images.length) displayText += ' [' + images.length + ' image(s)]';
-            addMsg('msg user', escapeHtml(displayText));
+            addMsg('msg user', escapeHtml(displayText), true);
         }
 
         var assistantDiv = null;
@@ -525,7 +747,9 @@ body {
 
             function readChunk() {
                 return reader.read().then(function(result) {
-                    if (result.done) return;
+                    if (result.done) { finishSend(); return; }
+                    // Any incoming data = connection alive, reset stale timer
+                    lastActivityTime = Date.now();
                     buffer += decoder.decode(result.value, {stream: true});
                     var lines = buffer.split('\\n');
                     buffer = lines.pop();
@@ -553,24 +777,57 @@ body {
                                 scrollToBottom();
                             } else if (data.type === 'cost') {
                                 addMsg('cost', data.content);
-                                // Cost is always the final event — force cleanup in case
-                                // Safari doesn't close the stream properly
+                                // Cost is always the final event — call directly
+                                // AND via timeout (belt + suspenders for Safari)
+                                finishSend();
                                 setTimeout(finishSend, 500);
+                            } else if (data.type === 'ping') {
+                                touchWorkingIndicator();
                             } else if (data.type === 'error') {
                                 addMsg('msg system', '<span style="color:#e55">' + escapeHtml(data.content) + '</span>');
                             }
                         } catch(e) {}
                     }
                     return readChunk();
+                }).catch(function(readErr) {
+                    // Stream read failed — Safari drops streams under memory pressure
+                    // or background throttling. Don't kill the session — try to reattach.
+                    if (wasCancelled || (readErr && readErr.name === 'AbortError')) {
+                        finishSend();
+                        return;
+                    }
+                    // Check if Claude is still working before giving up
+                    fetch('/pending-work').then(function(r) { return r.json(); }).then(function(pw) {
+                        if (pw.active) {
+                            reattachToActiveWork();
+                        } else {
+                            // Process finished while stream was broken — recover final response
+                            fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
+                                if (lr.text && lr.seq > lastSeenSeq) {
+                                    lastSeenSeq = lr.seq;
+                                    var div = addMsg('msg assistant', '', true);
+                                    div.innerHTML = formatOutput(lr.text);
+                                    if (lr.cost) addMsg('cost', lr.cost);
+                                    scrollToBottom(true);
+                                }
+                            }).catch(function() {});
+                            finishSend();
+                        }
+                    }).catch(function() { finishSend(); });
                 });
             }
             return readChunk();
         }).catch(function(e) {
-            if (!wasCancelled && e.name !== 'AbortError' && !gotData) {
+            // Fetch itself failed (not stream read) — network error
+            if (wasCancelled || (e && e.name === 'AbortError')) return;
+            if (!gotData) {
                 addMsg('msg system', '<span style="color:#e55">Connection error</span>');
             }
-        }).finally(function() {
-            finishSend();
+            // Still try to reattach in case Claude is running
+            fetch('/pending-work').then(function(r) { return r.json(); }).then(function(pw) {
+                if (pw.active) { reattachToActiveWork(); }
+                else { finishSend(); }
+            }).catch(function() { finishSend(); });
         });
     }
 
@@ -633,8 +890,225 @@ body {
 
     function clearAllImages() { pendingImages = []; renderPreviews(); }
 
+    // Queue management: tap text to edit, tap X to remove
+    messagesEl.addEventListener('click', function(e) {
+        var removeBtn = e.target.closest('.queue-remove');
+        var queueText = e.target.closest('.queue-text');
+        if (removeBtn) {
+            var idx = parseInt(removeBtn.getAttribute('data-queue-idx'));
+            for (var i = 0; i < messageQueue.length; i++) {
+                if (messageQueue[i].idx === idx) {
+                    if (messageQueue[i].div) messageQueue[i].div.remove();
+                    messageQueue.splice(i, 1);
+                    break;
+                }
+            }
+        } else if (queueText) {
+            var idx2 = parseInt(queueText.getAttribute('data-queue-idx'));
+            for (var j = 0; j < messageQueue.length; j++) {
+                if (messageQueue[j].idx === idx2) {
+                    inputEl.value = messageQueue[j].text;
+                    autoResize(inputEl);
+                    if (messageQueue[j].div) messageQueue[j].div.remove();
+                    messageQueue.splice(j, 1);
+                    inputEl.focus();
+                    break;
+                }
+            }
+        }
+    });
+
     addMsg('msg system', 'Claude Code Mobile ready.');
     setButtonMode('send');
+
+    // Recovery: if user taps input area while cancel is stuck, reset after 60s idle.
+    // Uses touchstart on the whole input-area div (more reliable than focus on
+    // iOS — focus won't re-fire if textarea is already focused).
+    // 60s threshold ensures this only fires when the stream is genuinely dead,
+    // not during normal pauses between SSE deliveries.
+    function recoverIfStuck() {
+        if (sending && Date.now() - lastActivityTime > 60000) {
+            finishSend();
+        }
+    }
+    inputEl.addEventListener('focus', recoverIfStuck);
+    document.querySelector('.input-area').addEventListener('touchstart', recoverIfStuck);
+    inputEl.addEventListener('input', recoverIfStuck);
+
+    // --- Recovery: reconnect to active stream when returning from background ---
+    // ALWAYS check /pending-work on tab return, regardless of sending state.
+    // The stale timer may have already fired (setting sending=false) before
+    // visibilitychange runs — so we can't rely on sending to decide.
+    var lastSeenSeq = 0;
+
+    document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState !== 'visible') {
+            _tabHidden = true;
+            return;
+        }
+        if (!_tabHidden) return; // Only recover after genuine background
+        _tabHidden = false;
+
+        // Always check if Claude is still working — stale timer may have
+        // already called finishSend() while we were away
+        fetch('/pending-work').then(function(r) { return r.json(); }).then(function(pw) {
+            if (pw.active) {
+                // Process still running — kill any dead stream and reattach
+                if (currentAbortController) currentAbortController.abort();
+                reattachToActiveWork();
+            } else {
+                // Process finished while we were away — grab the result
+                fetch('/last-response').then(function(r) { return r.json(); }).then(function(data) {
+                    if (!data.text || data.seq <= lastSeenSeq) return;
+                    var msgs = document.querySelectorAll('.msg.assistant');
+                    var lastMsg = msgs.length ? msgs[msgs.length - 1].textContent : '';
+                    if (lastMsg && data.text.substring(0, 80) === lastMsg.substring(0, 80)) {
+                        lastSeenSeq = data.seq;
+                        return;
+                    }
+                    lastSeenSeq = data.seq;
+                    var div = addMsg('msg assistant', '', true);
+                    div.innerHTML = formatOutput(data.text);
+                    if (data.cost) addMsg('cost', data.cost);
+                    scrollToBottom(true);
+                    finishSend();
+                }).catch(function() {});
+            }
+        }).catch(function() {});
+    });
+    // Also track seq when we receive responses normally
+    var origFinish = finishSend;
+    // Update lastSeenSeq periodically when actively receiving
+    setInterval(function() {
+        fetch('/last-response').then(function(r) { return r.json(); }).then(function(data) {
+            if (data.seq > lastSeenSeq) lastSeenSeq = data.seq;
+        }).catch(function() {});
+    }, 30000);
+
+    // --- Restart recovery: reattach to active Claude process after wrapper restart ---
+    function reattachToActiveWork() {
+        fetch('/pending-work').then(function(r) { return r.json(); }).then(function(data) {
+            if (!data.active) {
+                // Process not running — recover last response if we missed it
+                if (sending) {
+                    fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
+                        if (lr.text && lr.seq > lastSeenSeq) {
+                            lastSeenSeq = lr.seq;
+                            var div = addMsg('msg assistant', '', true);
+                            div.innerHTML = formatOutput(lr.text);
+                            if (lr.cost) addMsg('cost', lr.cost);
+                            scrollToBottom(true);
+                        }
+                    }).catch(function() {}).finally(function() { finishSend(); });
+                }
+                return;
+            }
+
+            // There's a Claude process still running — reattach to it
+            sending = true;
+            setButtonMode('cancel');
+            startWorkingIndicator();
+            if (data.session_id) sessionId = data.session_id;
+
+            var assistantDiv = null;
+            var fullText = '';
+            currentAbortController = new AbortController();
+
+            if (staleTimer) clearInterval(staleTimer);
+            staleTimer = setInterval(function() {
+                if (!sending) { clearInterval(staleTimer); staleTimer = null; return; }
+                if (_tabHidden) return;
+                var idle = Date.now() - lastActivityTime;
+                if (idle > 120000) { finishSend(); }
+            }, 10000);
+
+            fetch('/reattach', {signal: currentAbortController.signal}).then(function(response) {
+                var reader = response.body.getReader();
+                var decoder = new TextDecoder();
+                var buffer = '';
+
+                function readChunk() {
+                    return reader.read().then(function(result) {
+                        if (result.done) { finishSend(); return; }
+                        lastActivityTime = Date.now();
+                        buffer += decoder.decode(result.value, {stream: true});
+                        var lines = buffer.split('\\n');
+                        buffer = lines.pop();
+                        for (var i = 0; i < lines.length; i++) {
+                            if (!lines[i].startsWith('data: ')) continue;
+                            try {
+                                var d = JSON.parse(lines[i].slice(6));
+                                if (d.type === 'init') {
+                                    touchWorkingIndicator();
+                                    if (d.session_id) sessionId = d.session_id;
+                                } else if (d.type === 'tool') {
+                                    touchWorkingIndicator(d.content);
+                                } else if (d.type === 'activity' || d.type === 'ping') {
+                                    touchWorkingIndicator();
+                                } else if (d.type === 'snapshot') {
+                                    // Snapshot = accumulated text so far — replace, don't append
+                                    // Find existing assistant msg or create one
+                                    var msgs = document.querySelectorAll('.msg.assistant');
+                                    var lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+                                    if (lastMsg && lastMsg.textContent.substring(0, 80) === d.content.substring(0, 80)) {
+                                        // Already showing this — just update in place
+                                        assistantDiv = lastMsg;
+                                    } else {
+                                        assistantDiv = addMsg('msg assistant', '');
+                                    }
+                                    fullText = d.content;
+                                    assistantDiv.innerHTML = formatOutput(fullText);
+                                    scrollToBottom();
+                                } else if (d.type === 'text') {
+                                    if (!assistantDiv) assistantDiv = addMsg('msg assistant', '');
+                                    fullText += d.content;
+                                    assistantDiv.innerHTML = formatOutput(fullText);
+                                    scrollToBottom();
+                                } else if (d.type === 'cost') {
+                                    addMsg('cost', d.content);
+                                    finishSend();
+                                } else if (d.type === 'error') {
+                                    addMsg('msg system', '<span style="color:#e55">' + escapeHtml(d.content) + '</span>');
+                                }
+                            } catch(e) {}
+                        }
+                        return readChunk();
+                    }).catch(function(readErr) {
+                        // Reattach stream broke — check if process is still alive
+                        if (readErr && readErr.name === 'AbortError') { finishSend(); return; }
+                        fetch('/pending-work').then(function(r) { return r.json(); }).then(function(pw) {
+                            if (pw.active) {
+                                // Still running — one more reattach attempt
+                                setTimeout(function() { reattachToActiveWork(); }, 1000);
+                            } else {
+                                // Done — grab final response
+                                fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
+                                    if (lr.text && lr.seq > lastSeenSeq) {
+                                        lastSeenSeq = lr.seq;
+                                        var div = addMsg('msg assistant', '', true);
+                                        div.innerHTML = formatOutput(lr.text);
+                                        if (lr.cost) addMsg('cost', lr.cost);
+                                        scrollToBottom(true);
+                                    }
+                                }).catch(function() {});
+                                finishSend();
+                            }
+                        }).catch(function() { finishSend(); });
+                    });
+                }
+                return readChunk();
+            }).catch(function(e) {
+                if (e && e.name === 'AbortError') { finishSend(); return; }
+                // Fetch to /reattach failed — try recovering
+                fetch('/pending-work').then(function(r) { return r.json(); }).then(function(pw) {
+                    if (pw.active) { setTimeout(function() { reattachToActiveWork(); }, 1000); }
+                    else { finishSend(); }
+                }).catch(function() { finishSend(); });
+            });
+        }).catch(function() {});
+    }
+    // Run on page load
+    reattachToActiveWork();
 })();
 </script>
 
@@ -939,66 +1413,330 @@ body {
 (function() {
     var dashEl = document.getElementById('workDash');
     var autoTimer = null;
+    var currentSubtab = 'emails';
 
     function esc(text) {
         if (!text && text !== 0) return '';
         return String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
-    function renderWork(data) {
-        if (data.setup_required) {
-            dashEl.innerHTML = '<div class="work-setup">' + data.setup_message + '</div>';
-            return;
-        }
+    var readyEl = document.getElementById('workDashReady');
+    var emailsEl = document.getElementById('workEmails');
+    var diaryEl = document.getElementById('workDiary');
+    var slackEl = document.getElementById('workSlack');
+    var searchResultsEl = document.getElementById('workSearchResults');
+    var searchInput = document.getElementById('workSearchInput');
 
-        var html = '<div class="refresh-bar" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">';
-        html += '<span style="font-size:11px;color:#666;">Updated: ' + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) + '</span>';
-        html += '<button onclick="window.refreshWork()" style="background:#2a2a4a;color:#c9a96e;border:1px solid #3a3a5a;padding:6px 14px;border-radius:16px;font-size:12px;cursor:pointer;">Refresh</button>';
-        html += '</div>';
+    function acctBadge(item) {
+        if (!item.account) return '';
+        var bg = (item.account_color || '#888') + '22';
+        var fg = item.account_color || '#888';
+        return '<span class="wc-acct" style="background:' + bg + ';color:' + fg + ';">' + esc(item.account) + '</span> ';
+    }
 
-        // Emails
-        html += '<div class="work-section"><h3>Unread Emails (' + (data.emails ? data.emails.length : 0) + ')</h3>';
+    function refreshBar() {
+        return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+            '<span style="font-size:11px;color:#666;">Updated: ' + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) + '</span>' +
+            '<button onclick="window.refreshWork()" style="background:#2a2a4a;color:#c9a96e;border:1px solid #3a3a5a;padding:6px 14px;border-radius:16px;font-size:12px;cursor:pointer;">Refresh</button>' +
+            '</div>';
+    }
+
+    function gmailUrl(e) {
+        if (!e.message_id) return '';
+        var idx = (e.account === 'Work') ? '1' : '0';
+        return 'https://mail.google.com/mail/u/' + idx + '/#inbox/' + e.message_id;
+    }
+
+    function emailCard(e) {
+        var url = gmailUrl(e);
+        var tag = url ? 'a' : 'div';
+        var extra = url ? ' href="' + esc(url) + '" style="text-decoration:none;color:inherit;display:block;"' : '';
+        var html = '<' + tag + ' class="work-card"' + extra + '>';
+        html += '<div>' + acctBadge(e) + '<span class="wc-from">' + esc(e.from) + '</span></div>';
+        html += '<div class="wc-subject">' + esc(e.subject) + '</div>';
+        if (e.snippet) html += '<div class="wc-snippet">' + esc(e.snippet) + '</div>';
+        html += '<div class="wc-time">' + esc(e.time) + '</div>';
+        html += '</' + tag + '>';
+        return html;
+    }
+
+    function calCard(ev) {
+        var url = ev.html_link || '';
+        var tag = url ? 'a' : 'div';
+        var extra = url ? ' href="' + esc(url) + '" style="text-decoration:none;color:inherit;display:block;"' : '';
+        var html = '<' + tag + ' class="work-card cal-card"' + extra + '>';
+        html += '<div>' + acctBadge(ev) + '<span class="wc-title">' + esc(ev.summary) + '</span></div>';
+        html += '<div class="wc-when">' + esc(ev.when) + '</div>';
+        if (ev.location) html += '<div class="wc-location">' + esc(ev.location) + '</div>';
+        if (ev.attendees) html += '<div class="wc-attendees">' + esc(ev.attendees) + '</div>';
+        html += '</' + tag + '>';
+        return html;
+    }
+
+    function slackCard(m) {
+        var url = m.link || '';
+        var tag = url ? 'a' : 'div';
+        var extra = url ? ' href="' + esc(url) + '" style="text-decoration:none;color:inherit;display:block;"' : '';
+        var html = '<' + tag + ' class="work-card slack-card"' + extra + '>';
+        html += '<div class="wc-channel">#' + esc(m.channel) + '</div>';
+        html += '<div class="wc-user">' + esc(m.user) + '</div>';
+        html += '<div class="wc-text">' + esc(m.text) + '</div>';
+        var meta = esc(m.time);
+        if (m.reply_count) meta += ' &middot; ' + m.reply_count + ' replies';
+        html += '<div class="wc-time">' + meta + '</div>';
+        html += '</' + tag + '>';
+        return html;
+    }
+
+    function renderEmails(data) {
+        var html = refreshBar();
+        var count = data.emails ? data.emails.length : 0;
+        html += '<div class="work-section"><h3>Unread (' + count + ')</h3>';
         if (data.emails && data.emails.length) {
             for (var i = 0; i < data.emails.length; i++) {
-                var e = data.emails[i];
-                html += '<div class="work-card">';
-                html += '<div class="wc-from">' + esc(e.from) + '</div>';
-                html += '<div class="wc-subject">' + esc(e.subject) + '</div>';
-                if (e.snippet) html += '<div class="wc-snippet">' + esc(e.snippet) + '</div>';
-                html += '<div class="wc-time">' + esc(e.time) + '</div>';
-                html += '</div>';
+                html += emailCard(data.emails[i]);
             }
         } else {
             html += '<div style="color:#666;font-size:13px;padding:10px;">No unread emails</div>';
         }
         html += '</div>';
+        emailsEl.innerHTML = html;
+    }
 
-        // Calendar
+    function renderDiary(data) {
+        var html = refreshBar();
         html += '<div class="work-section"><h3>Upcoming Events</h3>';
         if (data.events && data.events.length) {
             for (var j = 0; j < data.events.length; j++) {
-                var ev = data.events[j];
-                html += '<div class="work-card cal-card">';
-                html += '<div class="wc-title">' + esc(ev.summary) + '</div>';
-                html += '<div class="wc-when">' + esc(ev.when) + '</div>';
-                if (ev.location) html += '<div class="wc-location">' + esc(ev.location) + '</div>';
-                if (ev.attendees) html += '<div class="wc-attendees">' + esc(ev.attendees) + '</div>';
-                html += '</div>';
+                html += calCard(data.events[j]);
             }
         } else {
             html += '<div style="color:#666;font-size:13px;padding:10px;">No upcoming events</div>';
         }
         html += '</div>';
-
-        dashEl.innerHTML = html;
+        diaryEl.innerHTML = html;
     }
 
-    function loadWork() {
-        dashEl.innerHTML = '<div class="printer-loading">Loading work status...</div>';
-        fetch('/work-status').then(function(r) { return r.json(); }).then(function(data) {
-            renderWork(data);
+    function renderSlack(data) {
+        if (data.setup_required) {
+            slackEl.innerHTML = '<div class="work-setup">' + data.setup_message + '</div>';
+            return;
+        }
+        if (data.error) {
+            slackEl.innerHTML = '<div class="work-setup" style="color:#e55;">' + esc(data.error) + '</div>';
+            return;
+        }
+        if (data.messages) window._workData.slack = data.messages;
+        var html = refreshBar();
+        var count = data.messages ? data.messages.length : 0;
+        html += '<div class="work-section"><h3>Recent Messages (' + count + ')</h3>';
+        if (data.messages && data.messages.length) {
+            for (var i = 0; i < data.messages.length; i++) {
+                html += slackCard(data.messages[i]);
+            }
+        } else {
+            html += '<div style="color:#666;font-size:13px;padding:10px;">No recent messages</div>';
+        }
+        html += '</div>';
+        slackEl.innerHTML = html;
+    }
+
+    // Global store for AI search context
+    window._workData = {emails: [], events: [], slack: []};
+
+    function renderWork(data) {
+        if (data.setup_required) {
+            dashEl.style.display = '';
+            readyEl.style.display = 'none';
+            dashEl.innerHTML = '<div class="work-setup">' + data.setup_message + '</div>';
+            return;
+        }
+        dashEl.style.display = 'none';
+        readyEl.style.display = '';
+        if (data.emails) window._workData.emails = data.emails;
+        if (data.events) window._workData.events = data.events;
+        renderEmails(data);
+        renderDiary(data);
+    }
+
+    function showSubtabContent(tab) {
+        emailsEl.style.display = tab === 'emails' ? '' : 'none';
+        diaryEl.style.display = tab === 'diary' ? '' : 'none';
+        slackEl.style.display = tab === 'slack' ? '' : 'none';
+        document.getElementById('wsEmails').classList.toggle('active', tab === 'emails');
+        document.getElementById('wsDiary').classList.toggle('active', tab === 'diary');
+        document.getElementById('wsSlack').classList.toggle('active', tab === 'slack');
+        document.getElementById('workSubtabBar').style.display = '';
+        searchResultsEl.style.display = 'none';
+    }
+
+    window.switchWorkSubtab = function(tab) {
+        currentSubtab = tab;
+        showSubtabContent(tab);
+        if (tab === 'slack') loadSlack();
+    };
+
+    function loadSlack() {
+        slackEl.innerHTML = '<div class="printer-loading">Loading Slack...</div>';
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, 15000);
+        fetch('/slack-messages', {signal: controller.signal}).then(function(r) { clearTimeout(timer); return r.json(); }).then(function(data) {
+            renderSlack(data);
         }).catch(function(e) {
-            dashEl.innerHTML = '<div class="printer-loading" style="color:#e55;">Failed to load. <button onclick="window.refreshWork()" style="color:#c9a96e;background:#2a2a4a;border:1px solid #3a3a5a;padding:4px 12px;border-radius:12px;margin-top:8px;">Retry</button></div>';
+            clearTimeout(timer);
+            var msg = e.name === 'AbortError' ? 'Slack timed out.' : 'Failed to load Slack.';
+            slackEl.innerHTML = '<div class="printer-loading" style="color:#e55;">' + msg + ' <button onclick="window.switchWorkSubtab(\\'slack\\')" style="color:#c9a96e;background:#2a2a4a;border:1px solid #3a3a5a;padding:4px 12px;border-radius:12px;margin-top:8px;">Retry</button></div>';
+        });
+    }
+
+    var aiChatEl = document.getElementById('workAiChat');
+    var aiContentEl = document.getElementById('workAiContent');
+    var _aiAbort = null;
+
+    function startAiSearch(query) {
+        aiChatEl.style.display = '';
+        aiContentEl.innerHTML = '<span style="color:#888;">Thinking...</span>';
+        if (_aiAbort) _aiAbort.abort();
+        _aiAbort = new AbortController();
+
+        fetch('/work-ai-search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                query: query,
+                emails: window._workData.emails || [],
+                events: window._workData.events || [],
+                slack: window._workData.slack || []
+            }),
+            signal: _aiAbort.signal
+        }).then(function(resp) {
+            var reader = resp.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var fullText = '';
+            aiContentEl.innerHTML = '';
+
+            function pump() {
+                return reader.read().then(function(result) {
+                    if (result.done) return;
+                    buf += decoder.decode(result.value, {stream: true});
+                    var lines = buf.split('\\n');
+                    buf = lines.pop();
+                    for (var i = 0; i < lines.length; i++) {
+                        var line = lines[i].trim();
+                        if (!line.startsWith('data: ')) continue;
+                        try {
+                            var ev = JSON.parse(line.substring(6));
+                            if (ev.type === 'text') {
+                                fullText += ev.content;
+                                aiContentEl.innerHTML = '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(fullText) + '</div>';
+                                aiContentEl.scrollTop = aiContentEl.scrollHeight;
+                            } else if (ev.type === 'cost') {
+                                aiContentEl.innerHTML += '<div style="font-size:10px;color:#666;margin-top:6px;">' + esc(ev.content) + '</div>';
+                            } else if (ev.type === 'error') {
+                                aiContentEl.innerHTML += '<div style="color:#e55;margin-top:4px;">' + esc(ev.content) + '</div>';
+                            }
+                        } catch(e) {}
+                    }
+                    return pump();
+                });
+            }
+            return pump();
+        }).catch(function(e) {
+            if (e.name !== 'AbortError') {
+                aiContentEl.innerHTML = '<div style="color:#e55;">AI search failed: ' + esc(e.message) + '</div>';
+            }
+        });
+    }
+
+    window.workSearch = function() {
+        var q = searchInput.value.trim();
+        if (!q) {
+            searchResultsEl.style.display = 'none';
+            aiChatEl.style.display = 'none';
+            showSubtabContent(currentSubtab);
+            return;
+        }
+        // Hide subtabs and content, show search results
+        document.getElementById('workSubtabBar').style.display = 'none';
+        emailsEl.style.display = 'none';
+        diaryEl.style.display = 'none';
+        slackEl.style.display = 'none';
+        searchResultsEl.style.display = '';
+        searchResultsEl.innerHTML = '<div class="printer-loading">Searching...</div>';
+
+        // Launch AI search in parallel
+        startAiSearch(q);
+
+        fetch('/work-search?q=' + encodeURIComponent(q)).then(function(r) { return r.json(); }).then(function(data) {
+            var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+                '<span style="font-size:12px;color:#888;">Results for "' + esc(q) + '"</span>' +
+                '<button onclick="window.clearWorkSearch()" style="background:#2a2a4a;color:#c9a96e;border:1px solid #3a3a5a;padding:6px 14px;border-radius:16px;font-size:12px;cursor:pointer;">Clear</button></div>';
+
+            // Emails
+            if (data.emails && data.emails.length) {
+                html += '<div class="search-group"><h3>Emails (' + data.emails.length + ')</h3>';
+                for (var i = 0; i < data.emails.length; i++) html += emailCard(data.emails[i]);
+                html += '</div>';
+            }
+            // Calendar
+            if (data.events && data.events.length) {
+                html += '<div class="search-group"><h3>Calendar (' + data.events.length + ')</h3>';
+                for (var j = 0; j < data.events.length; j++) html += calCard(data.events[j]);
+                html += '</div>';
+            }
+            // Slack
+            if (data.slack && data.slack.length) {
+                html += '<div class="search-group"><h3>Slack (' + data.slack.length + ')</h3>';
+                for (var k = 0; k < data.slack.length; k++) html += slackCard(data.slack[k]);
+                html += '</div>';
+            }
+
+            var total = (data.emails ? data.emails.length : 0) + (data.events ? data.events.length : 0) + (data.slack ? data.slack.length : 0);
+            if (total === 0) {
+                html += '<div style="color:#666;font-size:13px;padding:20px;text-align:center;">No results found</div>';
+            }
+            searchResultsEl.innerHTML = html;
+        }).catch(function(e) {
+            searchResultsEl.innerHTML = '<div class="printer-loading" style="color:#e55;">Search failed. <button onclick="window.workSearch()" style="color:#c9a96e;background:#2a2a4a;border:1px solid #3a3a5a;padding:4px 12px;border-radius:12px;margin-top:8px;">Retry</button></div>';
+        });
+    };
+
+    window.clearWorkSearch = function() {
+        searchInput.value = '';
+        searchResultsEl.style.display = 'none';
+        aiChatEl.style.display = 'none';
+        if (_aiAbort) { _aiAbort.abort(); _aiAbort = null; }
+        showSubtabContent(currentSubtab);
+    };
+
+    var dbg = document.getElementById('workDebug');
+    function wdbg(msg) { if (dbg) dbg.textContent = 'v3 | ' + msg; }
+
+    function loadWork() {
+        wdbg('loadWork called');
+        dashEl.style.display = '';
+        readyEl.style.display = 'none';
+        dashEl.innerHTML = '<div class="printer-loading">Loading work status...</div>';
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, 10000);
+        var t0 = Date.now();
+        wdbg('fetching /work-status...');
+        fetch('/work-status', {signal: controller.signal, cache: 'no-store', headers: {'Cache-Control': 'no-cache'}}).then(function(r) {
+            clearTimeout(timer);
+            wdbg('got response ' + r.status + ' in ' + ((Date.now()-t0)/1000).toFixed(1) + 's');
+            return r.json();
+        }).then(function(data) {
+            wdbg('rendering ' + (data.emails ? data.emails.length : 0) + ' emails, ' + (data.events ? data.events.length : 0) + ' events');
+            renderWork(data);
+            wdbg('done in ' + ((Date.now()-t0)/1000).toFixed(1) + 's');
+        }).catch(function(e) {
+            clearTimeout(timer);
+            dashEl.style.display = '';
+            readyEl.style.display = 'none';
+            var msg = e.name === 'AbortError' ? 'Timed out after 10s.' : 'Failed: ' + e.message;
+            wdbg('ERROR: ' + msg);
+            dashEl.innerHTML = '<div class="printer-loading" style="color:#e55;">' + msg + ' <button onclick="window.refreshWork()" style="color:#c9a96e;background:#2a2a4a;border:1px solid #3a3a5a;padding:4px 12px;border-radius:12px;margin-top:8px;">Retry</button></div>';
         });
     }
 
@@ -1033,7 +1771,7 @@ function switchTab(tab) {
     if (tab === 'governors') {
         var frame = document.getElementById('governorsFrame');
         if (frame && !frame.src) {
-            frame.src = '/governors/?embed=true&embed_options=light_theme';
+            frame.src = '/governors/';
         }
     }
     if (tab === 'work') {
@@ -1056,6 +1794,71 @@ def index():
     return resp
 
 
+@app.route('/work-test')
+def work_test():
+    """Minimal diagnostic page for Work tab debugging."""
+    return Response("""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Work Tab Diagnostic</title>
+<style>body{background:#1a1a2e;color:#e0e0e0;font-family:monospace;padding:16px;font-size:13px;}
+pre{white-space:pre-wrap;word-break:break-all;background:#0d0d1a;padding:12px;border-radius:8px;max-height:60vh;overflow-y:auto;}
+.ok{color:#52b788;} .err{color:#e55;} .warn{color:#c9a96e;} h2{color:#c9a96e;margin:8px 0;}
+button{background:#2a2a4a;color:#c9a96e;border:1px solid #3a3a5a;padding:8px 16px;border-radius:8px;margin:4px;font-size:13px;}</style></head>
+<body>
+<h2>Work Tab Diagnostic</h2>
+<div id="log"></div>
+<pre id="out"></pre>
+<button onclick="runTest()">Run Again</button>
+<script>
+var log = document.getElementById('log');
+var out = document.getElementById('out');
+function L(cls, msg) { log.innerHTML += '<div class="'+cls+'">' + new Date().toLocaleTimeString() + ' ' + msg + '</div>'; }
+function runTest() {
+    log.innerHTML = '';
+    out.textContent = '';
+    L('warn', 'Step 1: JS executing OK');
+    L('warn', 'Step 2: Starting fetch to /work-status...');
+    var t0 = Date.now();
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 15000);
+    fetch('/work-status', {signal: controller.signal, cache: 'no-store'})
+        .then(function(r) {
+            clearTimeout(timer);
+            var ms = Date.now() - t0;
+            L('ok', 'Step 3: Response received — HTTP ' + r.status + ' in ' + ms + 'ms');
+            return r.text();
+        })
+        .then(function(text) {
+            L('ok', 'Step 4: Body received — ' + text.length + ' bytes');
+            try {
+                var data = JSON.parse(text);
+                L('ok', 'Step 5: JSON parsed OK — ' + (data.emails ? data.emails.length : 0) + ' emails, ' + (data.events ? data.events.length : 0) + ' events');
+                if (data.errors) L('err', 'Server errors: ' + JSON.stringify(data.errors));
+                out.textContent = JSON.stringify(data, null, 2).substring(0, 2000);
+            } catch(e) {
+                L('err', 'Step 5: JSON parse FAILED — ' + e.message);
+                out.textContent = text.substring(0, 1000);
+            }
+        })
+        .catch(function(e) {
+            clearTimeout(timer);
+            var ms = Date.now() - t0;
+            L('err', 'FAILED after ' + ms + 'ms — ' + e.name + ': ' + e.message);
+        });
+    L('warn', 'Step 2b: Fetch initiated (async), waiting for response...');
+
+    // Also test /slack-messages
+    L('warn', 'Step 6: Fetching /slack-messages...');
+    var t1 = Date.now();
+    fetch('/slack-messages', {cache: 'no-store'})
+        .then(function(r) { return r.json(); })
+        .then(function(d) { L('ok', 'Step 7: Slack OK in ' + (Date.now()-t1) + 'ms — ' + (d.messages ? d.messages.length : 0) + ' messages'); })
+        .catch(function(e) { L('err', 'Slack FAILED: ' + e.name + ': ' + e.message); });
+}
+runTest();
+</script></body></html>""", content_type='text/html')
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     global current_session_id
@@ -1071,7 +1874,11 @@ def chat():
         user_message = f"I've attached {len(valid_paths)} image(s) at these paths: {paths_str} — please read/view them first. {user_message}"
 
     def generate():
-        global current_session_id
+        global current_session_id, last_response
+        import queue as _queue
+
+        response_buf = {"text": "", "cost": ""}
+        sse_queue = _queue.Queue()
 
         env = os.environ.copy()
         for key in ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDECODE', 'CLAUDE_CODE_SESSION']:
@@ -1099,30 +1906,194 @@ def chat():
         yield ": " + "x" * 2048 + "\n\n"
 
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=WORK_DIR,
-                env=env,
-                preexec_fn=os.setsid
-            )
+            # Write stdout to a temp file so the subprocess survives wrapper restarts.
+            # The subprocess runs in its own session group (os.setsid) and writes to
+            # a file, not a pipe — so it continues even if Flask restarts.
+            import tempfile
+            output_fd, output_path = tempfile.mkstemp(
+                suffix='.jsonl', prefix='claude_out_', dir='/tmp')
+            output_handle = os.fdopen(output_fd, 'wb', buffering=0)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=output_handle,
+                    stderr=subprocess.PIPE,
+                    cwd=WORK_DIR,
+                    env=env,
+                    preexec_fn=os.setsid
+                )
+            finally:
+                output_handle.close()  # Parent doesn't need it; child has the fd
+
             with current_proc_lock:
                 global current_proc
                 current_proc = proc
 
-            # Set stdout to non-blocking
-            fd = proc.stdout.fileno()
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            # Persist state so the new wrapper instance can reattach after restart
+            _save_work_state(proc.pid, output_path, current_session_id)
 
-            raw_buffer = b""
-            while proc.poll() is None:
+            # Background reader thread — tails the output file and feeds SSE events.
+            # If Safari suspends the tab, this thread keeps running and buffers.
+            # If the wrapper restarts, /reattach can resume from the same file.
+            def _reader_thread():
+                raw_buffer = b""
                 try:
-                    chunk = proc.stdout.read(8192)
+                    with open(output_path, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if chunk:
+                                raw_buffer += chunk
+                                while b'\n' in raw_buffer:
+                                    line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
+                                    line = line_bytes.decode('utf-8', errors='replace').strip()
+                                    if not line:
+                                        continue
+                                    try:
+                                        event = json.loads(line)
+                                        for sse in process_event(event):
+                                            _buffer_sse(sse, response_buf)
+                                            sse_queue.put(sse)
+                                    except json.JSONDecodeError:
+                                        pass
+                            else:
+                                # No new data — check if process finished
+                                if proc.poll() is not None:
+                                    time.sleep(0.3)  # Brief pause for final flush
+                                    final = f.read()
+                                    if final:
+                                        raw_buffer += final
+                                        while b'\n' in raw_buffer:
+                                            line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
+                                            line = line_bytes.decode('utf-8', errors='replace').strip()
+                                            if not line:
+                                                continue
+                                            try:
+                                                event = json.loads(line)
+                                                for sse in process_event(event):
+                                                    _buffer_sse(sse, response_buf)
+                                                    sse_queue.put(sse)
+                                            except json.JSONDecodeError:
+                                                pass
+                                    break
+                                time.sleep(0.2)  # Poll interval for new file data
+                except Exception:
+                    pass
+                finally:
+                    proc.wait()
+                    with current_proc_lock:
+                        global current_proc
+                        current_proc = None
+                    # Save completed response — runs even if client disconnected
+                    if response_buf["text"]:
+                        with last_response_lock:
+                            last_response["text"] = response_buf["text"]
+                            last_response["cost"] = response_buf["cost"]
+                            last_response["session_id"] = current_session_id
+                            last_response["seq"] += 1
+                    _clear_work_state()
+                    # Clean up output file now that we're done
+                    try:
+                        os.unlink(output_path)
+                    except Exception:
+                        pass
+                    sse_queue.put(None)  # Sentinel to signal completion
+
+            reader = threading.Thread(target=_reader_thread, daemon=True)
+            reader.start()
+
+            # Safari requires ~1KB per chunk to trigger ReadableStream delivery.
+            SAFARI_PAD = ": " + "x" * 256 + "\n\n"
+            while True:
+                try:
+                    item = sse_queue.get(timeout=2.0)
+                    if item is None:
+                        break  # Reader thread finished
+                    yield item + SAFARI_PAD
+                except _queue.Empty:
+                    # No data yet — send keepalive to keep connection alive
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n" + SAFARI_PAD
+
+        except FileNotFoundError:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Claude Code CLI not found'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache',
+                             'X-Accel-Buffering': 'no',
+                             'Connection': 'keep-alive'})
+
+
+def _buffer_sse(sse_line, buf):
+    """Extract text/cost from an SSE line and accumulate into buf."""
+    if not sse_line.startswith('data: '):
+        return
+    try:
+        data = json.loads(sse_line[6:].strip())
+        if data.get('type') == 'text':
+            buf["text"] += data.get('content', '')
+        elif data.get('type') == 'cost':
+            buf["cost"] = data.get('content', '')
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+
+@app.route('/last-response')
+def get_last_response():
+    """Return the last completed response for client-side recovery."""
+    with last_response_lock:
+        return jsonify(last_response)
+
+
+@app.route('/pending-work')
+def pending_work():
+    """Check if a Claude process is still running from before a restart."""
+    state = _load_work_state()
+    if state:
+        return jsonify({'active': True, 'session_id': state.get('session_id', ''),
+                        'pid': state.get('pid'), 'output_file': state.get('output_file')})
+    return jsonify({'active': False})
+
+
+@app.route('/reattach')
+def reattach():
+    """Re-attach to a running Claude process after wrapper restart.
+
+    Reads the output file from the beginning.  Historical text is accumulated
+    and sent as a single 'snapshot' event so the client can replace (not
+    duplicate) the assistant message.  After the snapshot, new events are
+    streamed live in the same SSE format as /chat.
+    """
+    state = _load_work_state()
+    if not state:
+        return jsonify({'error': 'No active work to reattach to'}), 404
+
+    pid = state['pid']
+    output_path = state['output_file']
+    session_id = state.get('session_id', '')
+
+    if not os.path.exists(output_path):
+        _clear_work_state()
+        return jsonify({'error': 'Output file not found'}), 404
+
+    def generate():
+        global current_session_id
+        if session_id:
+            current_session_id = session_id
+
+        SAFARI_PAD = ": " + "x" * 256 + "\n\n"
+        yield ": " + "x" * 2048 + "\n\n"  # Safari prime
+
+        response_buf = {"text": "", "cost": ""}
+        raw_buffer = b""
+        caught_up = False  # True once we've read all existing data
+
+        try:
+            with open(output_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)
                     if chunk:
                         raw_buffer += chunk
-                        # Process complete lines
                         while b'\n' in raw_buffer:
                             line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
                             line = line_bytes.decode('utf-8', errors='replace').strip()
@@ -1131,43 +2102,70 @@ def chat():
                             try:
                                 event = json.loads(line)
                                 for sse in process_event(event):
-                                    # Pad SSE events to defeat Safari buffering
-                                    yield sse + ": " + "x" * 256 + "\n\n"
+                                    _buffer_sse(sse, response_buf)
+                                    if caught_up:
+                                        # After snapshot, stream new events live
+                                        yield sse + SAFARI_PAD
                             except json.JSONDecodeError:
                                 pass
                     else:
-                        yield ": " + "x" * 256 + "\n\n"
-                        time.sleep(0.5)
-                except (BlockingIOError, OSError):
-                    yield ": " + "x" * 256 + "\n\n"
-                    time.sleep(0.5)
+                        # No more data in file right now.
+                        # If we haven't sent the snapshot yet, send it now —
+                        # this marks the boundary between history and live.
+                        if not caught_up:
+                            caught_up = True
+                            if response_buf["text"]:
+                                yield f"data: {json.dumps({'type': 'snapshot', 'content': response_buf['text']})}\n\n" + SAFARI_PAD
 
-            # Read remaining output
-            try:
-                remaining = proc.stdout.read()
-                if remaining:
-                    raw_buffer += remaining
-                    for line in raw_buffer.decode('utf-8', errors='replace').strip().split('\n'):
-                        line = line.strip()
-                        if not line:
-                            continue
+                        # Check if process is still alive
+                        alive = False
                         try:
-                            event = json.loads(line)
-                            for sse in process_event(event):
-                                yield sse
-                        except json.JSONDecodeError:
+                            os.kill(pid, 0)
+                            alive = True
+                        except OSError:
                             pass
-            except Exception:
-                pass
 
-            proc.wait()
-            with current_proc_lock:
-                current_proc = None
+                        if not alive:
+                            # Process finished — final read
+                            time.sleep(0.3)
+                            final = f.read()
+                            if final:
+                                raw_buffer += final
+                                while b'\n' in raw_buffer:
+                                    line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
+                                    line = line_bytes.decode('utf-8', errors='replace').strip()
+                                    if not line:
+                                        continue
+                                    try:
+                                        event = json.loads(line)
+                                        for sse in process_event(event):
+                                            _buffer_sse(sse, response_buf)
+                                            yield sse + SAFARI_PAD
+                                    except json.JSONDecodeError:
+                                        pass
+                            break
 
-        except FileNotFoundError:
-            yield f"data: {json.dumps({'type': 'error', 'content': 'Claude Code CLI not found'})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+                        # Still alive — keepalive + wait
+                        yield f"data: {json.dumps({'type': 'ping'})}\n\n" + SAFARI_PAD
+                        time.sleep(1)
+
+        except Exception:
+            pass
+
+        # Save completed response for /last-response
+        if response_buf["text"]:
+            with last_response_lock:
+                last_response["text"] = response_buf["text"]
+                last_response["cost"] = response_buf["cost"]
+                last_response["session_id"] = session_id
+                last_response["seq"] += 1
+
+        # Clean up state + output file
+        _clear_work_state()
+        try:
+            os.unlink(output_path)
+        except Exception:
+            pass
 
     return Response(generate(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache',
@@ -1310,11 +2308,11 @@ def printer_status():
 
     # --- SV08 via Moonraker (Ethernet .52, fallback WiFi .38) ---
     sv08_base = None
-    for sv08_ip in ['192.168.87.52', '192.168.87.38']:
+    for sv08_ip in [SOVOL_IP, SOVOL_WIFI_IP]:
         try:
-            with urllib.request.urlopen(f'http://{sv08_ip}:7125/printer/info', timeout=3) as r:
+            with urllib.request.urlopen(f'http://{sv08_ip}:{MOONRAKER_PORT}/printer/info', timeout=3) as r:
                 json.loads(r.read())
-            sv08_base = f'http://{sv08_ip}:7125'
+            sv08_base = f'http://{sv08_ip}:{MOONRAKER_PORT}'
             break
         except Exception:
             continue
@@ -1395,7 +2393,7 @@ def printer_status():
         # Camera snapshot (with timeout to avoid hanging)
         try:
             cam_path = os.path.join(PRINTER_IMG_DIR, 'sovol_camera.jpg')
-            with urllib.request.urlopen('http://192.168.87.52:8081/webcam/?action=snapshot', timeout=5) as cam_r:
+            with urllib.request.urlopen(f'http://{SOVOL_IP}:{SOVOL_CAMERA_PORT}/webcam/?action=snapshot', timeout=5) as cam_r:
                 with open(cam_path, 'wb') as f:
                     f.write(cam_r.read())
             sv['has_camera'] = True
@@ -1511,16 +2509,38 @@ def printer_status():
                                 if auto_cfg.get('mode') == 'conservative':
                                     target_pct = max(round(target_pct * 0.95),
                                                      auto_cfg.get('min_speed_pct', 80))
+                                # Global optimal cap: per-layer cal can underestimate
+                                # complexity; the measured alpha is ground truth
+                                try:
+                                    from print_eta import optimal_speed_factor
+                                    global_opt_pct = round(optimal_speed_factor(measured_alpha) * 100)
+                                    target_pct = min(target_pct, global_opt_pct)
+                                except Exception:
+                                    pass
                                 target_pct = max(auto_cfg.get('min_speed_pct', 80),
                                                  min(target_pct, auto_cfg.get('max_speed_pct', 200)))
                                 current_pct = round(spd * 100)
                                 last = auto_cfg.get('last_adjustment', {})
-                                if (last.get('layer') != cur_layer and
+                                # If current speed is hurting the print (making it
+                                # slower), drop immediately — don't wait for layer change
+                                hurting = False
+                                try:
+                                    from print_eta import speed_time_ratio
+                                    hurting = speed_time_ratio(spd, measured_alpha) > 1.0
+                                except Exception:
+                                    pass
+                                should_adjust = False
+                                if hurting and current_pct > target_pct:
+                                    should_adjust = True
+                                elif (last.get('layer') != cur_layer and
                                         abs(target_pct - current_pct) > 5):
+                                    should_adjust = True
+                                if should_adjust:
                                     if set_printer_speed(target_pct):
                                         auto_cfg['last_adjustment'] = {
                                             'layer': cur_layer, 'speed': target_pct,
                                             'from_speed': current_pct,
+                                            'forced': hurting,
                                             'timestamp': datetime.now().isoformat()
                                         }
                                         save_auto_speed(auto_cfg)
@@ -1619,7 +2639,7 @@ def printer_status():
         import paho.mqtt.client as mqtt
         a1_data = {}
         got_data = threading.Event()
-        serial = '03919D591203833'
+        serial = BAMBU_SERIAL
 
         def _on_connect(client, ud, flags, rc, props):
             if rc == 0:
@@ -1638,14 +2658,14 @@ def printer_status():
 
         c = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                         client_id='status_check', protocol=mqtt.MQTTv311)
-        c.username_pw_set('bblp', '27346688')
+        c.username_pw_set('bblp', BAMBU_ACCESS_CODE)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         c.tls_set_context(ctx)
         c.on_connect = _on_connect
         c.on_message = _on_message
-        c.connect('192.168.87.47', 8883, keepalive=60)
+        c.connect(BAMBU_IP, BAMBU_MQTT_PORT, keepalive=60)
         c.loop_start()
         got_data.wait(timeout=5)
         c.loop_stop()
@@ -1703,7 +2723,7 @@ def printer_status():
             # Camera snapshot via JPEG frame stream (port 6000)
             try:
                 from bambulab import JPEGFrameStream
-                with JPEGFrameStream('192.168.87.47', '27346688') as stream:
+                with JPEGFrameStream(BAMBU_IP, BAMBU_ACCESS_CODE) as stream:
                     frame = stream.get_frame()
                     if frame:
                         cam_path = os.path.join(PRINTER_IMG_DIR, 'a1_camera.jpg')
@@ -1756,11 +2776,17 @@ def printer_auto_speed():
 
 @app.route('/work-status')
 def work_status():
-    """Fetch unread Gmail and upcoming calendar events through end of next working day."""
+    """Fetch unread Gmail and upcoming calendar events from all configured Google accounts."""
     DIR = os.path.dirname(os.path.abspath(__file__))
-    TOKEN_FILE = os.path.join(DIR, 'google_token.json')
 
-    if not os.path.exists(TOKEN_FILE):
+    GOOGLE_ACCOUNTS = [
+        {'token': os.path.join(DIR, 'google_token.json'), 'label': 'Personal', 'color': '#52b788'},
+        {'token': os.path.join(DIR, 'google_token_work.json'), 'label': 'Work', 'color': '#c9a96e'},
+    ]
+
+    active_accounts = [a for a in GOOGLE_ACCOUNTS if os.path.exists(a['token'])]
+
+    if not active_accounts:
         return jsonify({
             'setup_required': True,
             'setup_message': (
@@ -1772,29 +2798,37 @@ def work_status():
             )
         })
 
-    try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
 
-        SCOPES = [
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/calendar.readonly',
-        ]
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    SCOPES = [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/calendar.readonly',
+    ]
 
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(TOKEN_FILE, 'w') as f:
-                f.write(creds.to_json())
+    result = {'emails': [], 'events': [], 'accounts': []}
 
-        result = {'emails': [], 'events': []}
+    for account in active_accounts:
+        acct_label = account['label']
+        acct_color = account['color']
+        try:
+            creds = Credentials.from_authorized_user_file(account['token'], SCOPES)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(account['token'], 'w') as f:
+                    f.write(creds.to_json())
+        except Exception as e:
+            result.setdefault('errors', []).append(f'{acct_label}: auth error — {e}')
+            continue
 
-        # --- Gmail: unread emails (max 15) ---
+        result['accounts'].append({'label': acct_label, 'color': acct_color})
+
+        # --- Gmail: unread emails (max 10 per account) ---
         try:
             gmail = build('gmail', 'v1', credentials=creds, cache_discovery=False)
             msgs = gmail.users().messages().list(
-                userId='me', q='is:unread', maxResults=15
+                userId='me', q='is:unread', maxResults=10
             ).execute()
 
             for msg_meta in msgs.get('messages', []):
@@ -1803,19 +2837,19 @@ def work_status():
                     metadataHeaders=['From', 'Subject', 'Date']
                 ).execute()
                 headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                # Parse sender name
                 from_raw = headers.get('From', '')
                 if '<' in from_raw:
                     from_name = from_raw.split('<')[0].strip().strip('"')
                 else:
                     from_name = from_raw
 
-                # Parse date
                 date_str = headers.get('Date', '')
                 time_display = ''
+                sort_ts = 0
                 try:
                     from email.utils import parsedate_to_datetime
                     dt = parsedate_to_datetime(date_str)
+                    sort_ts = dt.timestamp()
                     now = datetime.now(timezone.utc)
                     diff = now - dt
                     if diff.days == 0:
@@ -1834,20 +2868,23 @@ def work_status():
                     'subject': headers.get('Subject', '(no subject)'),
                     'snippet': msg.get('snippet', ''),
                     'time': time_display,
+                    'sort_ts': sort_ts,
+                    'message_id': msg_meta['id'],
+                    'thread_id': msg.get('threadId', ''),
+                    'account': acct_label,
+                    'account_color': acct_color,
                 })
         except Exception as e:
-            result['email_error'] = str(e)
+            result.setdefault('errors', []).append(f'{acct_label} Gmail: {e}')
 
         # --- Calendar: events through end of next working day ---
         try:
             cal = build('calendar', 'v3', credentials=creds, cache_discovery=False)
             now = datetime.now(timezone.utc)
-            # Find next working day end (skip weekends)
             today = datetime.now()
             target = today + timedelta(days=1)
-            while target.weekday() >= 5:  # 5=Sat, 6=Sun
+            while target.weekday() >= 5:
                 target += timedelta(days=1)
-            # End of that working day (23:59)
             end_of_next_workday = target.replace(hour=23, minute=59, second=59)
 
             time_min = now.isoformat()
@@ -1864,13 +2901,14 @@ def work_status():
 
             for ev in events_result.get('items', []):
                 start = ev.get('start', {})
-                end = ev.get('end', {})
-                # Format start time
+                end_t = ev.get('end', {})
+                sort_ts = 0
                 if 'dateTime' in start:
                     try:
                         from dateutil.parser import parse as dt_parse
                         st = dt_parse(start['dateTime'])
-                        en = dt_parse(end.get('dateTime', start['dateTime']))
+                        en = dt_parse(end_t.get('dateTime', start['dateTime']))
+                        sort_ts = st.timestamp()
                         when = st.strftime('%a %d %b %H:%M') + ' - ' + en.strftime('%H:%M')
                     except Exception:
                         when = start['dateTime'][:16]
@@ -1879,7 +2917,6 @@ def work_status():
                 else:
                     when = ''
 
-                # Attendees
                 attendees = ev.get('attendees', [])
                 att_names = []
                 for a in attendees[:5]:
@@ -1896,17 +2933,708 @@ def work_status():
                     'when': when,
                     'location': ev.get('location', ''),
                     'attendees': att_str,
+                    'sort_ts': sort_ts,
+                    'html_link': ev.get('htmlLink', ''),
+                    'event_id': ev.get('id', ''),
+                    'account': acct_label,
+                    'account_color': acct_color,
                 })
         except Exception as e:
-            result['calendar_error'] = str(e)
+            result.setdefault('errors', []).append(f'{acct_label} Calendar: {e}')
 
-        return jsonify(result)
+    # --- IMAP accounts (e.g. Microsoft 365) ---
+    IMAP_FILE = os.path.join(DIR, 'imap_accounts.json')
+    if os.path.exists(IMAP_FILE):
+        try:
+            import imaplib
+            import email as email_lib
+            from email.header import decode_header
+            from email.utils import parsedate_to_datetime as imap_parse_date
 
-    except Exception as e:
+            with open(IMAP_FILE) as f:
+                imap_accounts = json.load(f)
+
+            for iacct in imap_accounts:
+                acct_label = iacct.get('label', 'IMAP')
+                acct_color = iacct.get('color', '#a78bfa')
+                try:
+                    mail = imaplib.IMAP4_SSL(iacct['server'], iacct.get('port', 993))
+                    mail.login(iacct['email'], iacct['password'])
+                    mail.select('INBOX', readonly=True)
+
+                    result['accounts'].append({'label': acct_label, 'color': acct_color})
+
+                    status, msg_ids = mail.search(None, 'UNSEEN')
+                    ids = msg_ids[0].split() if msg_ids[0] else []
+                    # Newest first, max 10
+                    ids = ids[-10:][::-1]
+
+                    for mid in ids:
+                        status, msg_data = mail.fetch(mid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
+                        if status != 'OK':
+                            continue
+                        raw_header = msg_data[0][1]
+                        msg_obj = email_lib.message_from_bytes(raw_header)
+
+                        # Decode subject
+                        subj_raw = msg_obj.get('Subject', '(no subject)')
+                        decoded_parts = decode_header(subj_raw)
+                        subj = ''
+                        for part, charset in decoded_parts:
+                            if isinstance(part, bytes):
+                                subj += part.decode(charset or 'utf-8', errors='replace')
+                            else:
+                                subj += part
+
+                        # Decode from
+                        from_raw = msg_obj.get('From', '')
+                        decoded_from = decode_header(from_raw)
+                        from_str = ''
+                        for part, charset in decoded_from:
+                            if isinstance(part, bytes):
+                                from_str += part.decode(charset or 'utf-8', errors='replace')
+                            else:
+                                from_str += part
+                        if '<' in from_str:
+                            from_name = from_str.split('<')[0].strip().strip('"')
+                        else:
+                            from_name = from_str
+
+                        # Parse date
+                        date_str = msg_obj.get('Date', '')
+                        time_display = ''
+                        sort_ts = 0
+                        try:
+                            dt = imap_parse_date(date_str)
+                            sort_ts = dt.timestamp()
+                            now = datetime.now(timezone.utc)
+                            diff = now - dt
+                            if diff.days == 0:
+                                time_display = dt.strftime('%H:%M')
+                            elif diff.days == 1:
+                                time_display = 'Yesterday ' + dt.strftime('%H:%M')
+                            elif diff.days < 7:
+                                time_display = dt.strftime('%a %H:%M')
+                            else:
+                                time_display = dt.strftime('%d %b')
+                        except Exception:
+                            time_display = date_str[:20] if date_str else ''
+
+                        result['emails'].append({
+                            'from': from_name,
+                            'subject': subj,
+                            'snippet': '',
+                            'time': time_display,
+                            'sort_ts': sort_ts,
+                            'account': acct_label,
+                            'account_color': acct_color,
+                        })
+
+                    mail.logout()
+                except Exception as e:
+                    result.setdefault('errors', []).append(f'{acct_label}: {e}')
+        except Exception as e:
+            result.setdefault('errors', []).append(f'IMAP setup: {e}')
+
+    # Sort: emails newest first, events earliest first
+    result['emails'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
+    result['events'].sort(key=lambda x: x.get('sort_ts', 0))
+
+    resp = jsonify(result)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+# Persistent Slack caches (survive across requests)
+_slack_user_cache = {}
+_slack_team_id = None
+
+@app.route('/slack-messages')
+def slack_messages():
+    """Fetch recent Slack messages from all accessible channels, DMs, and group DMs."""
+    import re as _re
+    DIR = os.path.dirname(os.path.abspath(__file__))
+    SLACK_CONFIG = os.path.join(DIR, 'slack_config.json')
+
+    # Load Slack tokens: try slack_config.json first, fall back to credentials.py
+    slack_cfg = None
+    if os.path.exists(SLACK_CONFIG):
+        try:
+            with open(SLACK_CONFIG) as f:
+                slack_cfg = json.load(f)
+        except Exception as e:
+            return jsonify({'error': f'Failed to read slack_config.json: {e}'}), 500
+    else:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(DIR))
+            from credentials import SLACK_USER_TOKEN, SLACK_BOT_TOKEN
+            slack_cfg = {'token': SLACK_USER_TOKEN, 'bot_token': SLACK_BOT_TOKEN, 'channels': [], 'max_channels': 12}
+        except ImportError:
+            pass
+
+    if not slack_cfg:
         return jsonify({
             'setup_required': True,
-            'setup_message': f'Auth error: {str(e)}<br><br>Try running <code>python3 google_auth_setup.py</code> again.'
+            'setup_message': (
+                'Slack not configured yet.<br><br>'
+                '1. Create a Slack app at <code>api.slack.com/apps</code><br><br>'
+                '2. Add User Token Scopes: <code>channels:history</code>, <code>channels:read</code>, '
+                '<code>groups:history</code>, <code>groups:read</code>, <code>im:history</code>, '
+                '<code>im:read</code>, <code>mpim:history</code>, <code>mpim:read</code>, '
+                '<code>users:read</code>, <code>search:read</code><br><br>'
+                '3. Install to workspace and copy the User OAuth Token (xoxp-...)<br><br>'
+                '4. Add tokens to <code>credentials.py</code> or create <code>slack_config.json</code>'
+            )
         })
+
+    # User token for conversations/history, bot token for user lookups
+    token = slack_cfg.get('token', '') or slack_cfg.get('bot_token', '')
+    bot_token = slack_cfg.get('bot_token', '') or token
+    max_channels = slack_cfg.get('max_channels', 20)
+    channel_names = slack_cfg.get('channels', [])  # optional filter
+    slack_headers = {'Authorization': f'Bearer {token}'}
+    bot_headers = {'Authorization': f'Bearer {bot_token}'}
+
+    result = {'messages': [], 'channels': []}
+    import time as _time
+    DEADLINE = _time.monotonic() + 12  # hard 12-second budget
+
+    def _over_budget():
+        return _time.monotonic() >= DEADLINE
+
+    try:
+        # Use persistent cache — survives across requests
+        global _slack_user_cache, _slack_team_id
+
+        # Bulk-fetch ALL workspace users on first request (one API call vs N individual calls)
+        if not _slack_user_cache:
+            try:
+                cursor = ''
+                for _ in range(5):  # max 5 pages (5000 users)
+                    params = {'limit': 1000}
+                    if cursor:
+                        params['cursor'] = cursor
+                    users_resp = http_requests.get(
+                        'https://slack.com/api/users.list',
+                        headers=bot_headers,
+                        params=params,
+                        timeout=10
+                    ).json()
+                    if users_resp.get('ok'):
+                        for u in users_resp.get('members', []):
+                            uid = u.get('id', '')
+                            if not uid:
+                                continue
+                            profile = u.get('profile', {})
+                            name = (profile.get('display_name', '').strip()
+                                    or u.get('real_name', '').strip()
+                                    or profile.get('real_name', '').strip()
+                                    or u.get('name', uid))
+                            _slack_user_cache[uid] = name
+                    cursor = users_resp.get('response_metadata', {}).get('next_cursor', '')
+                    if not cursor:
+                        break
+            except Exception:
+                pass  # fall through to individual lookups if bulk fails
+
+        def get_username(user_id):
+            if not user_id or user_id in _slack_user_cache:
+                return _slack_user_cache.get(user_id, user_id)
+            if _over_budget():
+                return user_id
+            try:
+                user_resp = http_requests.get(
+                    'https://slack.com/api/users.info',
+                    headers=bot_headers,
+                    params={'user': user_id},
+                    timeout=3
+                ).json()
+                if user_resp.get('ok'):
+                    profile = user_resp['user'].get('profile', {})
+                    name = (profile.get('display_name', '').strip()
+                            or user_resp['user'].get('real_name', '').strip()
+                            or profile.get('real_name', '').strip()
+                            or user_resp['user'].get('name', user_id))
+                    _slack_user_cache[user_id] = name
+                    return name
+            except Exception:
+                pass
+            _slack_user_cache[user_id] = user_id
+            return user_id
+
+        # Get conversations (single page only — fastest path)
+        conv_types = 'public_channel,private_channel,im,mpim'
+        convos_resp = http_requests.get(
+            'https://slack.com/api/users.conversations',
+            headers=slack_headers,
+            params={'types': conv_types, 'limit': 200, 'exclude_archived': 'true'},
+            timeout=8
+        ).json()
+        if not convos_resp.get('ok'):
+            return jsonify({'error': f'Slack API error: {convos_resp.get("error", "unknown")}'}), 500
+        all_convos = convos_resp.get('channels', [])
+
+        # Optional filter: if channels specified, only show those
+        if channel_names:
+            name_set = set(channel_names)
+            all_convos = [c for c in all_convos if c.get('name', '') in name_set]
+
+        # Build channel list — DM names resolved from bulk cache
+        target_channels = []
+        for c in all_convos:
+            ch_id = c['id']
+            if c.get('is_im'):
+                dm_uid = c.get('user', ch_id)
+                ch_name = 'DM: ' + get_username(dm_uid)
+            elif c.get('is_mpim'):
+                ch_name = c.get('name', ch_id).replace('mpdm-', '').replace('--', ', ').rstrip('-')
+            else:
+                ch_name = c.get('name', ch_id)
+            target_channels.append((ch_name, ch_id))
+
+        # Limit to max_channels
+        target_channels = target_channels[:max_channels]
+        result['channels'] = [{'name': n, 'id': cid} for n, cid in target_channels]
+
+        # Get team ID for slack:// deep links (cached persistently, via auth.test)
+        if not _slack_team_id and not _over_budget():
+            try:
+                auth_resp = http_requests.get(
+                    'https://slack.com/api/auth.test',
+                    headers=bot_headers,
+                    timeout=3
+                ).json()
+                if auth_resp.get('ok'):
+                    _slack_team_id = auth_resp.get('team_id', '')
+            except Exception:
+                pass
+
+        for ch_name, ch_id in target_channels:
+            if _over_budget():
+                result.setdefault('warnings', []).append('Time limit reached — showing partial results')
+                break
+            try:
+                history = http_requests.get(
+                    'https://slack.com/api/conversations.history',
+                    headers=slack_headers,
+                    params={'channel': ch_id, 'limit': 5},
+                    timeout=5
+                ).json()
+
+                if not history.get('ok'):
+                    continue
+
+                for msg in history.get('messages', []):
+                    if msg.get('subtype') in ('channel_join', 'channel_leave', 'channel_topic',
+                                               'channel_purpose', 'bot_add', 'bot_remove'):
+                        continue
+                    ts = float(msg.get('ts', 0))
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    diff = now - dt
+                    if diff.days == 0:
+                        time_display = dt.strftime('%H:%M')
+                    elif diff.days == 1:
+                        time_display = 'Yesterday ' + dt.strftime('%H:%M')
+                    elif diff.days < 7:
+                        time_display = dt.strftime('%a %H:%M')
+                    else:
+                        time_display = dt.strftime('%d %b')
+
+                    user_name = get_username(msg.get('user', ''))
+                    text = msg.get('text', '')
+                    # Replace Slack user mentions
+                    for uid_match in _re.findall(r'<@(U[A-Z0-9]+)>', text):
+                        text = text.replace(f'<@{uid_match}>', f'@{get_username(uid_match)}')
+                    # Strip Slack URL formatting <http://...|label> -> label or url
+                    text = _re.sub(r'<(https?://[^|>]+)\|([^>]+)>', r'\2', text)
+                    text = _re.sub(r'<(https?://[^>]+)>', r'\1', text)
+
+                    # Build slack:// deep link (opens in Slack app)
+                    msg_link = ''
+                    if _slack_team_id:
+                        msg_link = f"slack://channel?team={_slack_team_id}&id={ch_id}&message={msg.get('ts', '')}"
+
+                    result['messages'].append({
+                        'channel': ch_name,
+                        'channel_id': ch_id,
+                        'user': user_name,
+                        'text': text[:300],
+                        'time': time_display,
+                        'sort_ts': ts,
+                        'link': msg_link,
+                        'thread_ts': msg.get('thread_ts', ''),
+                        'reply_count': msg.get('reply_count', 0),
+                    })
+            except Exception as e:
+                result.setdefault('errors', []).append(f'#{ch_name}: {e}')
+
+        result['messages'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify(result)
+
+
+@app.route('/work-search')
+def work_search():
+    """Search across Gmail, Calendar, and Slack."""
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'emails': [], 'events': [], 'slack': []})
+
+    DIR = os.path.dirname(os.path.abspath(__file__))
+    result = {'emails': [], 'events': [], 'slack': []}
+
+    # --- Gmail search ---
+    GOOGLE_ACCOUNTS = [
+        {'token': os.path.join(DIR, 'google_token.json'), 'label': 'Personal', 'color': '#52b788'},
+        {'token': os.path.join(DIR, 'google_token_work.json'), 'label': 'Work', 'color': '#c9a96e'},
+    ]
+    active_accounts = [a for a in GOOGLE_ACCOUNTS if os.path.exists(a['token'])]
+
+    if active_accounts:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        SCOPES = [
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/calendar.readonly',
+        ]
+
+        for account in active_accounts:
+            acct_label = account['label']
+            acct_color = account['color']
+            try:
+                creds = Credentials.from_authorized_user_file(account['token'], SCOPES)
+                if creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    with open(account['token'], 'w') as f:
+                        f.write(creds.to_json())
+            except Exception:
+                continue
+
+            # Search Gmail
+            try:
+                gmail = build('gmail', 'v1', credentials=creds, cache_discovery=False)
+                msgs = gmail.users().messages().list(
+                    userId='me', q=query, maxResults=10
+                ).execute()
+
+                for msg_meta in msgs.get('messages', []):
+                    msg = gmail.users().messages().get(
+                        userId='me', id=msg_meta['id'], format='metadata',
+                        metadataHeaders=['From', 'Subject', 'Date']
+                    ).execute()
+                    headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+                    from_raw = headers.get('From', '')
+                    from_name = from_raw.split('<')[0].strip().strip('"') if '<' in from_raw else from_raw
+
+                    date_str = headers.get('Date', '')
+                    time_display = ''
+                    sort_ts = 0
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt = parsedate_to_datetime(date_str)
+                        sort_ts = dt.timestamp()
+                        time_display = dt.strftime('%d %b %H:%M')
+                    except Exception:
+                        time_display = date_str[:20] if date_str else ''
+
+                    result['emails'].append({
+                        'from': from_name,
+                        'subject': headers.get('Subject', '(no subject)'),
+                        'snippet': msg.get('snippet', ''),
+                        'time': time_display,
+                        'sort_ts': sort_ts,
+                        'message_id': msg_meta['id'],
+                        'thread_id': msg.get('threadId', ''),
+                        'account': acct_label,
+                        'account_color': acct_color,
+                    })
+            except Exception:
+                pass
+
+            # Search Calendar
+            try:
+                cal = build('calendar', 'v3', credentials=creds, cache_discovery=False)
+                events_result = cal.events().list(
+                    calendarId='primary', q=query,
+                    singleEvents=True, orderBy='startTime',
+                    maxResults=10
+                ).execute()
+
+                for ev in events_result.get('items', []):
+                    start = ev.get('start', {})
+                    end_t = ev.get('end', {})
+                    sort_ts = 0
+                    if 'dateTime' in start:
+                        try:
+                            from dateutil.parser import parse as dt_parse
+                            st = dt_parse(start['dateTime'])
+                            en = dt_parse(end_t.get('dateTime', start['dateTime']))
+                            sort_ts = st.timestamp()
+                            when = st.strftime('%a %d %b %H:%M') + ' - ' + en.strftime('%H:%M')
+                        except Exception:
+                            when = start['dateTime'][:16]
+                    elif 'date' in start:
+                        when = 'All day - ' + start['date']
+                    else:
+                        when = ''
+
+                    result['events'].append({
+                        'summary': ev.get('summary', '(no title)'),
+                        'when': when,
+                        'location': ev.get('location', ''),
+                        'sort_ts': sort_ts,
+                        'html_link': ev.get('htmlLink', ''),
+                        'event_id': ev.get('id', ''),
+                        'account': acct_label,
+                        'account_color': acct_color,
+                    })
+            except Exception:
+                pass
+
+    # --- Slack search ---
+    SLACK_CONFIG = os.path.join(DIR, 'slack_config.json')
+    slack_cfg_search = None
+    if os.path.exists(SLACK_CONFIG):
+        try:
+            with open(SLACK_CONFIG) as f:
+                slack_cfg_search = json.load(f)
+        except Exception:
+            pass
+    if not slack_cfg_search:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(DIR))
+            from credentials import SLACK_USER_TOKEN, SLACK_BOT_TOKEN
+            slack_cfg_search = {'token': SLACK_USER_TOKEN, 'bot_token': SLACK_BOT_TOKEN}
+        except ImportError:
+            pass
+    if slack_cfg_search:
+        try:
+            # User token for search (requires search:read), bot token for user lookups
+            s_user_token = slack_cfg_search.get('token', '') or slack_cfg_search.get('bot_token', '')
+            s_bot_token = slack_cfg_search.get('bot_token', '') or s_user_token
+            s_user_headers = {'Authorization': f'Bearer {s_user_token}'}
+            s_bot_headers = {'Authorization': f'Bearer {s_bot_token}'}
+
+            search_resp = http_requests.get(
+                'https://slack.com/api/search.messages',
+                headers=s_user_headers,
+                params={'query': query, 'count': 10, 'sort': 'timestamp'},
+                timeout=10
+            ).json()
+
+            if search_resp.get('ok'):
+                matches = search_resp.get('messages', {}).get('matches', [])
+                # Resolve user IDs to display names (use persistent cache + bot token)
+                unique_uids = set(m.get('user', '') for m in matches if m.get('user'))
+                for uid in list(unique_uids)[:10]:
+                    if uid in _slack_user_cache:
+                        continue
+                    try:
+                        uresp = http_requests.get(
+                            'https://slack.com/api/users.info',
+                            headers=s_bot_headers,
+                            params={'user': uid},
+                            timeout=3
+                        ).json()
+                        if uresp.get('ok'):
+                            p = uresp['user'].get('profile', {})
+                            _slack_user_cache[uid] = (p.get('display_name', '').strip()
+                                                     or uresp['user'].get('real_name', '').strip()
+                                                     or p.get('real_name', '').strip()
+                                                     or uresp['user'].get('name', uid))
+                    except Exception:
+                        pass
+                for match in matches:
+                    ts = float(match.get('ts', 0))
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    time_display = dt.strftime('%d %b %H:%M')
+                    ch_name = match.get('channel', {}).get('name', '')
+                    ch_id = match.get('channel', {}).get('id', '')
+                    uid = match.get('user', '')
+                    display_name = _slack_user_cache.get(uid, match.get('username', uid))
+                    # Build slack:// deep link for Slack app
+                    msg_link = ''
+                    if _slack_team_id and ch_id:
+                        msg_link = f"slack://channel?team={_slack_team_id}&id={ch_id}&message={match.get('ts', '')}"
+                    else:
+                        msg_link = match.get('permalink', '')
+                    result['slack'].append({
+                        'channel': ch_name,
+                        'user': display_name,
+                        'text': match.get('text', '')[:300],
+                        'time': time_display,
+                        'sort_ts': ts,
+                        'link': msg_link,
+                    })
+        except Exception:
+            pass
+
+    result['emails'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
+    result['events'].sort(key=lambda x: x.get('sort_ts', 0))
+    result['slack'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
+
+    return jsonify(result)
+
+
+@app.route('/work-ai-search', methods=['POST'])
+def work_ai_search():
+    """AI-powered search over work data using Claude Haiku."""
+    import queue as _queue
+
+    data = request.json or {}
+    query = data.get('query', '').strip()
+    if not query:
+        return jsonify({'error': 'No query provided'}), 400
+
+    emails = data.get('emails', [])
+    events = data.get('events', [])
+    slack = data.get('slack', [])
+
+    # Build context for Claude
+    parts = []
+    if emails:
+        lines = []
+        for e in emails[:30]:
+            lines.append(f"- From: {e.get('from','')} | Subject: {e.get('subject','')} | {e.get('time','')}\n  {e.get('snippet','')}")
+        parts.append(f"EMAILS ({len(emails)}):\n" + "\n".join(lines))
+    if events:
+        lines = []
+        for ev in events[:20]:
+            loc = f" | Location: {ev['location']}" if ev.get('location') else ''
+            att = f" | With: {ev['attendees']}" if ev.get('attendees') else ''
+            lines.append(f"- {ev.get('summary','')} | {ev.get('when','')}{loc}{att}")
+        parts.append(f"CALENDAR ({len(events)}):\n" + "\n".join(lines))
+    if slack:
+        lines = []
+        for m in slack[:40]:
+            lines.append(f"- #{m.get('channel','')} | {m.get('user','')}: {m.get('text','')} ({m.get('time','')})")
+        parts.append(f"SLACK ({len(slack)}):\n" + "\n".join(lines))
+
+    context = "\n\n".join(parts) if parts else "(No work data loaded yet)"
+
+    prompt = f"""You are a helpful work assistant. The user has the following emails, calendar events and Slack messages loaded. Answer their question based on this data. Be concise and direct. If you reference specific items, mention enough detail to identify them (sender, subject, channel, time etc).
+
+{context}
+
+USER QUESTION: {query}"""
+
+    env = dict(os.environ)
+    for key in ['CLAUDE_CODE_ENTRYPOINT', 'CLAUDECODE', 'CLAUDE_CODE_SESSION']:
+        env.pop(key, None)
+    env['HOME'] = os.path.expanduser('~')
+    env['PATH'] = '/Users/timtrailor/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+    env.pop('ANTHROPIC_API_KEY', None)
+
+    cmd = [
+        'claude', '-p', prompt,
+        '--model', 'claude-haiku-4-5-20251001',
+        '--max-turns', '1',
+        '--output-format', 'stream-json',
+        '--verbose'
+    ]
+
+    def generate():
+        sse_queue = _queue.Queue()
+        SAFARI_PAD = ": " + "x" * 256 + "\n\n"
+        yield ": " + "x" * 2048 + "\n\n"
+
+        try:
+            import tempfile
+            output_fd, output_path = tempfile.mkstemp(
+                suffix='.jsonl', prefix='claude_ai_search_', dir='/tmp')
+            output_handle = os.fdopen(output_fd, 'wb', buffering=0)
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=output_handle, stderr=subprocess.PIPE,
+                    cwd=os.path.expanduser('~'), env=env
+                )
+            finally:
+                output_handle.close()
+
+            def _reader():
+                raw_buffer = b""
+                try:
+                    with open(output_path, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if chunk:
+                                raw_buffer += chunk
+                                while b'\n' in raw_buffer:
+                                    line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
+                                    line = line_bytes.decode('utf-8', errors='replace').strip()
+                                    if not line:
+                                        continue
+                                    try:
+                                        event = json.loads(line)
+                                        etype = event.get('type', '')
+                                        if etype == 'assistant':
+                                            for block in event.get('message', {}).get('content', []):
+                                                if block.get('type') == 'text' and block.get('text'):
+                                                    sse_queue.put(f"data: {json.dumps({'type': 'text', 'content': block['text']})}\n\n")
+                                        elif etype == 'result':
+                                            cost = event.get('total_cost_usd', 0)
+                                            dur = event.get('duration_ms', 0)
+                                            if cost > 0:
+                                                sse_queue.put(f"data: {json.dumps({'type': 'cost', 'content': f'${cost:.4f} | {dur/1000:.1f}s'})}\n\n")
+                                    except json.JSONDecodeError:
+                                        pass
+                            else:
+                                if proc.poll() is not None:
+                                    time.sleep(0.3)
+                                    final = f.read()
+                                    if final:
+                                        raw_buffer += final
+                                        while b'\n' in raw_buffer:
+                                            line_bytes, raw_buffer = raw_buffer.split(b'\n', 1)
+                                            line = line_bytes.decode('utf-8', errors='replace').strip()
+                                            if line:
+                                                try:
+                                                    event = json.loads(line)
+                                                    if event.get('type') == 'assistant':
+                                                        for block in event.get('message', {}).get('content', []):
+                                                            if block.get('type') == 'text' and block.get('text'):
+                                                                sse_queue.put(f"data: {json.dumps({'type': 'text', 'content': block['text']})}\n\n")
+                                                except json.JSONDecodeError:
+                                                    pass
+                                    break
+                                time.sleep(0.2)
+                except Exception:
+                    pass
+                finally:
+                    proc.wait()
+                    try:
+                        os.unlink(output_path)
+                    except Exception:
+                        pass
+                    sse_queue.put(None)
+
+            reader = threading.Thread(target=_reader, daemon=True)
+            reader.start()
+
+            while True:
+                try:
+                    item = sse_queue.get(timeout=2.0)
+                    if item is None:
+                        break
+                    yield item + SAFARI_PAD
+                except _queue.Empty:
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n" + SAFARI_PAD
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache',
+                             'X-Accel-Buffering': 'no',
+                             'Connection': 'keep-alive'})
 
 
 @app.route('/cancel', methods=['POST'])
@@ -1924,6 +3652,7 @@ def cancel():
                 except Exception:
                     pass
             current_proc = None
+            _clear_work_state()
             return jsonify({'status': 'cancelled'})
     return jsonify({'status': 'nothing_running'})
 
@@ -1952,7 +3681,7 @@ def proxy_governors(path=''):
 
     # Forward headers, replacing Host
     headers = {k: v for k, v in request.headers if k.lower() not in ('host', 'content-length')}
-    headers['Host'] = '192.168.87.37:8501'
+    headers['Host'] = f'{STREAMLIT_IP}:{STREAMLIT_PORT}'
 
     try:
         resp = http_requests.request(
@@ -2001,7 +3730,7 @@ def proxy_governors_ws(ws):
     """Reverse proxy WebSocket to Streamlit's _stcore/stream."""
     # Build upstream WebSocket URL
     qs = request.query_string.decode()
-    upstream_url = f'ws://192.168.87.37:8501/_stcore/stream'
+    upstream_url = f'ws://{STREAMLIT_IP}:{STREAMLIT_PORT}/_stcore/stream'
     if qs:
         upstream_url += f'?{qs}'
 
@@ -2059,16 +3788,24 @@ def proxy_governors_ws(ws):
 
 @app.route('/restart', methods=['POST'])
 def restart_server():
-    """Restart the Flask server — shut down cleanly before re-exec to avoid port conflict."""
-    import threading, signal
+    """Restart the Flask server — shut down cleanly before re-exec to avoid port conflict.
+
+    If a Claude subprocess is active, it keeps running (stdout goes to a temp file,
+    not a pipe) and the new wrapper instance reattaches via /pending-work + /reattach.
+    """
+    import signal
+    # Detach reader thread from subprocess — it will die with the old process,
+    # but the Claude subprocess survives because its stdout goes to a file.
+    with current_proc_lock:
+        active = current_proc is not None and current_proc.poll() is None
     def _restart():
-        import time; time.sleep(0.3)
-        # Shut down the Werkzeug server so port 8080 is released
+        time.sleep(0.3)
         os.kill(os.getpid(), signal.SIGINT)
         time.sleep(1)
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=_restart, daemon=True).start()
-    return 'Restarting...', 200
+    msg = 'Restarting... (active work will resume automatically)' if active else 'Restarting...'
+    return msg, 200
 
 
 if __name__ == '__main__':
