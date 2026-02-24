@@ -1233,6 +1233,90 @@ body {
         return svg;
     }
 
+    function renderEtaGraph(history, currentProgress) {
+        if (!history || history.length < 2) return '';
+        var W = 280, H = 110, PAD_L = 38, PAD_R = 8, PAD_T = 14, PAD_B = 20;
+        var gW = W - PAD_L - PAD_R;
+        var gH = H - PAD_T - PAD_B;
+        var n = history.length;
+
+        // Find min/max finish timestamps for Y axis
+        var minTs = Infinity, maxTs = -Infinity;
+        for (var i = 0; i < n; i++) {
+            var t = history[i].finish_ts;
+            if (t < minTs) minTs = t;
+            if (t > maxTs) maxTs = t;
+        }
+        // Add 5% padding to Y range
+        var range = maxTs - minTs;
+        if (range < 600) range = 600; // minimum 10 min range
+        var pad = range * 0.05;
+        var yMin = minTs - pad;
+        var yMax = maxTs + pad;
+        var yRange = yMax - yMin;
+
+        // X axis: progress %
+        var xMin = history[0].progress;
+        var xMax = history[n - 1].progress;
+        if (xMax - xMin < 1) xMax = xMin + 1;
+
+        function xPos(prog) { return PAD_L + ((prog - xMin) / (xMax - xMin)) * gW; }
+        function yPos(ts) { return PAD_T + gH - ((ts - yMin) / yRange) * gH; }
+
+        var svg = '<div style="margin:6px 0;padding:6px 8px;background:#1a1a2e;border-radius:8px;">';
+        svg += '<div style="font-size:10px;color:#888;margin-bottom:4px;">ETA HISTORY (predicted finish time vs progress)</div>';
+        svg += '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" style="display:block;">';
+
+        // Y-axis grid lines (time labels)
+        var nGrid = 4;
+        for (var g = 0; g <= nGrid; g++) {
+            var ts = yMin + (g / nGrid) * yRange;
+            var gy = yPos(ts);
+            svg += '<line x1="' + PAD_L + '" y1="' + gy + '" x2="' + (W - PAD_R) + '" y2="' + gy + '" stroke="#333" stroke-width="0.5"/>';
+            // Format as HH:MM
+            var d = new Date(ts * 1000);
+            var lbl = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+            svg += '<text x="' + (PAD_L - 3) + '" y="' + (gy + 3) + '" fill="#666" font-size="7" text-anchor="end">' + lbl + '</text>';
+        }
+
+        // X-axis labels (progress %)
+        var xSteps = [xMin, Math.round((xMin + xMax) / 2), xMax];
+        for (var xi = 0; xi < xSteps.length; xi++) {
+            svg += '<text x="' + xPos(xSteps[xi]) + '" y="' + (H - 4) + '" fill="#666" font-size="7" text-anchor="middle">' + Math.round(xSteps[xi]) + '%</text>';
+        }
+
+        // Draw the ETA line
+        var path = '';
+        for (var i = 0; i < n; i++) {
+            var px = xPos(history[i].progress);
+            var py = yPos(history[i].finish_ts);
+            path += (i === 0 ? 'M' : 'L') + px.toFixed(1) + ' ' + py.toFixed(1);
+        }
+        svg += '<path d="' + path + '" fill="none" stroke="#c9a96e" stroke-width="1.5"/>';
+
+        // Dots at start and end
+        var first = history[0], last = history[n - 1];
+        svg += '<circle cx="' + xPos(first.progress) + '" cy="' + yPos(first.finish_ts) + '" r="2.5" fill="#c9a96e" stroke="#fff" stroke-width="0.5"/>';
+        svg += '<circle cx="' + xPos(last.progress) + '" cy="' + yPos(last.finish_ts) + '" r="3" fill="#c9a96e" stroke="#fff" stroke-width="0.5"/>';
+
+        // Current ETA label at the end
+        svg += '<text x="' + (xPos(last.progress) - 3) + '" y="' + (yPos(last.finish_ts) - 6) + '" fill="#c9a96e" font-size="9" text-anchor="end">' + last.finish_str + '</text>';
+
+        // Drift indicator
+        var driftMin = Math.round((last.finish_ts - first.finish_ts) / 60);
+        var driftColor = Math.abs(driftMin) < 15 ? '#4a7' : driftMin > 0 ? '#e55' : '#4a7';
+        var driftLabel = driftMin > 0 ? '+' + driftMin + 'min' : driftMin + 'min';
+        if (Math.abs(driftMin) < 2) driftLabel = 'stable';
+        svg += '<text x="' + (W - PAD_R) + '" y="' + (PAD_T - 2) + '" fill="' + driftColor + '" font-size="9" text-anchor="end">Drift: ' + driftLabel + '</text>';
+
+        svg += '</svg>';
+        svg += '<div style="font-size:9px;color:#666;display:flex;gap:10px;margin-top:2px;">';
+        svg += '<span><span style="color:#c9a96e;">&#9644;</span> Predicted finish</span>';
+        svg += '<span style="color:#888;">Flat = accurate, rising = slipping</span>';
+        svg += '</div></div>';
+        return svg;
+    }
+
     function renderPrinterCard(p, name, accent, camImg, thumbImg) {
         var h = '<div class="printer-card">';
         h += '<div class="card-header">';
@@ -1321,6 +1405,11 @@ body {
         // Speed graph (per-layer optimal speeds)
         if (p.speed_graph && p.speed_graph.length > 1) {
             h += renderSpeedGraph(p.speed_graph, p.current_layer || 0, p.current_speed_pct || 100);
+        }
+
+        // ETA history graph (predicted finish time over print progress)
+        if (p.eta_history && p.eta_history.length >= 2) {
+            h += renderEtaGraph(p.eta_history, p.progress || 0);
         }
 
         // Filament feed warning
@@ -2571,6 +2660,44 @@ def printer_status():
 
                 sv['speed_graph'] = speed_graph
                 sv['current_speed_pct'] = round(spd * 100)
+
+                # Load ETA history from tracker for ETA drift graph
+                try:
+                    tracker_path = '/tmp/printer_status/print_tracker.jsonl'
+                    if os.path.exists(tracker_path):
+                        eta_history = []
+                        cur_file = sv.get('filename', '')
+                        with open(tracker_path) as tf:
+                            for line in tf:
+                                try:
+                                    entry = json.loads(line.strip())
+                                    if entry.get('file') != cur_file:
+                                        continue
+                                    rem = entry.get('remaining_s')
+                                    ts = entry.get('ts', '')
+                                    prog = entry.get('progress', 0)
+                                    elapsed = entry.get('print_duration', 0)
+                                    if rem and ts and prog > 0:
+                                        # Calculate predicted finish time as
+                                        # unix timestamp for graph
+                                        from datetime import datetime as _dt
+                                        snap_time = _dt.fromisoformat(ts)
+                                        finish_ts = snap_time.timestamp() + rem
+                                        eta_history.append({
+                                            'progress': round(prog, 1),
+                                            'elapsed_h': round(elapsed / 3600, 2),
+                                            'remaining_h': round(rem / 3600, 2),
+                                            'finish_ts': round(finish_ts),
+                                            'finish_str': _dt.fromtimestamp(
+                                                finish_ts).strftime('%H:%M'),
+                                        })
+                                except Exception:
+                                    continue
+                        if len(eta_history) >= 2:
+                            sv['eta_history'] = eta_history
+                except Exception:
+                    pass
+
         except Exception:
             pass
 
