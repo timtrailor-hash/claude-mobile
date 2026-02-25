@@ -79,6 +79,7 @@ CHAT_HTML = """<!DOCTYPE html>
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <title>Claude Code</title>
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js');}</script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -1886,10 +1887,20 @@ body {
         smartResults.innerHTML = html;
     }
 
+    function scrollToSmartRef(evt) {
+        evt.preventDefault();
+        var el = document.getElementById(evt.target.dataset.ref);
+        if (el) {
+            el.scrollIntoView({behavior:'smooth',block:'center'});
+            el.style.outline = '2px solid #a78bfa';
+            setTimeout(function(){ el.style.outline = ''; }, 2000);
+        }
+    }
+
     function linkifyRefs(text) {
         // Turn [email:0], [calendar:2], [slack:1] into clickable links that scroll to the card
         return esc(text).replace(/\[(email|calendar|slack):(\d+)\]/g, function(match, type, idx) {
-            return '<a href="#" onclick="var el=document.getElementById(\'smart-' + type + '-' + idx + '\');if(el){el.scrollIntoView({behavior:\'smooth\',block:\'center\'});el.style.outline=\'2px solid #a78bfa\';setTimeout(function(){el.style.outline=\'\';},2000);}return false;" style="color:#a78bfa;text-decoration:underline;cursor:pointer;">' + type + ' ' + idx + '</a>';
+            return '<a href="#" data-ref="smart-' + type + '-' + idx + '" onclick="scrollToSmartRef(event)" style="color:#a78bfa;text-decoration:underline;cursor:pointer;">' + type + ' ' + idx + '</a>';
         });
     }
 
@@ -2046,6 +2057,130 @@ function switchTab(tab) {
 </script>
 </body>
 </html>"""
+
+
+OFFLINE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Claude Code — Reconnecting</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #1a1a2e; color: #e0e0e0;
+    height: 100dvh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    padding: 20px;
+}
+.spinner {
+    width: 40px; height: 40px; border: 3px solid #2a2a4a;
+    border-top-color: #c9a96e; border-radius: 50%;
+    animation: spin 0.8s linear infinite; margin-bottom: 20px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+h1 { font-size: 20px; color: #c9a96e; margin-bottom: 8px; }
+.status { font-size: 14px; color: #888; margin-bottom: 4px; }
+.hint {
+    font-size: 14px; color: #e0e0e0; margin-top: 16px; padding: 12px 18px;
+    background: #2a2a4a; border-radius: 10px; border-left: 3px solid #c9a96e;
+    display: none;
+}
+.attempt { font-size: 12px; color: #555; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="spinner" id="spinner"></div>
+<h1>Reconnecting...</h1>
+<div class="status" id="status">Trying to reach server</div>
+<div class="hint" id="hint">Check Tailscale is connected on your iPhone</div>
+<div class="attempt" id="attempt"></div>
+<script>
+var attempts = 0;
+var maxBackoff = 10000;
+function tryReconnect() {
+    attempts++;
+    var el = document.getElementById('status');
+    var hint = document.getElementById('hint');
+    var att = document.getElementById('attempt');
+    el.textContent = 'Attempting to reconnect...';
+    att.textContent = 'Attempt ' + attempts;
+    if (attempts >= 4) {
+        hint.style.display = 'block';
+    }
+    fetch('/', {cache: 'no-store'}).then(function(r) {
+        if (r.ok) {
+            el.textContent = 'Connected! Reloading...';
+            document.getElementById('spinner').style.borderTopColor = '#4a4';
+            window.location.replace('/');
+        } else {
+            scheduleRetry();
+        }
+    }).catch(function() {
+        el.textContent = 'Server unreachable';
+        scheduleRetry();
+    });
+}
+function scheduleRetry() {
+    var delay = Math.min(3000 * Math.pow(1.3, attempts - 1), maxBackoff);
+    setTimeout(tryReconnect, delay);
+}
+tryReconnect();
+</script>
+</body>
+</html>"""
+
+SW_JS = """
+var CACHE_NAME = 'claude-offline-v1';
+var OFFLINE_URL = '/offline';
+
+self.addEventListener('install', function(event) {
+    event.waitUntil(
+        caches.open(CACHE_NAME).then(function(cache) {
+            return cache.add(new Request(OFFLINE_URL, {cache: 'reload'}));
+        }).then(function() { self.skipWaiting(); })
+    );
+});
+
+self.addEventListener('activate', function(event) {
+    event.waitUntil(
+        caches.keys().then(function(names) {
+            return Promise.all(
+                names.filter(function(n) { return n !== CACHE_NAME; })
+                     .map(function(n) { return caches.delete(n); })
+            );
+        }).then(function() { return self.clients.claim(); })
+    );
+});
+
+self.addEventListener('fetch', function(event) {
+    if (event.request.mode === 'navigate') {
+        event.respondWith(
+            fetch(event.request).catch(function() {
+                return caches.match(OFFLINE_URL);
+            })
+        );
+    }
+});
+"""
+
+
+@app.route('/sw.js')
+def service_worker():
+    resp = Response(SW_JS, content_type='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.headers['Service-Worker-Allowed'] = '/'
+    return resp
+
+
+@app.route('/offline')
+def offline_page():
+    resp = Response(OFFLINE_HTML, content_type='text/html')
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
 
 
 @app.route('/')
@@ -2315,6 +2450,10 @@ def printer_image(name):
     img_dir = '/tmp/printer_status'
     path = os.path.join(img_dir, name)
     if not os.path.exists(path):
+        return 'Not found', 404
+    # Don't serve stale camera images (>10 min old) — misleading
+    age = time.time() - os.path.getmtime(path)
+    if age > 600 and name.endswith('_camera.jpg'):
         return 'Not found', 404
     return send_from_directory(img_dir, name)
 
