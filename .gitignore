@@ -1,6 +1,7 @@
 uploads/
 google_credentials.json
 google_token.json
+google_token.json.bak
 google_token_work.json
 imap_accounts.json
 slack_config.json
@@ -8,3 +9,5 @@ credentials.py
 wrapper.log
 .work_state.json
 __pycache__/
+static/
+.DS_Store

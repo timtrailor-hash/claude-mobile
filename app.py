@@ -500,6 +500,8 @@ body {
     var messageQueue = [];
     var currentAbortController = null;
     var wasCancelled = false;
+    var wasTruncated = false;
+    var autoContCount = 0;  // Track consecutive auto-continues to prevent loops
     var workingTimer = null;
     var workingDiv = null;
     var workingStart = 0;
@@ -661,6 +663,19 @@ body {
         setButtonMode('send');
         inputEl.focus();
         if (staleTimer) { clearInterval(staleTimer); staleTimer = null; }
+
+        // Auto-continue: if response was truncated by turn limit, automatically
+        // send "Continue" (up to 3 times to prevent infinite loops)
+        if (wasTruncated && !wasCancelled && autoContCount < 3) {
+            wasTruncated = false;
+            autoContCount++;
+            addMsg('msg system', '<span style="color:#88aacc;">Auto-continuing (' + autoContCount + '/3)...</span>');
+            setTimeout(function() { sendMessage('Continue from where you left off.', [], true); }, 500);
+            return;
+        }
+        wasTruncated = false;
+        autoContCount = 0;
+
         if (messageQueue.length > 0) {
             var next = messageQueue.shift();
             var tag = next.div && next.div.querySelector('.queue-tag');
@@ -685,7 +700,7 @@ body {
             if (!sending) { clearInterval(staleTimer); staleTimer = null; return; }
             if (_tabHidden) return; // Don't fire while backgrounded — visibilitychange handles it
             var idle = Date.now() - lastActivityTime;
-            if (idle > 120000) {
+            if (idle > 45000) {
                 // Try to recover missed response before giving up
                 fetch('/last-response').then(function(r) { return r.json(); }).then(function(data) {
                     if (data.text && data.seq > lastSeenSeq) {
@@ -778,6 +793,8 @@ body {
                                 // AND via timeout (belt + suspenders for Safari)
                                 finishSend();
                                 setTimeout(finishSend, 500);
+                            } else if (data.type === 'done') {
+                                if (data.truncated) wasTruncated = true;
                             } else if (data.type === 'ping') {
                                 touchWorkingIndicator();
                             } else if (data.type === 'error') {
@@ -1018,7 +1035,7 @@ body {
                 if (!sending) { clearInterval(staleTimer); staleTimer = null; return; }
                 if (_tabHidden) return;
                 var idle = Date.now() - lastActivityTime;
-                if (idle > 120000) { finishSend(); }
+                if (idle > 45000) { finishSend(); }
             }, 10000);
 
             fetch('/reattach?offset=' + lastOffset, {signal: currentAbortController.signal}).then(function(response) {
@@ -3188,14 +3205,19 @@ def _search_slack(query, max_results=10):
 
 
 def _get_anthropic_key():
-    """Get Anthropic API key for Haiku calls."""
+    """Get Anthropic API key for Haiku calls (direct API, NOT Claude CLI).
+    Uses shared_utils.get_api_key() — single source of truth."""
     try:
-        import sys as _sys
-        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-        from credentials import ANTHROPIC_API_KEY
-        return ANTHROPIC_API_KEY
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+        from shared_utils import get_api_key
+        return get_api_key()
     except ImportError:
-        return os.environ.get('ANTHROPIC_API_KEY', '')
+        # Fallback if shared_utils not available
+        try:
+            from credentials import ANTHROPIC_API_KEY
+            return ANTHROPIC_API_KEY
+        except ImportError:
+            return os.environ.get('ANTHROPIC_API_KEY', '')
 
 
 _SMART_SEARCH_TOOLS = [

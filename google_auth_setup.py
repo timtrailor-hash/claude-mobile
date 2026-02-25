@@ -15,6 +15,7 @@ from google.oauth2.credentials import Credentials
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/drive.file',
 ]
 
 DIR = os.path.dirname(os.path.abspath(__file__))
