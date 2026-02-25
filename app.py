@@ -709,6 +709,7 @@ body {
         var fullText = '';
         var gotData = false;
         var hadToolOutput = false;
+        var hadCost = false;
         lastOffset = 0;  // Reset offset for new conversation turn
         currentAbortController = new AbortController();
 
@@ -728,7 +729,19 @@ body {
 
             function readChunk() {
                 return reader.read().then(function(result) {
-                    if (result.done) { finishSend(); return; }
+                    if (result.done) {
+                        // Stream ended — verify we got everything
+                        fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
+                            if (lr.text && lr.text.length > fullText.length) {
+                                if (!assistantDiv) assistantDiv = addMsg('msg assistant', '');
+                                fullText = lr.text;
+                                assistantDiv.innerHTML = formatOutput(fullText);
+                                scrollToBottom(true);
+                            }
+                            if (lr.cost && !hadCost) addMsg('cost', lr.cost);
+                        }).catch(function() {}).finally(function() { finishSend(); });
+                        return;
+                    }
                     // Any incoming data = connection alive, reset stale timer
                     lastActivityTime = Date.now();
                     buffer += decoder.decode(result.value, {stream: true});
@@ -758,6 +771,7 @@ body {
                                 assistantDiv.innerHTML = formatOutput(fullText);
                                 scrollToBottom();
                             } else if (data.type === 'cost') {
+                                hadCost = true;
                                 addMsg('cost', data.content);
                                 // Cost is always the final event — call directly
                                 // AND via timeout (belt + suspenders for Safari)
@@ -787,13 +801,14 @@ body {
                             fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
                                 if (lr.text && lr.seq > lastSeenSeq) {
                                     lastSeenSeq = lr.seq;
-                                    var div = addMsg('msg assistant', '', true);
-                                    div.innerHTML = formatOutput(lr.text);
+                                    // Reuse existing div if present, else create new
+                                    if (!assistantDiv) assistantDiv = addMsg('msg assistant', '', true);
+                                    fullText = lr.text;
+                                    assistantDiv.innerHTML = formatOutput(fullText);
                                     if (lr.cost) addMsg('cost', lr.cost);
                                     scrollToBottom(true);
                                 }
-                            }).catch(function() {});
-                            finishSend();
+                            }).catch(function() {}).finally(function() { finishSend(); });
                         }
                     }).catch(function() { finishSend(); });
                 });
@@ -1012,7 +1027,19 @@ body {
 
                 function readChunk() {
                     return reader.read().then(function(result) {
-                        if (result.done) { finishSend(); return; }
+                        if (result.done) {
+                            // Stream ended — verify we got everything
+                            fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
+                                if (lr.text && lr.text.length > fullText.length) {
+                                    if (!assistantDiv) assistantDiv = addMsg('msg assistant', '');
+                                    fullText = lr.text;
+                                    assistantDiv.innerHTML = formatOutput(fullText);
+                                    scrollToBottom(true);
+                                }
+                                if (lr.cost) addMsg('cost', lr.cost);
+                            }).catch(function() {}).finally(function() { finishSend(); });
+                            return;
+                        }
                         lastActivityTime = Date.now();
                         buffer += decoder.decode(result.value, {stream: true});
                         var lines = buffer.split('\\n');
@@ -1055,13 +1082,13 @@ body {
                                 fetch('/last-response').then(function(r) { return r.json(); }).then(function(lr) {
                                     if (lr.text && lr.seq > lastSeenSeq) {
                                         lastSeenSeq = lr.seq;
-                                        var div = addMsg('msg assistant', '', true);
-                                        div.innerHTML = formatOutput(lr.text);
+                                        if (!assistantDiv) assistantDiv = addMsg('msg assistant', '', true);
+                                        fullText = lr.text;
+                                        assistantDiv.innerHTML = formatOutput(fullText);
                                         if (lr.cost) addMsg('cost', lr.cost);
                                         scrollToBottom(true);
                                     }
-                                }).catch(function() {});
-                                finishSend();
+                                }).catch(function() {}).finally(function() { finishSend(); });
                             }
                         }).catch(function() { finishSend(); });
                     });
