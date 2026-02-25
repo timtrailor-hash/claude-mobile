@@ -1003,6 +1003,15 @@ _prev_printer_state = {"sv08": None, "a1": None}
 _ai_check_counter = [0]  # Mutable so nested function can modify
 _last_obico_alert_ts = [None]  # Track last Obico alert to avoid duplicates
 _last_bambu_ai_alert = [0]  # Timestamp of last Bambu AI alert (cooldown)
+_last_obico_check = [0]  # Timestamp of last Obico check
+_last_bambu_ai_check = [0]  # Timestamp of last Bambu AI check
+
+# Configurable AI check intervals (seconds, 0 = off)
+_ai_config = {
+    "bambu_interval": 300,   # Default 5 min
+    "sv08_interval": 300,    # Default 5 min
+}
+_ai_config_lock = threading.Lock()
 
 
 def _check_obico_alerts():
@@ -1058,16 +1067,23 @@ def _check_bambu_camera_ai(printer_data):
     if a1_state != "RUNNING":
         return
 
-    # Cooldown: don't alert more than once every 5 minutes
-    if time.time() - _last_bambu_ai_alert[0] < 300:
+    # Cooldown: don't alert more than once per check interval
+    with _ai_config_lock:
+        interval = _ai_config["bambu_interval"]
+    if interval <= 0:
+        return
+    if time.time() - _last_bambu_ai_alert[0] < interval:
         return
 
-    # Check camera image exists and is fresh (< 2 minutes old)
+    # Check camera image exists and is fresh
+    # Freshness window scales with interval: 2min for 1min, 5min for 5min, 10min for 15min, 30min for 1hr
+    freshness_map = {60: 120, 300: 300, 900: 600, 3600: 1800}
+    max_age = freshness_map.get(interval, max(120, interval // 2))
     cam_path = "/tmp/printer_status/a1_camera.jpg"
     if not os.path.exists(cam_path):
         return
     age = time.time() - os.path.getmtime(cam_path)
-    if age > 120:  # Image older than 2 minutes
+    if age > max_age:
         return
 
     try:
@@ -1223,10 +1239,16 @@ def _check_printer_state():
                 _printer_watches[:] = [w for w in _printer_watches
                                        if w["id"] not in triggered]
 
-            # AI failure detection checks (every other cycle = ~60s)
-            _ai_check_counter[0] += 1
-            if _ai_check_counter[0] % 2 == 0:
+            # AI failure detection checks (configurable intervals)
+            now = time.time()
+            with _ai_config_lock:
+                sv08_interval = _ai_config["sv08_interval"]
+                bambu_interval = _ai_config["bambu_interval"]
+            if sv08_interval > 0 and now - _last_obico_check[0] >= sv08_interval:
+                _last_obico_check[0] = now
                 _check_obico_alerts()
+            if bambu_interval > 0 and now - _last_bambu_ai_check[0] >= bambu_interval:
+                _last_bambu_ai_check[0] = now
                 _check_bambu_camera_ai(data)
 
         except Exception as e:
@@ -1389,6 +1411,22 @@ def governors_reset():
     with open(flag, "w") as f:
         f.write("reset")
     return jsonify({"ok": True})
+
+
+@app.route("/ai-check-config", methods=["POST", "GET"])
+def ai_check_config():
+    """Configure AI failure detection intervals."""
+    if request.method == "GET":
+        with _ai_config_lock:
+            return jsonify(_ai_config)
+    data = request.get_json(silent=True) or {}
+    with _ai_config_lock:
+        if "bambu_interval" in data:
+            _ai_config["bambu_interval"] = int(data["bambu_interval"])
+        if "sv08_interval" in data:
+            _ai_config["sv08_interval"] = int(data["sv08_interval"])
+        print(f"[{datetime.now().isoformat()}] AI config updated: {_ai_config}", flush=True)
+        return jsonify(_ai_config)
 
 
 @app.route("/work-search")
