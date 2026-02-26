@@ -23,6 +23,7 @@ Routes:
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -63,6 +64,7 @@ _session = {
     "started": None,
     "last_activity": None,
     "reader_running": False,  # Is the reader thread active?
+    "generation": 0,       # Incremented on each subprocess spawn; prevents stale reader cleanup
 }
 
 # Last completed response for recovery
@@ -109,8 +111,8 @@ def _append_event(events_file, event_data):
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] ERROR: Failed to write event: {e}", flush=True)
 
     # Wake any WebSocket handlers waiting for new events
     with _event_condition:
@@ -230,7 +232,7 @@ def _keepalive_thread(session_id, events_file_arg, activity_ref, done_flag):
                     _session["last_activity"] = time.time()
 
 
-def _reader_thread(proc):
+def _reader_thread(proc, generation):
     """Background thread: reads from persistent Claude CLI subprocess stdout.
 
     Runs for the entire lifetime of the subprocess. Routes events to the
@@ -239,6 +241,9 @@ def _reader_thread(proc):
 
     The subprocess stays alive between turns (messages). On process exit
     (normal or crash), marks session as error and cleans up.
+
+    The generation parameter prevents a stale reader from overwriting state
+    that belongs to a newer subprocess (e.g. after cancel + respawn).
     """
     spawn_time = time.time()
     first_byte_logged = False
@@ -346,20 +351,30 @@ def _reader_thread(proc):
 
     done_flag[0] = True
 
-    # Subprocess exited — write done if turn was in progress
+    # Subprocess exited — write done if turn was in progress.
+    # Only clear session state if our generation still matches — a newer
+    # subprocess may have already been spawned (e.g. after cancel + respawn).
     with _lock:
-        if _session.get("status") == "running":
-            events_file = _session.get("events_file")
-            if events_file:
-                _append_event(events_file, {"type": "done", "truncated": False})
-            _session["status"] = "completed"
-        _session["proc"] = None
-        _session["stdin_pipe"] = None
-        _session["pid"] = None
-        _session["reader_running"] = False
+        if _session.get("generation") == generation:
+            if _session.get("status") == "running":
+                events_file = _session.get("events_file")
+                if events_file:
+                    _append_event(events_file, {"type": "done", "truncated": False})
+                _session["status"] = "completed"
+            _session["proc"] = None
+            _session["stdin_pipe"] = None
+            _session["pid"] = None
+            _session["reader_running"] = False
+        else:
+            print(f"[{datetime.now().isoformat()}] Reader thread (gen {generation}) "
+                  f"skipping cleanup — newer gen {_session.get('generation')} active",
+                  flush=True)
 
-    print(f"[{datetime.now().isoformat()}] Reader thread exited (subprocess ended)",
-          flush=True)
+    print(f"[{datetime.now().isoformat()}] Reader thread (gen {generation}) exited "
+          f"(subprocess ended)", flush=True)
+
+
+_spawn_lock = threading.Lock()  # Serialises check-and-spawn in _ensure_subprocess
 
 
 def _ensure_subprocess():
@@ -369,135 +384,142 @@ def _ensure_subprocess():
     events come out via stdout. It stays alive across multiple messages.
     Permission requests are handled via the MCP approval server.
 
+    Uses _spawn_lock to prevent the race between "is it running?" check and
+    the Popen call — without this, two threads could both see "not running"
+    and spawn duplicate subprocesses.
+
     Returns True if subprocess is running, False on error.
     """
-    with _lock:
-        if (_session.get("proc") and _session["proc"].poll() is None
-                and _session.get("reader_running")):
-            return True  # Already running
+    with _spawn_lock:
+        with _lock:
+            if (_session.get("proc") and _session["proc"].poll() is None
+                    and _session.get("reader_running")):
+                return True  # Already running
 
-    # Build command — persistent subprocess with bidirectional streaming
-    #
-    # IMPORTANT: --setting-sources "" prevents loading project/user-level
-    # allowedTools from .claude/settings.local.json that would auto-approve
-    # everything and bypass the permission bridge entirely.
-    #
-    # We use explicit --allowedTools per tier so safe tools are auto-approved
-    # at Layer 1 (static rules) BEFORE the --permission-prompt-tool (Layer 3)
-    # gets called. Without this, every tool call routes through the MCP bridge.
-    #
-    # Permission tiers (most → least permissive):
-    #   approve_all      → bypassPermissions — never prompt
-    #   terminal_only    → reads+edits+web auto, only terminal commands prompt
-    #   terminal_and_web → reads+edits auto, terminal+web prompt
-    #   most_actions     → reads auto, writes/terminal/web all prompt
-    level = _permission_level
+        # Build command — persistent subprocess with bidirectional streaming
+        #
+        # IMPORTANT: --setting-sources "" prevents loading project/user-level
+        # allowedTools from .claude/settings.local.json that would auto-approve
+        # everything and bypass the permission bridge entirely.
+        #
+        # We use explicit --allowedTools per tier so safe tools are auto-approved
+        # at Layer 1 (static rules) BEFORE the --permission-prompt-tool (Layer 3)
+        # gets called. Without this, every tool call routes through the MCP bridge.
+        #
+        # Permission tiers (most → least permissive):
+        #   approve_all      → bypassPermissions — never prompt
+        #   terminal_only    → reads+edits+web auto, only terminal commands prompt
+        #   terminal_and_web → reads+edits auto, terminal+web prompt
+        #   most_actions     → reads auto, writes/terminal/web all prompt
+        level = _permission_level
 
-    # Tool groups for --allowedTools whitelist
-    READ_TOOLS = "Read Glob Grep"
-    EDIT_TOOLS = "Read Write Edit Glob Grep"
-    EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch Task"
+        # Tool groups for --allowedTools whitelist
+        READ_TOOLS = "Read Glob Grep"
+        EDIT_TOOLS = "Read Write Edit Glob Grep"
+        EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch Task"
 
-    cmd = [
-        "claude", "-p",
-        "--input-format", "stream-json",
-        "--output-format", "stream-json",
-        "--model", "claude-opus-4-6",
-        "--max-turns", "200",
-        "--verbose",
-        "--setting-sources", "",
-    ]
-
-    if level == "approve_all":
-        cmd += ["--permission-mode", "bypassPermissions"]
-    elif level == "terminal_only":
-        # Auto-approve file ops + web, prompt for terminal only
-        cmd += [
-            "--permission-mode", "default",
-            "--allowedTools", EDIT_AND_WEB_TOOLS,
-            "--permission-prompt-tool", "mcp__approval__approve",
-            "--mcp-config", MCP_CONFIG,
-        ]
-    elif level == "terminal_and_web":
-        # Auto-approve file ops, prompt for terminal + web
-        cmd += [
-            "--permission-mode", "default",
-            "--allowedTools", EDIT_TOOLS,
-            "--permission-prompt-tool", "mcp__approval__approve",
-            "--mcp-config", MCP_CONFIG,
-        ]
-    else:  # most_actions
-        # Auto-approve reads only, prompt for writes/terminal/web
-        cmd += [
-            "--permission-mode", "default",
-            "--allowedTools", READ_TOOLS,
-            "--permission-prompt-tool", "mcp__approval__approve",
-            "--mcp-config", MCP_CONFIG,
+        cmd = [
+            "claude", "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--model", "claude-opus-4-6",
+            "--max-turns", "200",
+            "--verbose",
+            "--setting-sources", "",
         ]
 
-    cmd += [
-        "--append-system-prompt",
-        "You are running in a mobile chat app but have FULL terminal capabilities. "
-        "Always run commands directly (bash, ping, curl, file reads, etc.) instead "
-        "of suggesting the user run them. You have full access to the filesystem, "
-        "network, and all tools — use them proactively just as you would in an "
-        "interactive terminal session. Never ask the user to run a command when "
-        "you can run it yourself.",
-    ]
+        if level == "approve_all":
+            cmd += ["--permission-mode", "bypassPermissions"]
+        elif level == "terminal_only":
+            # Auto-approve file ops + web, prompt for terminal only
+            cmd += [
+                "--permission-mode", "default",
+                "--allowedTools", EDIT_AND_WEB_TOOLS,
+                "--permission-prompt-tool", "mcp__approval__approve",
+                "--mcp-config", MCP_CONFIG,
+            ]
+        elif level == "terminal_and_web":
+            # Auto-approve file ops, prompt for terminal + web
+            cmd += [
+                "--permission-mode", "default",
+                "--allowedTools", EDIT_TOOLS,
+                "--permission-prompt-tool", "mcp__approval__approve",
+                "--mcp-config", MCP_CONFIG,
+            ]
+        else:  # most_actions
+            # Auto-approve reads only, prompt for writes/terminal/web
+            cmd += [
+                "--permission-mode", "default",
+                "--allowedTools", READ_TOOLS,
+                "--permission-prompt-tool", "mcp__approval__approve",
+                "--mcp-config", MCP_CONFIG,
+            ]
 
-    allowed_map = {
-        "approve_all": "all",
-        "terminal_only": EDIT_AND_WEB_TOOLS,
-        "terminal_and_web": EDIT_TOOLS,
-        "most_actions": READ_TOOLS,
-    }
-    print(f"[{datetime.now().isoformat()}] Permission level: {level} "
-          f"(allowed: {allowed_map.get(level, '?')})", flush=True)
+        cmd += [
+            "--append-system-prompt",
+            "You are running in a mobile chat app but have FULL terminal capabilities. "
+            "Always run commands directly (bash, ping, curl, file reads, etc.) instead "
+            "of suggesting the user run them. You have full access to the filesystem, "
+            "network, and all tools — use them proactively just as you would in an "
+            "interactive terminal session. Never ask the user to run a command when "
+            "you can run it yourself.",
+        ]
 
-    # Clean environment — subscription auth only, no API key leakage
-    env = env_for_claude_cli()
+        allowed_map = {
+            "approve_all": "all",
+            "terminal_only": EDIT_AND_WEB_TOOLS,
+            "terminal_and_web": EDIT_TOOLS,
+            "most_actions": READ_TOOLS,
+        }
+        print(f"[{datetime.now().isoformat()}] Permission level: {level} "
+              f"(allowed: {allowed_map.get(level, '?')})", flush=True)
 
-    try:
-        stderr_path = os.path.join(SESSIONS_DIR, "claude_stderr.log")
-        stderr_handle = open(stderr_path, "ab")
+        # Clean environment — subscription auth only, no API key leakage
+        env = env_for_claude_cli()
 
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_handle,
-                cwd=WORK_DIR,
-                env=env,
-                preexec_fn=os.setsid
-            )
-        finally:
-            stderr_handle.close()
+            stderr_path = os.path.join(SESSIONS_DIR, "claude_stderr.log")
+            stderr_handle = open(stderr_path, "ab")
 
-        with _lock:
-            _session["proc"] = proc
-            _session["stdin_pipe"] = proc.stdin
-            _session["pid"] = proc.pid
-            _session["reader_running"] = True
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_handle,
+                    cwd=WORK_DIR,
+                    env=env,
+                    preexec_fn=os.setsid
+                )
+            finally:
+                stderr_handle.close()
 
-        # Start persistent reader thread
-        reader = threading.Thread(
-            target=_reader_thread,
-            args=(proc,),
-            daemon=True)
-        reader.start()
+            with _lock:
+                _session["generation"] += 1
+                _session["proc"] = proc
+                _session["stdin_pipe"] = proc.stdin
+                _session["pid"] = proc.pid
+                _session["reader_running"] = True
+                gen = _session["generation"]
 
-        print(f"[{datetime.now().isoformat()}] Spawned persistent Claude subprocess "
-              f"(PID {proc.pid})", flush=True)
-        return True
+            # Start persistent reader thread (with generation for stale-cleanup guard)
+            reader = threading.Thread(
+                target=_reader_thread,
+                args=(proc, gen),
+                daemon=True)
+            reader.start()
 
-    except FileNotFoundError:
-        print(f"[{datetime.now().isoformat()}] Claude CLI not found", flush=True)
-        return False
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Failed to spawn subprocess: {e}",
-              flush=True)
-        return False
+            print(f"[{datetime.now().isoformat()}] Spawned persistent Claude subprocess "
+                  f"(PID {proc.pid}, gen {gen})", flush=True)
+            return True
+
+        except FileNotFoundError:
+            print(f"[{datetime.now().isoformat()}] Claude CLI not found", flush=True)
+            return False
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Failed to spawn subprocess: {e}",
+                  flush=True)
+            return False
 
 
 def _start_session(message, image_paths=None, client_session_id=None):
@@ -1758,6 +1780,10 @@ def exclude_object():
     name = body.get("name", "")
     if not name:
         return jsonify({"error": "Missing object name"}), 400
+    # Sanitize name to prevent gcode injection — only allow safe characters
+    name = re.sub(r'[^a-zA-Z0-9_.\-]', '', name)
+    if not name:
+        return jsonify({"error": "Invalid object name"}), 400
     try:
         gcode = f"EXCLUDE_OBJECT NAME={name}"
         payload = json.dumps({"script": gcode}).encode()
@@ -1971,11 +1997,64 @@ def work_search_proxy():
 
 @app.after_request
 def add_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
+    # No CORS header — native iOS app uses WebSocket (not browser CORS).
     # Service worker scope
     if response.content_type and 'javascript' in response.content_type:
         response.headers['Service-Worker-Allowed'] = '/'
     return response
+
+
+def _cleanup_thread():
+    """Background thread: periodically cleans up stale session dirs and upload files.
+
+    Runs every hour. Deletes:
+      - Session directories in SESSIONS_DIR older than 24 hours
+      - Upload files in /tmp/claude_uploads older than 1 hour
+    """
+    import tempfile
+    upload_dir = os.path.join(tempfile.gettempdir(), "claude_uploads")
+
+    while True:
+        time.sleep(3600)  # Run every hour
+        now = time.time()
+
+        # Clean session directories older than 24 hours
+        try:
+            for entry in os.listdir(SESSIONS_DIR):
+                entry_path = os.path.join(SESSIONS_DIR, entry)
+                if not os.path.isdir(entry_path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(entry_path)
+                    if now - mtime > 86400:  # 24 hours
+                        import shutil
+                        shutil.rmtree(entry_path, ignore_errors=True)
+                        print(f"[{datetime.now().isoformat()}] Cleanup: removed stale "
+                              f"session dir {entry}", flush=True)
+                except OSError:
+                    pass
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Cleanup error (sessions): {e}",
+                  flush=True)
+
+        # Clean upload files older than 1 hour
+        try:
+            if os.path.isdir(upload_dir):
+                for entry in os.listdir(upload_dir):
+                    entry_path = os.path.join(upload_dir, entry)
+                    if not os.path.isfile(entry_path):
+                        continue
+                    try:
+                        mtime = os.path.getmtime(entry_path)
+                        if now - mtime > 3600:  # 1 hour
+                            os.remove(entry_path)
+                            print(f"[{datetime.now().isoformat()}] Cleanup: removed stale "
+                                  f"upload {entry}", flush=True)
+                    except OSError:
+                        pass
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Cleanup error (uploads): {e}",
+                  flush=True)
 
 
 def _signal_handler(signum, frame):
@@ -2016,5 +2095,11 @@ if __name__ == "__main__":
     monitor = threading.Thread(target=_check_printer_state, daemon=True)
     monitor.start()
     print(f"[{datetime.now().isoformat()}] Printer state monitor started", flush=True)
+
+    # Start session/upload cleanup thread (hourly)
+    cleaner = threading.Thread(target=_cleanup_thread, daemon=True)
+    cleaner.start()
+    print(f"[{datetime.now().isoformat()}] Cleanup thread started (sessions >24h, uploads >1h)",
+          flush=True)
 
     app.run(host="0.0.0.0", port=8081, threaded=True)
