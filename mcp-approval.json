@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "approval": {
+      "command": "/Users/timtrailor/Documents/Claude code/venv/bin/python3",
+      "args": ["/Users/timtrailor/Documents/Claude code/claude-mobile/mcp_approval_server.py"],
+      "env": {
+        "APPROVAL_SERVER_URL": "http://127.0.0.1:8081"
+      }
+    }
+  }
+}

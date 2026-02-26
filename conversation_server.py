@@ -5,14 +5,20 @@ Runs as a persistent launchd daemon on port 8081.
 The wrapper (app.py) proxies to this server.
 Sessions survive wrapper restarts and iOS Safari connection drops.
 
+Architecture (v2 — persistent subprocess with permission bridge):
+  Claude CLI runs as a persistent subprocess with bidirectional stream-json.
+  Messages are written to stdin, events read from stdout.
+  Permission requests are bridged to the iOS app via an MCP approval server.
+
 Routes:
-  POST /send          — send message, spawn Claude CLI
+  POST /send          — send message to persistent Claude subprocess
   GET  /stream?offset=N — SSE stream from event N (reconnectable)
   WS   /ws            — WebSocket: real-time bidirectional (native iOS app)
   GET  /status        — current session status
   POST /cancel        — kill active subprocess
   POST /new-session   — clear session (start fresh conversation)
   GET  /last-response — last completed response text
+  POST /internal/permission-request — MCP approval server long-poll
 """
 
 import json
@@ -40,18 +46,23 @@ WORK_DIR = work_dir()
 SESSIONS_DIR = "/tmp/claude_sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
+MCP_CONFIG = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "mcp-approval.json")
+
 # ── Session state (single active conversation) ──
 _lock = threading.Lock()
 _session = {
-    "id": None,            # Current session UUID
-    "claude_sid": None,    # Claude conversation session ID (for --resume)
-    "proc": None,          # subprocess.Popen
+    "id": None,            # Current turn UUID (changes per message)
+    "claude_sid": None,    # Claude conversation session ID
+    "proc": None,          # subprocess.Popen (persistent)
+    "stdin_pipe": None,    # stdin of persistent subprocess
     "pid": None,           # PID (survives proc object loss)
-    "events_file": None,   # Processed SSE events (JSONL, one per line)
-    "event_count": 0,      # Number of events written
+    "events_file": None,   # Current turn's events (JSONL, one per line)
+    "event_count": 0,      # Number of events written for current turn
     "status": "idle",      # idle | running | completed | error
     "started": None,
     "last_activity": None,
+    "reader_running": False,  # Is the reader thread active?
 }
 
 # Last completed response for recovery
@@ -61,6 +72,21 @@ _last_response_lock = threading.Lock()
 # Condition variable — signalled every time _append_event writes a line.
 # WebSocket handlers wait on this instead of polling with sleep.
 _event_condition = threading.Condition()
+
+# ── Permission bridge ──
+# Pending permission requests from MCP approval server.
+# Key: request_id, Value: threading.Event + response dict
+_permission_requests = {}  # {request_id: {"event": Event, "response": None, "data": {...}}}
+_permission_lock = threading.Lock()
+
+# ── Permission level ──
+# Configurable from iOS Settings tab. Controls which tools auto-approve vs
+# prompt via the MCP permission bridge. Most → least permissive:
+#
+#   "approve_all" → everything auto-approved, no prompts
+#   "strict"      → reads+edits auto, only bash/web prompt
+#   "moderate"    → reads auto, writes/bash/web all prompt
+_permission_level = "strict"  # Default: prompt only for bash/web
 
 
 def _events_path(session_id):
@@ -107,17 +133,24 @@ def _process_event(event):
                 if text:
                     yield {"type": "text", "content": text}
             elif block.get("type") == "tool_use":
-                summary = _format_tool(block.get("name", ""), block.get("input", {}))
+                tool_name = block.get("name", "")
+                # Filter out the MCP approval tool — permission flow is handled
+                # separately via WebSocket permission_request events
+                if tool_name == "mcp__approval__approve":
+                    yield {"type": "activity", "content": "requesting_permission"}
+                    continue
+                summary = _format_tool(tool_name, block.get("input", {}))
                 yield {"type": "tool", "content": summary}
                 # Detect image file reads and emit an image event
-                if block.get("name") == "Read":
+                if tool_name == "Read":
                     fpath = block.get("input", {}).get("file_path", "")
                     if fpath and any(fpath.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
                         yield {"type": "image", "content": f"/file?path={fpath}"}
 
     elif etype == "tool":
         tool_name = event.get("tool", "")
-        if tool_name:
+        # Filter out MCP approval tool results
+        if tool_name and tool_name != "mcp__approval__approve":
             yield {"type": "tool", "content": f"Result from {tool_name}"}
 
     elif etype == "result":
@@ -170,12 +203,15 @@ def _format_tool(name, input_data):
     return f"Tool: {name}"
 
 
-def _keepalive_thread(session_id, events_file, activity_ref, done_flag):
+def _keepalive_thread(session_id, events_file_arg, activity_ref, done_flag):
     """Writes periodic ping events to prevent Safari idle-kill.
 
     During tool execution (Bash, Read, etc.), Claude CLI goes silent for
     10-30s. Safari kills idle SSE connections. This thread writes a ping
     every 10s when no real events have flowed, keeping the stream alive.
+
+    For persistent subprocess mode, events_file_arg is None and we read
+    the current events file from session state.
     """
     while not done_flag[0]:
         time.sleep(10)
@@ -183,34 +219,50 @@ def _keepalive_thread(session_id, events_file, activity_ref, done_flag):
             break
         idle = time.time() - activity_ref[0]
         if idle >= 8:
-            _append_event(events_file, {"type": "ping"})
-            with _lock:
-                if _session.get("id") == session_id:
+            ef = events_file_arg
+            if ef is None:
+                with _lock:
+                    ef = _session.get("events_file")
+            if ef:
+                _append_event(ef, {"type": "ping"})
+                with _lock:
                     _session["last_activity"] = time.time()
 
 
-def _reader_thread(proc, session_id, events_file):
-    """Background thread: reads Claude CLI stdout (pipe), processes events,
-    writes to events.jsonl.
+def _reader_thread(proc):
+    """Background thread: reads from persistent Claude CLI subprocess stdout.
 
-    Uses subprocess.PIPE for stdout — Node.js line-buffers pipes (unlike
-    regular files where it fully buffers, causing the "0 bytes for minutes"
-    bug). The events file provides persistence for reconnection.
+    Runs for the entire lifetime of the subprocess. Routes events to the
+    current turn's events file. When a 'result' event arrives, the turn is
+    complete — a 'done' event is emitted and the session is marked idle.
+
+    The subprocess stays alive between turns (messages). On process exit
+    (normal or crash), marks session as error and cleans up.
     """
-    response_text = ""
-    response_cost = ""
-    claude_sid = None
-    event_count = 0
     spawn_time = time.time()
     first_byte_logged = False
+
+    # Per-turn state (reset on each new turn)
+    response_text = ""
+    response_cost = ""
     last_event_type = None
 
-    # Shared state for keepalive thread
+    # Keepalive state
     activity_ref = [time.time()]
     done_flag = [False]
+
+    def _current_events_file():
+        with _lock:
+            return _session.get("events_file")
+
+    def _current_turn_id():
+        with _lock:
+            return _session.get("id")
+
+    # Start keepalive thread for the persistent subprocess
     ka = threading.Thread(
         target=_keepalive_thread,
-        args=(session_id, events_file, activity_ref, done_flag),
+        args=("persistent", None, activity_ref, done_flag),
         daemon=True)
     ka.start()
 
@@ -218,7 +270,7 @@ def _reader_thread(proc, session_id, events_file):
         for raw_line in proc.stdout:
             if not first_byte_logged:
                 elapsed = time.time() - spawn_time
-                print(f"[{datetime.now().isoformat()}] [{session_id}] First output "
+                print(f"[{datetime.now().isoformat()}] [persistent] First output "
                       f"after {elapsed:.1f}s", flush=True)
                 first_byte_logged = True
 
@@ -231,90 +283,228 @@ def _reader_thread(proc, session_id, events_file):
             except json.JSONDecodeError:
                 continue
 
+            etype = event.get("type", "")
+
             # Extract claude session ID from init event
-            if event.get("type") == "system" and event.get("subtype") == "init":
+            if etype == "system" and event.get("subtype") == "init":
                 claude_sid = event.get("session_id", "")
                 with _lock:
-                    if _session.get("id") == session_id:
-                        _session["claude_sid"] = claude_sid
+                    _session["claude_sid"] = claude_sid
 
+            # Get current turn's events file
+            events_file = _current_events_file()
+            if not events_file:
+                # No active turn — skip (shouldn't happen in normal flow)
+                continue
+
+            # Process and write events
             for ev in _process_event(event):
                 _append_event(events_file, ev)
-                event_count += 1
                 activity_ref[0] = time.time()
 
-                # Update session activity (only if still current session)
                 with _lock:
-                    if _session.get("id") == session_id:
-                        _session["event_count"] = event_count
-                        _session["last_activity"] = time.time()
+                    _session["event_count"] = _session.get("event_count", 0) + 1
+                    _session["last_activity"] = time.time()
 
-                # Accumulate text/cost
                 if ev.get("type") == "text":
                     response_text += ev.get("content", "")
                 elif ev.get("type") == "cost":
                     response_cost = ev.get("content", "")
                 last_event_type = ev.get("type")
 
+            # 'result' event = turn complete
+            if etype == "result":
+                truncated = last_event_type == "tool"
+                _append_event(events_file, {"type": "done", "truncated": truncated})
+
+                with _lock:
+                    _session["status"] = "completed"
+
+                # Save last response
+                if response_text:
+                    with _last_response_lock:
+                        _last_response["text"] = response_text
+                        _last_response["cost"] = response_cost
+                        _last_response["session_id"] = _session.get("claude_sid")
+                        _last_response["seq"] += 1
+
+                turn_id = _current_turn_id()
+                print(f"[{datetime.now().isoformat()}] [turn:{turn_id}] Turn complete",
+                      flush=True)
+
+                # Reset per-turn state for next message
+                response_text = ""
+                response_cost = ""
+                last_event_type = None
+
     except Exception as e:
-        _append_event(events_file, {"type": "error", "content": str(e)})
+        events_file = _current_events_file()
+        if events_file:
+            _append_event(events_file, {"type": "error", "content": str(e)})
+        print(f"[{datetime.now().isoformat()}] Reader thread error: {e}", flush=True)
 
     done_flag[0] = True
 
-    # Check if response was truncated by turn limit:
-    # If last content was a tool_use (not text/cost), the CLI hit --max-turns
-    # mid-response. Signal this so the client can auto-continue.
-    truncated = last_event_type == "tool"
-
-    # Write terminal done event
-    _append_event(events_file, {"type": "done", "truncated": truncated})
-
-    # Mark session complete (only if still current session)
+    # Subprocess exited — write done if turn was in progress
     with _lock:
-        if _session.get("id") == session_id:
+        if _session.get("status") == "running":
+            events_file = _session.get("events_file")
+            if events_file:
+                _append_event(events_file, {"type": "done", "truncated": False})
             _session["status"] = "completed"
-            _session["proc"] = None
+        _session["proc"] = None
+        _session["stdin_pipe"] = None
+        _session["pid"] = None
+        _session["reader_running"] = False
 
-    # Save last response
-    if response_text:
-        with _last_response_lock:
-            _last_response["text"] = response_text
-            _last_response["cost"] = response_cost
-            _last_response["session_id"] = claude_sid
-            _last_response["seq"] += 1
+    print(f"[{datetime.now().isoformat()}] Reader thread exited (subprocess ended)",
+          flush=True)
 
-    print(f"[{datetime.now().isoformat()}] [{session_id}] Session complete: "
-          f"{event_count} events", flush=True)
+
+def _ensure_subprocess():
+    """Ensure a persistent Claude CLI subprocess is running. Spawn if needed.
+
+    The subprocess uses bidirectional stream-json: messages go in via stdin,
+    events come out via stdout. It stays alive across multiple messages.
+    Permission requests are handled via the MCP approval server.
+
+    Returns True if subprocess is running, False on error.
+    """
+    with _lock:
+        if (_session.get("proc") and _session["proc"].poll() is None
+                and _session.get("reader_running")):
+            return True  # Already running
+
+    # Build command — persistent subprocess with bidirectional streaming
+    #
+    # IMPORTANT: --setting-sources "" prevents loading project/user-level
+    # allowedTools from .claude/settings.local.json that would auto-approve
+    # everything and bypass the permission bridge entirely.
+    #
+    # We use explicit --allowedTools per tier so safe tools are auto-approved
+    # at Layer 1 (static rules) BEFORE the --permission-prompt-tool (Layer 3)
+    # gets called. Without this, every tool call routes through the MCP bridge.
+    #
+    # Permission tiers (most → least permissive):
+    #   approve_all → bypassPermissions — never prompt
+    #   strict      → auto-approve reads+edits, prompt bash/web only
+    #   moderate    → auto-approve reads only, prompt writes/bash/web
+    level = _permission_level
+
+    # Safe tools that never need prompting (read-only, no side effects)
+    READ_TOOLS = "Read Glob Grep"
+    # File modification tools
+    EDIT_TOOLS = "Read Write Edit Glob Grep"
+
+    cmd = [
+        "claude", "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--model", "claude-opus-4-6",
+        "--max-turns", "200",
+        "--verbose",
+        "--setting-sources", "",
+    ]
+
+    if level == "approve_all":
+        cmd += ["--permission-mode", "bypassPermissions"]
+    elif level == "strict":
+        # Auto-approve file ops, prompt for bash/web
+        cmd += [
+            "--permission-mode", "default",
+            "--allowedTools", EDIT_TOOLS,
+            "--permission-prompt-tool", "mcp__approval__approve",
+            "--mcp-config", MCP_CONFIG,
+        ]
+    else:  # moderate (default)
+        # Auto-approve reads only, prompt for writes/bash/web
+        cmd += [
+            "--permission-mode", "default",
+            "--allowedTools", READ_TOOLS,
+            "--permission-prompt-tool", "mcp__approval__approve",
+            "--mcp-config", MCP_CONFIG,
+        ]
+
+    cmd += [
+        "--append-system-prompt",
+        "You are running in a mobile chat app but have FULL terminal capabilities. "
+        "Always run commands directly (bash, ping, curl, file reads, etc.) instead "
+        "of suggesting the user run them. You have full access to the filesystem, "
+        "network, and all tools — use them proactively just as you would in an "
+        "interactive terminal session. Never ask the user to run a command when "
+        "you can run it yourself.",
+    ]
+
+    print(f"[{datetime.now().isoformat()}] Permission level: {level} "
+          f"(allowed: {EDIT_TOOLS if level == 'strict' else READ_TOOLS if level == 'moderate' else 'all'})",
+          flush=True)
+
+    # Clean environment — subscription auth only, no API key leakage
+    env = env_for_claude_cli()
+
+    try:
+        stderr_path = os.path.join(SESSIONS_DIR, "claude_stderr.log")
+        stderr_handle = open(stderr_path, "ab")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+                cwd=WORK_DIR,
+                env=env,
+                preexec_fn=os.setsid
+            )
+        finally:
+            stderr_handle.close()
+
+        with _lock:
+            _session["proc"] = proc
+            _session["stdin_pipe"] = proc.stdin
+            _session["pid"] = proc.pid
+            _session["reader_running"] = True
+
+        # Start persistent reader thread
+        reader = threading.Thread(
+            target=_reader_thread,
+            args=(proc,),
+            daemon=True)
+        reader.start()
+
+        print(f"[{datetime.now().isoformat()}] Spawned persistent Claude subprocess "
+              f"(PID {proc.pid})", flush=True)
+        return True
+
+    except FileNotFoundError:
+        print(f"[{datetime.now().isoformat()}] Claude CLI not found", flush=True)
+        return False
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Failed to spawn subprocess: {e}",
+              flush=True)
+        return False
 
 
 def _start_session(message, image_paths=None, client_session_id=None):
-    """Core session logic — spawn Claude CLI subprocess.
+    """Send a message to the persistent Claude subprocess.
 
+    Creates a new turn (events file) and writes the message to stdin.
     Returns (result_dict, error_string). On success error_string is None.
-    Used by both POST /send and the WebSocket handler.
     """
     image_paths = image_paths or []
 
+    # Ensure subprocess is running
+    if not _ensure_subprocess():
+        return None, "Failed to start Claude subprocess"
+
+    # Prepare new turn
+    sid = str(uuid.uuid4())[:8]
+    session_dir = os.path.join(SESSIONS_DIR, sid)
+    os.makedirs(session_dir, exist_ok=True)
+    events_file = os.path.join(session_dir, "events.jsonl")
+    open(events_file, "w").close()
+
     with _lock:
-        # Kill existing process if still running
-        if _session["proc"] and _session["proc"].poll() is None:
-            try:
-                os.killpg(os.getpgid(_session["proc"].pid), signal.SIGTERM)
-            except Exception:
-                try:
-                    _session["proc"].terminate()
-                except Exception:
-                    pass
-
-        # Prepare session directory
-        sid = str(uuid.uuid4())[:8]
-        session_dir = os.path.join(SESSIONS_DIR, sid)
-        os.makedirs(session_dir, exist_ok=True)
-
-        events_file = os.path.join(session_dir, "events.jsonl")
-        # Clear events file
-        open(events_file, "w").close()
-
         _session["id"] = sid
         _session["events_file"] = events_file
         _session["event_count"] = 0
@@ -329,68 +519,34 @@ def _start_session(message, image_paths=None, client_session_id=None):
         message = (f"I've attached {len(valid_paths)} image(s) at these paths: "
                    f"{paths_str} — please read/view them first. {message}")
 
-    # Build command
-    cmd = [
-        "claude", "-p", message,
-        "--model", "claude-opus-4-6",
-        "--max-turns", "50",
-        "--output-format", "stream-json",
-        "--verbose"
-    ]
+    # Write message to stdin as NDJSON (stream-json input format)
+    ndjson_msg = json.dumps({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": message,
+        }
+    })
 
-    # Resume existing conversation
-    resume_sid = client_session_id or _session.get("claude_sid")
-    if resume_sid:
-        cmd.extend(["--resume", resume_sid])
-
-    # Clean environment — subscription auth only, no API key leakage
-    env = env_for_claude_cli()
-
-    # Spawn subprocess with PIPE for stdout.
-    # Node.js (Claude CLI) line-buffers pipes but fully buffers regular files.
-    # Using PIPE ensures streaming output arrives immediately.
-    # stderr goes to a log file (never PIPE without a drain thread).
     try:
-        stderr_path = os.path.join(SESSIONS_DIR, "claude_stderr.log")
-        stderr_handle = open(stderr_path, "ab")
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=stderr_handle,
-                cwd=WORK_DIR,
-                env=env,
-                preexec_fn=os.setsid
-            )
-        finally:
-            stderr_handle.close()
-
         with _lock:
-            _session["proc"] = proc
-            _session["pid"] = proc.pid
+            stdin_pipe = _session.get("stdin_pipe")
+        if not stdin_pipe:
+            return None, "No stdin pipe available"
 
-        # Start background reader — reads from pipe, writes to events file
-        reader = threading.Thread(
-            target=_reader_thread,
-            args=(proc, sid, events_file),
-            daemon=True)
-        reader.start()
-
-        print(f"[{datetime.now().isoformat()}] Started session {sid} "
-              f"(PID {proc.pid})", flush=True)
-
-        return {"session_id": sid, "pid": proc.pid}, None
-
-    except FileNotFoundError:
+        stdin_pipe.write((ndjson_msg + "\n").encode("utf-8"))
+        stdin_pipe.flush()
+    except (BrokenPipeError, OSError) as e:
+        # Subprocess died — try respawn on next message
         with _lock:
-            _session["status"] = "error"
-        return None, "Claude CLI not found"
-    except Exception as e:
-        with _lock:
-            _session["status"] = "error"
-        return None, str(e)
+            _session["proc"] = None
+            _session["stdin_pipe"] = None
+        return None, f"Subprocess pipe error: {e}"
+
+    print(f"[{datetime.now().isoformat()}] [turn:{sid}] Message sent to persistent "
+          f"subprocess", flush=True)
+
+    return {"session_id": sid, "pid": _session.get("pid")}, None
 
 
 @app.route("/send", methods=["POST"])
@@ -523,6 +679,12 @@ def status():
         })
 
 
+@app.route("/permission-level")
+def get_permission_level():
+    """Return current permission level."""
+    return jsonify({"level": _permission_level})
+
+
 @app.route("/cancel", methods=["POST"])
 def cancel():
     """Kill active subprocess."""
@@ -540,15 +702,95 @@ def cancel():
                 pass
 
         _session["status"] = "completed"
+        _session["proc"] = None
+        _session["stdin_pipe"] = None
         return jsonify({"cancelled": True})
 
 
 @app.route("/new-session", methods=["POST"])
 def new_session():
-    """Clear conversation context — next /send starts fresh."""
+    """Kill subprocess and clear session — next /send starts fresh."""
     with _lock:
+        proc = _session.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
         _session["claude_sid"] = None
+        _session["proc"] = None
+        _session["stdin_pipe"] = None
+        _session["pid"] = None
+        _session["status"] = "idle"
     return jsonify({"ok": True})
+
+
+# ── Permission bridge endpoint ──────────────────────────────────────
+
+@app.route("/internal/permission-request", methods=["POST"])
+def permission_request():
+    """Long-poll endpoint called by MCP approval server.
+
+    Receives a permission request, pushes it to iOS clients via WebSocket,
+    then blocks until the user responds (or times out after 120s).
+    """
+    data = request.get_json(force=True)
+    request_id = data.get("request_id", str(uuid.uuid4())[:8])
+    tool_name = data.get("tool_name", "")
+    tool_input = data.get("input", {})
+    summary = data.get("summary", f"Use tool: {tool_name}")
+
+    print(f"[{datetime.now().isoformat()}] Permission request {request_id}: "
+          f"{tool_name} — {summary}", flush=True)
+
+    # Create a pending request with an Event for synchronisation
+    wait_event = threading.Event()
+    with _permission_lock:
+        _permission_requests[request_id] = {
+            "event": wait_event,
+            "response": None,
+            "data": data,
+        }
+
+    # Push to all WebSocket clients
+    _broadcast_ws({
+        "type": "permission_request",
+        "request_id": request_id,
+        "tool_name": tool_name,
+        "input": tool_input,
+        "summary": summary,
+    })
+
+    # Block until user responds or timeout
+    responded = wait_event.wait(timeout=120)
+
+    with _permission_lock:
+        req = _permission_requests.pop(request_id, None)
+
+    if not responded or not req or not req.get("response"):
+        # Timeout — deny by default
+        print(f"[{datetime.now().isoformat()}] Permission {request_id}: "
+              f"timed out, denying", flush=True)
+        return jsonify({"allow": False, "message": "Permission request timed out"})
+
+    response = req["response"]
+    allow = response.get("allow", False)
+    print(f"[{datetime.now().isoformat()}] Permission {request_id}: "
+          f"{'allowed' if allow else 'denied'}", flush=True)
+
+    if allow:
+        return jsonify({
+            "allow": True,
+            "updatedInput": response.get("updatedInput", tool_input),
+        })
+    else:
+        return jsonify({
+            "allow": False,
+            "message": response.get("message", "User denied permission"),
+        })
 
 
 @app.route("/last-response")
@@ -803,15 +1045,82 @@ def websocket_handler(ws):
                             except Exception:
                                 pass
                         _session["status"] = "completed"
+                        _session["proc"] = None
+                        _session["stdin_pipe"] = None
                         _ws_send({"type": "cancelled"})
                     else:
                         _ws_send({"type": "ws_error",
                                   "content": "No active process"})
 
             elif msg_type == "new_session":
+                # Kill persistent subprocess so next message starts fresh
                 with _lock:
+                    proc = _session.get("proc")
+                    if proc and proc.poll() is None:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except Exception:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
                     _session["claude_sid"] = None
+                    _session["proc"] = None
+                    _session["stdin_pipe"] = None
+                    _session["pid"] = None
+                    _session["status"] = "idle"
                 _ws_send({"type": "new_session_ok"})
+
+            elif msg_type == "permission_response":
+                # User approved/denied a permission request from their phone
+                req_id = msg.get("request_id", "")
+                allow = msg.get("allow", False)
+                with _permission_lock:
+                    pending = _permission_requests.get(req_id)
+                if pending:
+                    pending["response"] = {
+                        "allow": allow,
+                        "message": msg.get("message", ""),
+                        "updatedInput": msg.get("updatedInput"),
+                    }
+                    pending["event"].set()  # Wake the long-poll
+                    _ws_send({"type": "permission_acknowledged",
+                              "request_id": req_id})
+                else:
+                    _ws_send({"type": "ws_error",
+                              "content": f"Unknown permission request: {req_id}"})
+
+            elif msg_type == "set_permission_level":
+                # iOS Settings changed the permission level
+                global _permission_level
+                new_level = msg.get("level", "moderate")
+                if new_level not in ("approve_all", "moderate", "strict"):
+                    _ws_send({"type": "ws_error",
+                              "content": f"Invalid permission level: {new_level}"})
+                    continue
+
+                old_level = _permission_level
+                _permission_level = new_level
+                print(f"[{datetime.now().isoformat()}] Permission level changed: "
+                      f"{old_level} → {new_level}", flush=True)
+
+                # Kill subprocess so next message spawns with new mode
+                if old_level != new_level:
+                    with _lock:
+                        proc = _session.get("proc")
+                        if proc and proc.poll() is None:
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                            except Exception:
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+                        _session["proc"] = None
+                        _session["stdin_pipe"] = None
+                        _session["pid"] = None
+
+                _ws_send({"type": "permission_level_set", "level": new_level})
 
             elif msg_type == "ping":
                 _ws_send({"type": "pong"})
@@ -1460,7 +1769,7 @@ def _signal_handler(signum, frame):
     print(f"[{datetime.now().isoformat()}] Received {sig_name} (uptime {uptime}s), "
           f"shutting down", flush=True)
 
-    # Kill any active Claude subprocess cleanly
+    # Kill persistent Claude subprocess cleanly
     with _lock:
         proc = _session.get("proc")
         if proc and proc.poll() is None:
@@ -1468,6 +1777,12 @@ def _signal_handler(signum, frame):
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
                 pass
+
+    # Unblock any pending permission requests
+    with _permission_lock:
+        for req_id, req in _permission_requests.items():
+            req["response"] = {"allow": False, "message": "Server shutting down"}
+            req["event"].set()
 
     sys.exit(0)
 
