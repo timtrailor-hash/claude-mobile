@@ -1876,11 +1876,12 @@ def system_health():
     else:
         items.append({"name": "Memory Search DB", "timestamp": None, "detail": "not found"})
 
-    # 6. GitHub repos — check last commit dates
+    # 6. GitHub repos — check last commit dates + uncommitted change counts
     for repo_name, repo_path in [
         ("GitHub: ClaudeCode", Path.home() / "Documents" / "Claude code" / "ClaudeCode"),
         ("GitHub: claude-mobile", Path.home() / "Documents" / "Claude code" / "claude-mobile"),
         ("GitHub: ofsted-agent", Path.home() / "Documents" / "Claude code" / "ofsted-agent"),
+        ("GitHub: sv08-print-tools", Path.home() / "Documents" / "Claude code" / "sv08-print-tools"),
     ]:
         if (repo_path / ".git").exists():
             try:
@@ -1888,16 +1889,24 @@ def system_health():
                     ["git", "-C", str(repo_path), "log", "-1", "--format=%aI"],
                     capture_output=True, text=True, timeout=5
                 )
+                # Count uncommitted changes (staged + unstaged + untracked)
+                status_result = subprocess.run(
+                    ["git", "-C", str(repo_path), "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=5
+                )
+                uncommitted = len([l for l in status_result.stdout.strip().split("\n") if l.strip()]) if status_result.returncode == 0 and status_result.stdout.strip() else 0
                 if result.returncode == 0 and result.stdout.strip():
+                    detail = f"{uncommitted} uncommitted" if uncommitted > 0 else "clean"
                     items.append({
                         "name": repo_name,
                         "timestamp": result.stdout.strip(),
-                        "detail": "last commit",
+                        "detail": detail,
+                        "uncommitted_count": uncommitted,
                     })
                 else:
-                    items.append({"name": repo_name, "timestamp": None, "detail": "no commits"})
+                    items.append({"name": repo_name, "timestamp": None, "detail": "no commits", "uncommitted_count": 0})
             except Exception:
-                items.append({"name": repo_name, "timestamp": None, "detail": "git error"})
+                items.append({"name": repo_name, "timestamp": None, "detail": "git error", "uncommitted_count": -1})
 
     return jsonify({"items": items})
 

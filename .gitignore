@@ -11,3 +11,4 @@ wrapper.log
 __pycache__/
 static/
 .DS_Store
+nohup.out
