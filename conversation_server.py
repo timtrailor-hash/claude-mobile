@@ -36,11 +36,34 @@ from datetime import datetime
 sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
 from shared_utils import env_for_claude_cli, work_dir
 
+# Auth token — imported from credentials.py (gitignored), fallback to None (no auth)
+try:
+    from credentials import AUTH_TOKEN
+except ImportError:
+    AUTH_TOKEN = None
+
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 
 app = Flask(__name__)
 sock = Sock(app)
+
+
+@app.before_request
+def check_auth():
+    """Require auth token for non-localhost requests (iOS app via Tailscale)."""
+    if not AUTH_TOKEN:
+        return  # No token configured, skip auth
+    # Trust localhost (MCP server, health check, etc.)
+    if request.remote_addr in ('127.0.0.1', '::1'):
+        return
+    # Check Authorization header or query param
+    auth = request.headers.get('Authorization', '')
+    if auth == f'Bearer {AUTH_TOKEN}':
+        return
+    if request.args.get('token') == AUTH_TOKEN:
+        return
+    return jsonify({"error": "Unauthorized"}), 401
 
 # ── Config ──
 WORK_DIR = work_dir()
@@ -879,6 +902,17 @@ def websocket_handler(ws):
 
     with _ws_clients_lock:
         _ws_clients[client_id] = ws
+
+    # Check auth for non-localhost WebSocket clients
+    if ws.environ.get('REMOTE_ADDR') not in ('127.0.0.1', '::1'):
+        token_param = request.args.get('token', '')
+        if AUTH_TOKEN and token_param != AUTH_TOKEN:
+            try:
+                ws.send(json.dumps({"type": "ws_error", "content": "Unauthorized \u2014 check auth token in Settings"}))
+                ws.close()
+            except Exception:
+                pass
+            return
 
     # Send immediate welcome so iOS app knows connection is live
     try:
