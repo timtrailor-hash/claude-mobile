@@ -1728,6 +1728,17 @@ def slack_messages_proxy():
         return jsonify({"error": str(e), "messages": []}), 502
 
 
+@app.route("/push-message", methods=["POST"])
+def push_message():
+    """Push a message to all connected app clients (used by terminal sessions)."""
+    data = request.get_json() or {}
+    content = data.get("content", "")
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    _broadcast_ws({"type": "push_message", "content": content})
+    return jsonify({"ok": True})
+
+
 @app.route("/governors-reset", methods=["POST"])
 def governors_reset():
     """Signal the governors Streamlit app to reset chat."""
