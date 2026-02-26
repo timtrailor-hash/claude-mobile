@@ -425,10 +425,9 @@ def _ensure_subprocess():
 
         # Build command — persistent subprocess with bidirectional streaming
         #
-        # --setting-sources "project,user" loads CLAUDE.md, MEMORY.md, and
-        # user settings, but skips "local" (.claude/settings.local.json) which
-        # has a huge allowedTools list that would auto-approve everything and
-        # bypass the permission bridge entirely.
+        # --setting-sources "project" loads CLAUDE.md and MEMORY.md but skips
+        # "user" (which loads cloud MCP servers that conflict with --mcp-config)
+        # and "local" (.claude/settings.local.json with permissive allowedTools).
         #
         # We use explicit --allowedTools per tier so safe tools are auto-approved
         # at Layer 1 (static rules) BEFORE the --permission-prompt-tool (Layer 3)
@@ -453,7 +452,7 @@ def _ensure_subprocess():
             "--model", "claude-opus-4-6",
             "--max-turns", "200",
             "--verbose",
-            "--setting-sources", "project,user",
+            "--setting-sources", "project",
         ]
 
         if level == "approve_all":
