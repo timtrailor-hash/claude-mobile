@@ -83,10 +83,11 @@ _permission_lock = threading.Lock()
 # Configurable from iOS Settings tab. Controls which tools auto-approve vs
 # prompt via the MCP permission bridge. Most → least permissive:
 #
-#   "approve_all" → everything auto-approved, no prompts
-#   "strict"      → reads+edits auto, only bash/web prompt
-#   "moderate"    → reads auto, writes/bash/web all prompt
-_permission_level = "strict"  # Default: prompt only for bash/web
+#   "approve_all"     → everything auto-approved, no prompts
+#   "terminal_only"   → reads+edits+web auto, only terminal commands prompt
+#   "terminal_and_web"→ reads+edits auto, terminal+web prompt
+#   "most_actions"    → reads auto, writes/terminal/web all prompt
+_permission_level = "terminal_only"  # Default: prompt only for terminal commands
 
 
 def _events_path(session_id):
@@ -386,15 +387,16 @@ def _ensure_subprocess():
     # gets called. Without this, every tool call routes through the MCP bridge.
     #
     # Permission tiers (most → least permissive):
-    #   approve_all → bypassPermissions — never prompt
-    #   strict      → auto-approve reads+edits, prompt bash/web only
-    #   moderate    → auto-approve reads only, prompt writes/bash/web
+    #   approve_all      → bypassPermissions — never prompt
+    #   terminal_only    → reads+edits+web auto, only terminal commands prompt
+    #   terminal_and_web → reads+edits auto, terminal+web prompt
+    #   most_actions     → reads auto, writes/terminal/web all prompt
     level = _permission_level
 
-    # Safe tools that never need prompting (read-only, no side effects)
+    # Tool groups for --allowedTools whitelist
     READ_TOOLS = "Read Glob Grep"
-    # File modification tools
     EDIT_TOOLS = "Read Write Edit Glob Grep"
+    EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch"
 
     cmd = [
         "claude", "-p",
@@ -408,16 +410,24 @@ def _ensure_subprocess():
 
     if level == "approve_all":
         cmd += ["--permission-mode", "bypassPermissions"]
-    elif level == "strict":
-        # Auto-approve file ops, prompt for bash/web
+    elif level == "terminal_only":
+        # Auto-approve file ops + web, prompt for terminal only
+        cmd += [
+            "--permission-mode", "default",
+            "--allowedTools", EDIT_AND_WEB_TOOLS,
+            "--permission-prompt-tool", "mcp__approval__approve",
+            "--mcp-config", MCP_CONFIG,
+        ]
+    elif level == "terminal_and_web":
+        # Auto-approve file ops, prompt for terminal + web
         cmd += [
             "--permission-mode", "default",
             "--allowedTools", EDIT_TOOLS,
             "--permission-prompt-tool", "mcp__approval__approve",
             "--mcp-config", MCP_CONFIG,
         ]
-    else:  # moderate (default)
-        # Auto-approve reads only, prompt for writes/bash/web
+    else:  # most_actions
+        # Auto-approve reads only, prompt for writes/terminal/web
         cmd += [
             "--permission-mode", "default",
             "--allowedTools", READ_TOOLS,
@@ -435,9 +445,14 @@ def _ensure_subprocess():
         "you can run it yourself.",
     ]
 
+    allowed_map = {
+        "approve_all": "all",
+        "terminal_only": EDIT_AND_WEB_TOOLS,
+        "terminal_and_web": EDIT_TOOLS,
+        "most_actions": READ_TOOLS,
+    }
     print(f"[{datetime.now().isoformat()}] Permission level: {level} "
-          f"(allowed: {EDIT_TOOLS if level == 'strict' else READ_TOOLS if level == 'moderate' else 'all'})",
-          flush=True)
+          f"(allowed: {allowed_map.get(level, '?')})", flush=True)
 
     # Clean environment — subscription auth only, no API key leakage
     env = env_for_claude_cli()
@@ -1094,7 +1109,7 @@ def websocket_handler(ws):
                 # iOS Settings changed the permission level
                 global _permission_level
                 new_level = msg.get("level", "moderate")
-                if new_level not in ("approve_all", "moderate", "strict"):
+                if new_level not in ("approve_all", "terminal_only", "terminal_and_web", "most_actions"):
                     _ws_send({"type": "ws_error",
                               "content": f"Invalid permission level: {new_level}"})
                     continue
