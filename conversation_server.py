@@ -1102,8 +1102,12 @@ def websocket_handler(ws):
                     _ws_send({"type": "permission_acknowledged",
                               "request_id": req_id})
                 else:
-                    _ws_send({"type": "ws_error",
-                              "content": f"Unknown permission request: {req_id}"})
+                    # Stale request (already handled or timed out) — not an error
+                    print(f"[{datetime.now().isoformat()}] Permission {req_id}: "
+                          f"stale (already handled/expired), ignoring", flush=True)
+                    _ws_send({"type": "permission_acknowledged",
+                              "request_id": req_id,
+                              "stale": True})
 
             elif msg_type == "set_permission_level":
                 # iOS Settings changed the permission level
@@ -1737,6 +1741,115 @@ def push_message():
         return jsonify({"error": "content required"}), 400
     _broadcast_ws({"type": "push_message", "content": content})
     return jsonify({"ok": True})
+
+
+@app.route("/system-health")
+def system_health():
+    """Return timestamps and status of key system components for the iOS health dashboard."""
+    from pathlib import Path
+    import stat
+
+    items = []
+
+    # 1. Last backup
+    manifest_path = Path.home() / "Documents" / "Claude code" / ".backup_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            last_backup = manifest.get("last_backup")
+            file_count = len(manifest.get("files", {}))
+            items.append({
+                "name": "Google Drive Backup",
+                "timestamp": last_backup,
+                "detail": f"{file_count} files tracked",
+            })
+        except Exception:
+            items.append({"name": "Google Drive Backup", "timestamp": None, "detail": "manifest unreadable"})
+    else:
+        items.append({"name": "Google Drive Backup", "timestamp": None, "detail": "no manifest found"})
+
+    # 2. Conversation server uptime
+    uptime_s = round(time.time() - _start_time)
+    started_iso = datetime.fromtimestamp(_start_time).isoformat()
+    items.append({
+        "name": "Conversation Server",
+        "timestamp": started_iso,
+        "detail": f"uptime {uptime_s // 3600}h {(uptime_s % 3600) // 60}m",
+    })
+
+    # 3. Printer daemon (check status.json freshness)
+    printer_status = Path("/tmp/printer_status/status.json")
+    if printer_status.exists():
+        mtime = printer_status.stat().st_mtime
+        items.append({
+            "name": "Printer Daemon",
+            "timestamp": datetime.fromtimestamp(mtime).isoformat(),
+            "detail": "status.json last updated",
+        })
+    else:
+        items.append({"name": "Printer Daemon", "timestamp": None, "detail": "no status file"})
+
+    # 4. School docs Google Drive sync
+    gdrive_links = Path.home() / "Documents" / "Claude code" / "ofsted-agent" / "gdrive_links.json"
+    if gdrive_links.exists():
+        mtime = gdrive_links.stat().st_mtime
+        try:
+            with open(gdrive_links) as f:
+                link_count = len(json.load(f))
+        except Exception:
+            link_count = 0
+        items.append({
+            "name": "School Docs Sync",
+            "timestamp": datetime.fromtimestamp(mtime).isoformat(),
+            "detail": f"{link_count} files mapped to Drive",
+        })
+    else:
+        items.append({"name": "School Docs Sync", "timestamp": None, "detail": "not synced yet"})
+
+    # 5. Memory search DB freshness
+    chroma_dir = Path.home() / "Documents" / "Claude code" / "memory_server" / "data" / "chroma"
+    if chroma_dir.exists():
+        # Find most recent file in chroma dir
+        latest = 0
+        for p in chroma_dir.rglob("*"):
+            if p.is_file():
+                latest = max(latest, p.stat().st_mtime)
+        if latest > 0:
+            items.append({
+                "name": "Memory Search DB",
+                "timestamp": datetime.fromtimestamp(latest).isoformat(),
+                "detail": "ChromaDB last updated",
+            })
+        else:
+            items.append({"name": "Memory Search DB", "timestamp": None, "detail": "empty"})
+    else:
+        items.append({"name": "Memory Search DB", "timestamp": None, "detail": "not found"})
+
+    # 6. GitHub repos — check last commit dates
+    for repo_name, repo_path in [
+        ("GitHub: ClaudeCode", Path.home() / "Documents" / "Claude code" / "ClaudeCode"),
+        ("GitHub: claude-mobile", Path.home() / "Documents" / "Claude code" / "claude-mobile"),
+        ("GitHub: ofsted-agent", Path.home() / "Documents" / "Claude code" / "ofsted-agent"),
+    ]:
+        if (repo_path / ".git").exists():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo_path), "log", "-1", "--format=%aI"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    items.append({
+                        "name": repo_name,
+                        "timestamp": result.stdout.strip(),
+                        "detail": "last commit",
+                    })
+                else:
+                    items.append({"name": repo_name, "timestamp": None, "detail": "no commits"})
+            except Exception:
+                items.append({"name": repo_name, "timestamp": None, "detail": "git error"})
+
+    return jsonify({"items": items})
 
 
 @app.route("/governors-reset", methods=["POST"])
