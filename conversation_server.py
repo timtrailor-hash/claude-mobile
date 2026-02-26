@@ -1058,6 +1058,31 @@ def websocket_handler(ws):
                         sender_state["events_file"] = current_ef
                         sender_state["offset"] = 0
 
+    # Keepalive thread — sends periodic pings to prevent iOS URLSession
+    # from timing out during silent periods (e.g., tool execution).
+    # Sends both a JSON keepalive (app-level) and protocol-level ping.
+    keepalive_count = {"n": 0}
+
+    def _keepalive_loop():
+        while not sender_state["stop"]:
+            time.sleep(15)
+            if sender_state["stop"]:
+                break
+            try:
+                ws.send(json.dumps({"type": "keepalive"}))
+                keepalive_count["n"] += 1
+                # Log every 4th keepalive (once per minute) to avoid spam
+                if keepalive_count["n"] % 4 == 1:
+                    print(f"[{datetime.now().isoformat()}] WS {client_id} "
+                          f"keepalive #{keepalive_count['n']}", flush=True)
+            except Exception as e:
+                print(f"[{datetime.now().isoformat()}] WS {client_id} "
+                      f"keepalive failed: {e}", flush=True)
+                break
+
+    keepalive = threading.Thread(target=_keepalive_loop, daemon=True)
+    keepalive.start()
+
     # Start sender thread
     sender = threading.Thread(target=_sender_loop, daemon=True)
     sender.start()
