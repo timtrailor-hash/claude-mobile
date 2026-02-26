@@ -864,6 +864,24 @@ def websocket_handler(ws):
     except Exception:
         pass
 
+    # Re-broadcast any pending permission requests so the new client can respond.
+    # This handles the case where a WebSocket disconnects while a permission prompt
+    # is waiting — without this, the prompt is lost and times out (auto-denied).
+    with _permission_lock:
+        for req_id, req in _permission_requests.items():
+            if req.get("response") is None:  # Still waiting
+                data = req.get("data", {})
+                try:
+                    ws.send(json.dumps({
+                        "type": "permission_request",
+                        "request_id": req_id,
+                        "tool_name": data.get("tool_name", ""),
+                        "input": data.get("input", {}),
+                        "summary": data.get("summary", "Use a tool"),
+                    }))
+                except Exception:
+                    pass
+
     # Track what we've sent so the sender thread knows where the file cursor is
     sender_state = {
         "session_id": None,
