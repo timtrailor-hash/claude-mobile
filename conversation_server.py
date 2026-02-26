@@ -396,7 +396,7 @@ def _ensure_subprocess():
     # Tool groups for --allowedTools whitelist
     READ_TOOLS = "Read Glob Grep"
     EDIT_TOOLS = "Read Write Edit Glob Grep"
-    EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch"
+    EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch Task"
 
     cmd = [
         "claude", "-p",
@@ -1315,7 +1315,8 @@ def serve_file():
     if not any(fpath.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
         return "Not an image file", 403
     # Only allow files under known safe directories
-    safe_prefixes = ["/tmp/", os.path.expanduser("~/Documents/")]
+    # Resolve prefixes too — macOS /tmp is a symlink to /private/tmp
+    safe_prefixes = [os.path.realpath("/tmp/") + "/", os.path.realpath(os.path.expanduser("~/Documents/")) + "/"]
     if not any(fpath.startswith(p) for p in safe_prefixes):
         return "Access denied", 403
     if not os.path.exists(fpath):
@@ -1579,9 +1580,58 @@ def _check_printer_state():
                 _last_bambu_ai_check[0] = now
                 _check_bambu_camera_ai(data)
 
+            # Check for alerts from printer_status_fetch (method changes,
+            # connection failures, etc.)
+            _check_printer_alert_file()
+
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] State monitor error: {e}",
                   flush=True)
+
+
+_PRINTER_ALERT_FILE = "/tmp/printer_status/printer_alerts.jsonl"
+_last_alert_pos = [0]  # File offset — only read new lines
+
+
+def _check_printer_alert_file():
+    """Read new alerts written by printer_status_fetch and broadcast them.
+
+    The fetch process appends alerts (method changes, connection lost/restored)
+    to printer_alerts.jsonl. We track our read position and only broadcast
+    new entries, then truncate the file to prevent unbounded growth.
+    """
+    if not os.path.exists(_PRINTER_ALERT_FILE):
+        return
+
+    try:
+        with open(_PRINTER_ALERT_FILE, "r") as f:
+            f.seek(_last_alert_pos[0])
+            new_lines = f.readlines()
+            _last_alert_pos[0] = f.tell()
+
+        for line in new_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                alert = json.loads(line)
+                # Broadcast to all connected WebSocket clients
+                _broadcast_ws(alert)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        # Truncate if file is getting large (> 100KB)
+        try:
+            if os.path.getsize(_PRINTER_ALERT_FILE) > 100_000:
+                with open(_PRINTER_ALERT_FILE, "w") as f:
+                    pass  # truncate
+                _last_alert_pos[0] = 0
+        except OSError:
+            pass
+
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Alert file check error: {e}",
+              flush=True)
 
 
 def _describe_state_change(name, old, new, data):
