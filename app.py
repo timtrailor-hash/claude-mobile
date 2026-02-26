@@ -16,7 +16,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 import requests as http_requests
 import websocket as ws_client
-from flask import Flask, request, Response, render_template_string, jsonify
+from flask import Flask, request, Response, render_template_string, jsonify, send_file
 from flask_sock import Sock
 from werkzeug.utils import secure_filename
 
@@ -3515,6 +3515,22 @@ def proxy_governors(path=''):
                         'Governors app not running.<br>Start it with: '
                         '<code>streamlit run app.py</code></h3>',
                         status=502, content_type='text/html')
+
+
+@app.route('/governors/doc/<path:filepath>')
+def serve_school_doc(filepath):
+    """Serve a school document file for viewing on mobile."""
+    import urllib.parse
+    from pathlib import Path
+    school_docs = Path.home() / "Desktop" / "school docs"
+    decoded = urllib.parse.unquote(filepath)
+    full_path = (school_docs / decoded).resolve()
+    # Security: ensure path stays within school docs directory
+    if not str(full_path).startswith(str(school_docs.resolve())):
+        return Response("Forbidden", status=403)
+    if not full_path.is_file():
+        return Response("File not found", status=404)
+    return send_file(str(full_path), as_attachment=False)
 
 
 @sock.route('/governors/_stcore/stream')
