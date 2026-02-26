@@ -464,6 +464,7 @@ def _ensure_subprocess():
                 "--allowedTools", EDIT_AND_WEB_TOOLS,
                 "--permission-prompt-tool", "mcp__approval__approve",
                 "--mcp-config", MCP_CONFIG,
+                "--strict-mcp-config",
             ]
         elif level == "terminal_and_web":
             # Auto-approve file ops, prompt for terminal + web
@@ -472,6 +473,7 @@ def _ensure_subprocess():
                 "--allowedTools", EDIT_TOOLS,
                 "--permission-prompt-tool", "mcp__approval__approve",
                 "--mcp-config", MCP_CONFIG,
+                "--strict-mcp-config",
             ]
         else:  # most_actions
             # Auto-approve reads only, prompt for writes/terminal/web
@@ -480,6 +482,7 @@ def _ensure_subprocess():
                 "--allowedTools", READ_TOOLS,
                 "--permission-prompt-tool", "mcp__approval__approve",
                 "--mcp-config", MCP_CONFIG,
+                "--strict-mcp-config",
             ]
 
         cmd += [
