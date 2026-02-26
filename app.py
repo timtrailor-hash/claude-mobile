@@ -23,6 +23,18 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 sock = Sock(app)
 
+# --- Work tab background cache ---
+# Fetches Gmail, Calendar, Slack in background every 60s.
+# Endpoints serve from cache instantly (<1ms).
+_work_cache = {
+    'work_status': None,       # cached /work-status response dict
+    'slack_messages': None,    # cached /slack-messages response dict
+    'last_refresh': 0,         # monotonic timestamp of last successful refresh
+    'refreshing': False,       # prevent concurrent refreshes
+    'error': None,             # last error (if any)
+}
+_WORK_CACHE_TTL = 60  # seconds between background refreshes
+
 # --- Request logging to file ---
 import logging as _logging
 _log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wrapper.log')
@@ -2493,9 +2505,8 @@ def printer_auto_speed():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
-@app.route('/work-status')
-def work_status():
-    """Fetch unread Gmail and upcoming calendar events from all configured Google accounts."""
+def _fetch_work_status():
+    """Background fetch: unread + last 7 days Gmail, 40-day calendar window."""
     DIR = os.path.dirname(os.path.abspath(__file__))
 
     GOOGLE_ACCOUNTS = [
@@ -2506,7 +2517,7 @@ def work_status():
     active_accounts = [a for a in GOOGLE_ACCOUNTS if os.path.exists(a['token'])]
 
     if not active_accounts:
-        return jsonify({
+        return {
             'setup_required': True,
             'setup_message': (
                 'Google auth not configured yet.<br><br>'
@@ -2515,7 +2526,7 @@ def work_status():
                 '2. Save as <code>google_credentials.json</code> in the claude-mobile folder<br><br>'
                 '3. Run: <code>python3 google_auth_setup.py</code>'
             )
-        })
+        }
 
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
@@ -2543,14 +2554,26 @@ def work_status():
 
         result['accounts'].append({'label': acct_label, 'color': acct_color})
 
-        # --- Gmail: unread emails (max 10 per account) ---
+        # --- Gmail: unread + last 7 days (deduplicated) ---
         try:
             gmail = build('gmail', 'v1', credentials=creds, cache_discovery=False)
-            msgs = gmail.users().messages().list(
-                userId='me', q='is:unread', maxResults=10
-            ).execute()
+            # Fetch unread (any age) + recent 7 days (read or unread)
+            seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y/%m/%d')
+            seen_ids = set()
+            all_msg_metas = []
+            for query in [f'is:unread', f'after:{seven_days_ago}']:
+                try:
+                    resp = gmail.users().messages().list(
+                        userId='me', q=query, maxResults=50
+                    ).execute()
+                    for m in resp.get('messages', []):
+                        if m['id'] not in seen_ids:
+                            seen_ids.add(m['id'])
+                            all_msg_metas.append(m)
+                except Exception:
+                    continue
 
-            for msg_meta in msgs.get('messages', []):
+            for msg_meta in all_msg_metas:
                 msg = gmail.users().messages().get(
                     userId='me', id=msg_meta['id'], format='metadata',
                     metadataHeaders=['From', 'Subject', 'Date']
@@ -2596,18 +2619,15 @@ def work_status():
         except Exception as e:
             result.setdefault('errors', []).append(f'{acct_label} Gmail: {e}')
 
-        # --- Calendar: events through end of next working day ---
+        # --- Calendar: 7 days ago to 33 days ahead (40-day window) ---
         try:
             cal = build('calendar', 'v3', credentials=creds, cache_discovery=False)
             now = datetime.now(timezone.utc)
-            today = datetime.now()
-            target = today + timedelta(days=1)
-            while target.weekday() >= 5:
-                target += timedelta(days=1)
-            end_of_next_workday = target.replace(hour=23, minute=59, second=59)
+            window_start = now - timedelta(days=7)
+            window_end = now + timedelta(days=33)
 
-            time_min = now.isoformat()
-            time_max = end_of_next_workday.astimezone(timezone.utc).isoformat() if end_of_next_workday.tzinfo else end_of_next_workday.replace(tzinfo=timezone.utc).isoformat()
+            time_min = window_start.isoformat()
+            time_max = window_end.isoformat()
 
             events_result = cal.events().list(
                 calendarId='primary',
@@ -2615,7 +2635,7 @@ def work_status():
                 timeMax=time_max,
                 singleEvents=True,
                 orderBy='startTime',
-                maxResults=20
+                maxResults=100
             ).execute()
 
             for ev in events_result.get('items', []):
@@ -2759,18 +2779,32 @@ def work_status():
     result['emails'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
     result['events'].sort(key=lambda x: x.get('sort_ts', 0))
 
-    resp = jsonify(result)
-    resp.headers['Cache-Control'] = 'no-store'
-    return resp
+    return result
+
+
+@app.route('/work-status')
+def work_status():
+    """Serve work status from background cache (instant response)."""
+    cached = _work_cache.get('work_status')
+    if cached is not None:
+        resp = jsonify(cached)
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+    # First request before cache is populated — fetch synchronously
+    try:
+        data = _fetch_work_status()
+        _work_cache['work_status'] = data
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
 
 
 # Persistent Slack caches (survive across requests)
 _slack_user_cache = {}
 _slack_team_id = None
 
-@app.route('/slack-messages')
-def slack_messages():
-    """Fetch recent Slack messages from all accessible channels, DMs, and group DMs."""
+def _fetch_slack_messages():
+    """Background fetch: last 20 messages per channel + unreads."""
     import re as _re
     DIR = os.path.dirname(os.path.abspath(__file__))
     SLACK_CONFIG = os.path.join(DIR, 'slack_config.json')
@@ -2782,7 +2816,7 @@ def slack_messages():
             with open(SLACK_CONFIG) as f:
                 slack_cfg = json.load(f)
         except Exception as e:
-            return jsonify({'error': f'Failed to read slack_config.json: {e}'}), 500
+            return {'error': f'Failed to read slack_config.json: {e}'}
     else:
         try:
             import sys as _sys
@@ -2793,7 +2827,7 @@ def slack_messages():
             pass
 
     if not slack_cfg:
-        return jsonify({
+        return {
             'setup_required': True,
             'setup_message': (
                 'Slack not configured yet.<br><br>'
@@ -2805,7 +2839,7 @@ def slack_messages():
                 '3. Install to workspace and copy the User OAuth Token (xoxp-...)<br><br>'
                 '4. Add tokens to <code>credentials.py</code> or create <code>slack_config.json</code>'
             )
-        })
+        }
 
     # User token for conversations/history, bot token for user lookups
     token = slack_cfg.get('token', '') or slack_cfg.get('bot_token', '')
@@ -2891,7 +2925,7 @@ def slack_messages():
             timeout=8
         ).json()
         if not convos_resp.get('ok'):
-            return jsonify({'error': f'Slack API error: {convos_resp.get("error", "unknown")}'}), 500
+            return {'error': f'Slack API error: {convos_resp.get("error", "unknown")}'}
         all_convos = convos_resp.get('channels', [])
 
         # Optional filter: if channels specified, only show those
@@ -2937,7 +2971,7 @@ def slack_messages():
                 history = http_requests.get(
                     'https://slack.com/api/conversations.history',
                     headers=slack_headers,
-                    params={'channel': ch_id, 'limit': 5},
+                    params={'channel': ch_id, 'limit': 20},
                     timeout=5
                 ).json()
 
@@ -2992,9 +3026,24 @@ def slack_messages():
         result['messages'].sort(key=lambda x: x.get('sort_ts', 0), reverse=True)
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        result['error'] = str(e)
 
-    return jsonify(result)
+    return result
+
+
+@app.route('/slack-messages')
+def slack_messages():
+    """Serve Slack messages from background cache (instant response)."""
+    cached = _work_cache.get('slack_messages')
+    if cached is not None:
+        return jsonify(cached)
+    # First request before cache is populated — fetch synchronously
+    try:
+        data = _fetch_slack_messages()
+        _work_cache['slack_messages'] = data
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3617,9 +3666,33 @@ def restart_server():
     return msg, 200
 
 
+def _work_cache_thread():
+    """Background thread: refreshes work status + Slack every 60s."""
+    import time as _t
+    # Wait 5s for server to fully start before first fetch
+    _t.sleep(5)
+    while True:
+        try:
+            _work_cache['refreshing'] = True
+            _work_cache['work_status'] = _fetch_work_status()
+        except Exception as e:
+            _work_cache['error'] = f'work_status: {e}'
+        try:
+            _work_cache['slack_messages'] = _fetch_slack_messages()
+        except Exception as e:
+            _work_cache['error'] = f'slack: {e}'
+        _work_cache['refreshing'] = False
+        _work_cache['last_refresh'] = _t.monotonic()
+        _t.sleep(_WORK_CACHE_TTL)
+
+
 if __name__ == '__main__':
     import socket
     from werkzeug.serving import make_server
+
+    # Start background cache thread for Work tab data
+    _cache_t = threading.Thread(target=_work_cache_thread, daemon=True, name='work-cache')
+    _cache_t.start()
 
     topic_count = len(glob.glob(os.path.join(TOPICS_DIR, "*.md")))
     print(f"\n  Claude Code Mobile")
@@ -3627,7 +3700,8 @@ if __name__ == '__main__':
     print(f"  iPhone:    http://100.112.125.42:8080")
     print(f"  Memory:    {topic_count} topic files")
     print(f"  Work dir:  {WORK_DIR}")
-    print(f"  Features:  Full CLI, streaming, tool visibility, session continuity\n")
+    print(f"  Features:  Full CLI, streaming, tool visibility, session continuity")
+    print(f"  Work cache: every {_WORK_CACHE_TTL}s (background thread)\n")
 
     server = make_server('0.0.0.0', 8080, app, threaded=True)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
