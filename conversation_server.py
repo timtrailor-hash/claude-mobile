@@ -1844,28 +1844,340 @@ def exclude_object():
         return jsonify({"error": str(e)}), 502
 
 
-@app.route("/work-status")
-def work_status_proxy():
-    """Proxy to wrapper's work-status endpoint so native app only needs one port."""
-    import urllib.request
+# ── Work status cache (background thread) ──────────────────────────────────
+_work_cache = {
+    "work_status": None,
+    "slack_messages": None,
+    "last_refresh": 0,
+}
+_WORK_CACHE_TTL = 60  # seconds
+_slack_user_cache = {}
+_slack_team_id = ""
+
+
+def _fetch_work_status():
+    """Fetch Gmail + Calendar data from Google APIs."""
+    from datetime import timedelta, timezone as tz
+    DIR = os.path.dirname(os.path.abspath(__file__))
+
+    GOOGLE_ACCOUNTS = [
+        {"token": os.path.join(DIR, "google_token.json"), "label": "Personal", "color": "#52b788"},
+        {"token": os.path.join(DIR, "google_token_work.json"), "label": "Work", "color": "#c9a96e"},
+    ]
+    active_accounts = [a for a in GOOGLE_ACCOUNTS if os.path.exists(a["token"])]
+    if not active_accounts:
+        return {"setup_required": True, "setup_message": "Google auth not configured. Run google_auth_setup.py"}
+
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly"]
+    result = {"emails": [], "events": [], "accounts": []}
+
+    for account in active_accounts:
+        acct_label, acct_color = account["label"], account["color"]
+        try:
+            creds = Credentials.from_authorized_user_file(account["token"], SCOPES)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(account["token"], "w") as f:
+                    f.write(creds.to_json())
+        except Exception as e:
+            result.setdefault("errors", []).append(f"{acct_label}: auth error — {e}")
+            continue
+        result["accounts"].append({"label": acct_label, "color": acct_color})
+
+        # Gmail: unread + last 7 days
+        try:
+            gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
+            seen_ids = set()
+            all_msg_metas = []
+            for query in ["is:unread", f"after:{seven_days_ago}"]:
+                try:
+                    resp = gmail.users().messages().list(userId="me", q=query, maxResults=50).execute()
+                    for m in resp.get("messages", []):
+                        if m["id"] not in seen_ids:
+                            seen_ids.add(m["id"])
+                            all_msg_metas.append(m)
+                except Exception:
+                    continue
+            for msg_meta in all_msg_metas:
+                msg = gmail.users().messages().get(
+                    userId="me", id=msg_meta["id"], format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"]
+                ).execute()
+                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+                from_raw = headers.get("From", "")
+                from_name = from_raw.split("<")[0].strip().strip('"') if "<" in from_raw else from_raw
+                date_str = headers.get("Date", "")
+                time_display, sort_ts = "", 0
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(date_str)
+                    sort_ts = dt.timestamp()
+                    now = datetime.now(tz.utc)
+                    diff = now - dt
+                    if diff.days == 0:
+                        time_display = dt.strftime("%H:%M")
+                    elif diff.days == 1:
+                        time_display = "Yesterday " + dt.strftime("%H:%M")
+                    elif diff.days < 7:
+                        time_display = dt.strftime("%a %H:%M")
+                    else:
+                        time_display = dt.strftime("%d %b")
+                except Exception:
+                    time_display = date_str[:20] if date_str else ""
+                result["emails"].append({
+                    "from": from_name, "subject": headers.get("Subject", "(no subject)"),
+                    "snippet": msg.get("snippet", ""), "time": time_display, "sort_ts": sort_ts,
+                    "message_id": msg_meta["id"], "thread_id": msg.get("threadId", ""),
+                    "account": acct_label, "account_color": acct_color,
+                })
+        except Exception as e:
+            result.setdefault("errors", []).append(f"{acct_label} Gmail: {e}")
+
+        # Calendar: 7 days back to 33 days ahead
+        try:
+            cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+            now = datetime.now(tz.utc)
+            time_min = (now - timedelta(days=7)).isoformat()
+            time_max = (now + timedelta(days=33)).isoformat()
+            events_result = cal.events().list(
+                calendarId="primary", timeMin=time_min, timeMax=time_max,
+                singleEvents=True, orderBy="startTime", maxResults=100
+            ).execute()
+            for ev in events_result.get("items", []):
+                start = ev.get("start", {})
+                end_t = ev.get("end", {})
+                sort_ts = 0
+                if "dateTime" in start:
+                    try:
+                        from dateutil.parser import parse as dt_parse
+                        st = dt_parse(start["dateTime"])
+                        en = dt_parse(end_t.get("dateTime", start["dateTime"]))
+                        sort_ts = st.timestamp()
+                        when = st.strftime("%a %d %b %H:%M") + " - " + en.strftime("%H:%M")
+                    except Exception:
+                        when = start["dateTime"][:16]
+                elif "date" in start:
+                    when = "All day - " + start["date"]
+                else:
+                    when = ""
+                attendees = ev.get("attendees", [])
+                att_names = [a.get("displayName", a.get("email", "")) for a in attendees[:5] if not a.get("self")]
+                att_str = ", ".join(att_names)
+                if len(attendees) > 5:
+                    att_str += f" +{len(attendees) - 5} more"
+                result["events"].append({
+                    "summary": ev.get("summary", "(no title)"), "when": when,
+                    "location": ev.get("location", ""), "attendees": att_str, "sort_ts": sort_ts,
+                    "html_link": ev.get("htmlLink", ""), "event_id": ev.get("id", ""),
+                    "account": acct_label, "account_color": acct_color,
+                })
+        except Exception as e:
+            result.setdefault("errors", []).append(f"{acct_label} Calendar: {e}")
+
+    result["emails"].sort(key=lambda x: x.get("sort_ts", 0), reverse=True)
+    result["events"].sort(key=lambda x: x.get("sort_ts", 0))
+    return result
+
+
+def _fetch_slack_messages():
+    """Fetch Slack channel messages."""
+    import requests as http_requests
+    global _slack_user_cache, _slack_team_id
+    DIR = os.path.dirname(os.path.abspath(__file__))
+    SLACK_CONFIG = os.path.join(DIR, "slack_config.json")
+
+    slack_cfg = None
+    if os.path.exists(SLACK_CONFIG):
+        try:
+            with open(SLACK_CONFIG) as f:
+                slack_cfg = json.load(f)
+        except Exception as e:
+            return {"error": f"Failed to read slack_config.json: {e}"}
+    else:
+        try:
+            from credentials import SLACK_USER_TOKEN, SLACK_BOT_TOKEN
+            slack_cfg = {"token": SLACK_USER_TOKEN, "bot_token": SLACK_BOT_TOKEN, "channels": [], "max_channels": 12}
+        except ImportError:
+            pass
+
+    if not slack_cfg:
+        return {"setup_required": True, "setup_message": "Slack not configured. Create slack_config.json."}
+
+    token = slack_cfg.get("token", "") or slack_cfg.get("bot_token", "")
+    bot_token = slack_cfg.get("bot_token", "") or token
+    max_channels = slack_cfg.get("max_channels", 20)
+    channel_names = slack_cfg.get("channels", [])
+    slack_headers = {"Authorization": f"Bearer {token}"}
+    bot_headers = {"Authorization": f"Bearer {bot_token}"}
+    result = {"messages": [], "channels": []}
+    DEADLINE = time.monotonic() + 12
+
+    def _over_budget():
+        return time.monotonic() >= DEADLINE
+
     try:
-        req = urllib.request.Request("http://127.0.0.1:8080/work-status", method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-            return Response(data, content_type="application/json")
+        # Bulk-fetch users on first request
+        if not _slack_user_cache:
+            try:
+                cursor = ""
+                for _ in range(5):
+                    params = {"limit": 1000}
+                    if cursor:
+                        params["cursor"] = cursor
+                    users_resp = http_requests.get("https://slack.com/api/users.list", headers=bot_headers, params=params, timeout=10).json()
+                    if users_resp.get("ok"):
+                        for u in users_resp.get("members", []):
+                            uid = u.get("id", "")
+                            if not uid:
+                                continue
+                            profile = u.get("profile", {})
+                            name = (profile.get("display_name", "").strip() or u.get("real_name", "").strip() or u.get("name", uid))
+                            _slack_user_cache[uid] = name
+                    cursor = users_resp.get("response_metadata", {}).get("next_cursor", "")
+                    if not cursor:
+                        break
+            except Exception:
+                pass
+
+        def get_username(user_id):
+            if not user_id or user_id in _slack_user_cache:
+                return _slack_user_cache.get(user_id, user_id)
+            if _over_budget():
+                return user_id
+            try:
+                user_resp = http_requests.get("https://slack.com/api/users.info", headers=bot_headers, params={"user": user_id}, timeout=3).json()
+                if user_resp.get("ok"):
+                    profile = user_resp["user"].get("profile", {})
+                    name = (profile.get("display_name", "").strip() or user_resp["user"].get("real_name", "").strip() or user_resp["user"].get("name", user_id))
+                    _slack_user_cache[user_id] = name
+                    return name
+            except Exception:
+                pass
+            _slack_user_cache[user_id] = user_id
+            return user_id
+
+        convos_resp = http_requests.get("https://slack.com/api/users.conversations", headers=slack_headers,
+                                         params={"types": "public_channel,private_channel,im,mpim", "limit": 200, "exclude_archived": "true"}, timeout=8).json()
+        if not convos_resp.get("ok"):
+            return {"error": f"Slack API error: {convos_resp.get('error', 'unknown')}"}
+        all_convos = convos_resp.get("channels", [])
+        if channel_names:
+            name_set = set(channel_names)
+            all_convos = [c for c in all_convos if c.get("name", "") in name_set]
+
+        target_channels = []
+        for c in all_convos:
+            ch_id = c["id"]
+            if c.get("is_im"):
+                ch_name = "DM: " + get_username(c.get("user", ch_id))
+            elif c.get("is_mpim"):
+                ch_name = c.get("name", ch_id).replace("mpdm-", "").replace("--", ", ").rstrip("-")
+            else:
+                ch_name = c.get("name", ch_id)
+            target_channels.append((ch_name, ch_id))
+        target_channels = target_channels[:max_channels]
+        result["channels"] = [{"name": n, "id": cid} for n, cid in target_channels]
+
+        if not _slack_team_id and not _over_budget():
+            try:
+                auth_resp = http_requests.get("https://slack.com/api/auth.test", headers=bot_headers, timeout=3).json()
+                if auth_resp.get("ok"):
+                    _slack_team_id = auth_resp.get("team_id", "")
+            except Exception:
+                pass
+
+        for ch_name, ch_id in target_channels:
+            if _over_budget():
+                result.setdefault("warnings", []).append("Time limit reached — partial results")
+                break
+            try:
+                history = http_requests.get("https://slack.com/api/conversations.history", headers=slack_headers,
+                                             params={"channel": ch_id, "limit": 20}, timeout=5).json()
+                if not history.get("ok"):
+                    continue
+                for msg in history.get("messages", []):
+                    if msg.get("subtype") in ("channel_join", "channel_leave", "channel_topic", "channel_purpose", "bot_add", "bot_remove"):
+                        continue
+                    from datetime import timezone as tz
+                    ts = float(msg.get("ts", 0))
+                    dt = datetime.fromtimestamp(ts, tz=tz.utc)
+                    now = datetime.now(tz.utc)
+                    diff = now - dt
+                    if diff.days == 0:
+                        time_display = dt.strftime("%H:%M")
+                    elif diff.days == 1:
+                        time_display = "Yesterday " + dt.strftime("%H:%M")
+                    elif diff.days < 7:
+                        time_display = dt.strftime("%a %H:%M")
+                    else:
+                        time_display = dt.strftime("%d %b")
+                    user_name = get_username(msg.get("user", ""))
+                    text = msg.get("text", "")
+                    for uid_match in re.findall(r"<@(U[A-Z0-9]+)>", text):
+                        text = text.replace(f"<@{uid_match}>", f"@{get_username(uid_match)}")
+                    text = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2", text)
+                    text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+                    msg_link = f"slack://channel?team={_slack_team_id}&id={ch_id}&message={msg.get('ts', '')}" if _slack_team_id else ""
+                    result["messages"].append({
+                        "channel": ch_name, "channel_id": ch_id, "user": user_name,
+                        "text": text[:300], "time": time_display, "sort_ts": ts,
+                        "link": msg_link, "thread_ts": msg.get("thread_ts", ""), "reply_count": msg.get("reply_count", 0),
+                    })
+            except Exception as e:
+                result.setdefault("errors", []).append(f"#{ch_name}: {e}")
+        result["messages"].sort(key=lambda x: x.get("sort_ts", 0), reverse=True)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def _work_cache_thread():
+    """Background thread: refreshes work status + Slack every 60s."""
+    time.sleep(5)
+    while True:
+        try:
+            _work_cache["work_status"] = _fetch_work_status()
+        except Exception as e:
+            _work_cache["work_status"] = {"error": str(e)}
+        try:
+            _work_cache["slack_messages"] = _fetch_slack_messages()
+        except Exception as e:
+            _work_cache["slack_messages"] = {"error": str(e)}
+        _work_cache["last_refresh"] = time.monotonic()
+        time.sleep(_WORK_CACHE_TTL)
+
+
+@app.route("/work-status")
+def work_status():
+    """Serve work status (Gmail + Calendar) from background cache."""
+    cached = _work_cache.get("work_status")
+    if cached is not None:
+        resp = jsonify(cached)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    try:
+        data = _fetch_work_status()
+        _work_cache["work_status"] = data
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e), "setup_required": True}), 502
 
 
 @app.route("/slack-messages")
-def slack_messages_proxy():
-    """Proxy to wrapper's slack-messages endpoint."""
-    import urllib.request
+def slack_messages():
+    """Serve Slack messages from background cache."""
+    cached = _work_cache.get("slack_messages")
+    if cached is not None:
+        return jsonify(cached)
     try:
-        req = urllib.request.Request("http://127.0.0.1:8080/slack-messages", method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-            return Response(data, content_type="application/json")
+        data = _fetch_slack_messages()
+        _work_cache["slack_messages"] = data
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e), "messages": []}), 502
 
@@ -2173,6 +2485,12 @@ if __name__ == "__main__":
     cleaner = threading.Thread(target=_cleanup_thread, daemon=True)
     cleaner.start()
     print(f"[{datetime.now().isoformat()}] Cleanup thread started (sessions >24h, uploads >1h)",
+          flush=True)
+
+    # Start work status cache thread (Gmail + Calendar + Slack)
+    work_t = threading.Thread(target=_work_cache_thread, daemon=True, name="work-cache")
+    work_t.start()
+    print(f"[{datetime.now().isoformat()}] Work cache thread started (60s refresh)",
           flush=True)
 
     app.run(host="0.0.0.0", port=8081, threaded=True)
