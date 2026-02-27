@@ -941,6 +941,21 @@ def health():
     })
 
 
+def _terminal_claude_cmd():
+    """Build the tmux send-keys command to launch claude with subscription auth."""
+    cmd = "cd ~/Documents/Claude\\ code"
+    try:
+        from credentials import CLAUDE_CODE_OAUTH_TOKEN
+        if CLAUDE_CODE_OAUTH_TOKEN:
+            cmd += (f" && export CLAUDE_CODE_OAUTH_TOKEN={CLAUDE_CODE_OAUTH_TOKEN}"
+                    " && unset ANTHROPIC_API_KEY && claude")
+        else:
+            cmd += " && claude"
+    except (ImportError, AttributeError):
+        cmd += " && claude"
+    return cmd
+
+
 @app.route("/terminal-new-window", methods=["POST"])
 def terminal_new_window():
     """Create a new tmux window in the claude-terminal session."""
@@ -950,12 +965,11 @@ def terminal_new_window():
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
-            # Auto-start claude CLI from project dir so MEMORY.md + MCP servers load
             import time
             time.sleep(0.5)
             subprocess.run(
                 ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal",
-                 "cd ~/Documents/Claude\\ code && claude", "Enter"],
+                 _terminal_claude_cmd(), "Enter"],
                 capture_output=True, text=True, timeout=5
             )
             _log.info("Created new tmux window in claude-terminal (claude auto-started)")
@@ -1137,7 +1151,7 @@ def terminal_auth_complete():
                 time.sleep(1)
                 subprocess.run(
                     ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal",
-                     "cd ~/Documents/Claude\\ code && claude", "Enter"],
+                     _terminal_claude_cmd(), "Enter"],
                     capture_output=True, text=True, timeout=5
                 )
             except Exception:
