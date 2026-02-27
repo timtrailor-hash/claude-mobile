@@ -1889,8 +1889,23 @@ def system_health():
 
     items = []
 
+    # Base path: works from both ~/projects/claude/ (cron) and ~/Documents/Claude code/ (interactive)
+    _base = Path(__file__).resolve().parent.parent
+    _home_base = Path.home() / "Documents" / "Claude code"
+
+    def _find(rel):
+        """Try both base paths, return first that exists."""
+        for b in [_base, _home_base]:
+            p = b / rel
+            try:
+                if p.exists():
+                    return p
+            except (PermissionError, OSError):
+                continue
+        return _base / rel  # fallback
+
     # 1. Last backup
-    manifest_path = Path.home() / "Documents" / "Claude code" / ".backup_manifest.json"
+    manifest_path = _find(".backup_manifest.json")
     if manifest_path.exists():
         try:
             with open(manifest_path) as f:
@@ -1929,7 +1944,7 @@ def system_health():
         items.append({"name": "Printer Daemon", "timestamp": None, "detail": "no status file"})
 
     # 4. School docs Google Drive sync
-    gdrive_links = Path.home() / "Documents" / "Claude code" / "ofsted-agent" / "gdrive_links.json"
+    gdrive_links = _find("ofsted-agent/gdrive_links.json")
     if gdrive_links.exists():
         mtime = gdrive_links.stat().st_mtime
         try:
@@ -1946,7 +1961,7 @@ def system_health():
         items.append({"name": "School Docs Sync", "timestamp": None, "detail": "not synced yet"})
 
     # 5. Memory search DB freshness
-    chroma_dir = Path.home() / "Documents" / "Claude code" / "memory_server" / "data" / "chroma"
+    chroma_dir = _find("memory_server/data/chroma")
     if chroma_dir.exists():
         # Find most recent file in chroma dir
         latest = 0
@@ -1966,10 +1981,10 @@ def system_health():
 
     # 6. GitHub repos — check last commit dates + uncommitted change counts
     for repo_name, repo_path in [
-        ("GitHub: ClaudeCode", Path.home() / "Documents" / "Claude code" / "ClaudeCode"),
-        ("GitHub: claude-mobile", Path.home() / "Documents" / "Claude code" / "claude-mobile"),
-        ("GitHub: ofsted-agent", Path.home() / "Documents" / "Claude code" / "ofsted-agent"),
-        ("GitHub: sv08-print-tools", Path.home() / "Documents" / "Claude code" / "sv08-print-tools"),
+        ("GitHub: ClaudeCode", _find("ClaudeCode")),
+        ("GitHub: claude-mobile", _find("claude-mobile")),
+        ("GitHub: ofsted-agent", _find("ofsted-agent")),
+        ("GitHub: sv08-print-tools", _find("sv08-print-tools")),
     ]:
         if (repo_path / ".git").exists():
             try:
