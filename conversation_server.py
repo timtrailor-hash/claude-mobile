@@ -1980,12 +1980,26 @@ def system_health():
         items.append({"name": "Memory Search DB", "timestamp": None, "detail": "not found"})
 
     # 6. GitHub repos — check last commit dates + uncommitted change counts
+    # Use both base paths for git checks (~/projects/claude/ copies may lack .git)
+    def _find_repo(rel):
+        for b in [_base, _home_base]:
+            p = b / rel
+            try:
+                if (p / ".git").is_dir():
+                    return p
+            except (PermissionError, OSError):
+                continue
+        return None
+
     for repo_name, repo_path in [
-        ("GitHub: ClaudeCode", _find("ClaudeCode")),
-        ("GitHub: claude-mobile", _find("claude-mobile")),
-        ("GitHub: ofsted-agent", _find("ofsted-agent")),
-        ("GitHub: sv08-print-tools", _find("sv08-print-tools")),
+        ("GitHub: ClaudeCode", _find_repo("ClaudeCode")),
+        ("GitHub: claude-mobile", _find_repo("claude-mobile")),
+        ("GitHub: ofsted-agent", _find_repo("ofsted-agent")),
+        ("GitHub: sv08-print-tools", _find_repo("sv08-print-tools")),
     ]:
+        if repo_path is None:
+            items.append({"name": repo_name, "timestamp": None, "detail": "repo not found", "uncommitted_count": -1})
+            continue
         if (repo_path / ".git").exists():
             try:
                 result = subprocess.run(
