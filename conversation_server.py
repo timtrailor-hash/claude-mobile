@@ -1031,7 +1031,7 @@ def terminal_auth_start():
         env = os.environ.copy()
         env["TERM"] = "dumb"
         proc = subprocess.Popen(
-            ["/usr/local/bin/claude", "auth", "login"],
+            ["/opt/homebrew/bin/claude", "auth", "login"],
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
             env=env, close_fds=True
         )
@@ -1134,7 +1134,7 @@ def terminal_auth_complete():
 
         # Check auth status
         auth_check = subprocess.run(
-            ["/usr/local/bin/claude", "auth", "status"],
+            ["/opt/homebrew/bin/claude", "auth", "status"],
             capture_output=True, text=True, timeout=10
         )
         auth_ok = auth_check.returncode == 0
