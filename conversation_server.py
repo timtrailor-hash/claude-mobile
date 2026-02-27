@@ -942,18 +942,19 @@ def health():
 
 
 def _terminal_claude_cmd():
-    """Build the tmux send-keys command to launch claude with subscription auth."""
-    cmd = "cd ~/Documents/Claude\\ code"
+    """Build the tmux send-keys command to launch claude with subscription auth.
+
+    Uses keychain auth (from `claude auth login` OAuth flow).
+    CRITICAL: strips ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN to prevent
+    API billing — Claude Team subscription only.
+    """
     try:
-        from credentials import CLAUDE_CODE_OAUTH_TOKEN
-        if CLAUDE_CODE_OAUTH_TOKEN:
-            cmd += (f" && export CLAUDE_CODE_OAUTH_TOKEN={CLAUDE_CODE_OAUTH_TOKEN}"
-                    " && unset ANTHROPIC_API_KEY && claude")
-        else:
-            cmd += " && claude"
+        from credentials import KEYCHAIN_PASSWORD
+        unlock = f"security unlock-keychain -p {KEYCHAIN_PASSWORD} ~/Library/Keychains/login.keychain-db"
     except (ImportError, AttributeError):
-        cmd += " && claude"
-    return cmd
+        unlock = "true"  # no-op if no password
+    return (f"{unlock} && cd ~/Documents/Claude\\\\ code"
+            " && unset ANTHROPIC_API_KEY && unset CLAUDE_CODE_OAUTH_TOKEN && claude")
 
 
 @app.route("/terminal-new-window", methods=["POST"])
