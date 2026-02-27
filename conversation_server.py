@@ -981,6 +981,43 @@ def terminal_new_window():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/terminal-reset", methods=["POST"])
+def terminal_reset():
+    """Kill ttyd + tmux and restart fresh. Used by iOS 'Reset Terminal' button."""
+    try:
+        tmux = "/opt/homebrew/bin/tmux"
+        # 1. Kill ttyd
+        subprocess.run(["pkill", "-f", "ttyd"], capture_output=True, timeout=5)
+        # 2. Kill tmux session
+        subprocess.run([tmux, "kill-session", "-t", "claude-terminal"],
+                       capture_output=True, text=True, timeout=5)
+        import time
+        time.sleep(2)
+        # 3. Restart via wrapper script
+        result = subprocess.run(
+            ["/bin/zsh", "-l", "-c",
+             "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH && "
+             "~/.local/bin/ttyd_wrapper.sh start"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if "Listening on port" in result.stderr or "ttyd started" in result.stdout:
+            _log.info("terminal-reset: restarted successfully")
+            return jsonify({"ok": True})
+        # Wrapper runs ttyd in background, so check if it's actually listening
+        time.sleep(2)
+        check = subprocess.run(["lsof", "-i", ":7681"], capture_output=True, text=True, timeout=5)
+        if "ttyd" in check.stdout:
+            _log.info("terminal-reset: restarted (confirmed via lsof)")
+            return jsonify({"ok": True})
+        _log.warning("terminal-reset: wrapper output: stdout=%s stderr=%s",
+                      result.stdout[:300], result.stderr[:300])
+        return jsonify({"ok": False, "error": "ttyd may not have started",
+                        "stdout": result.stdout[:300], "stderr": result.stderr[:300]}), 500
+    except Exception as e:
+        _log.error("terminal-reset failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ── Terminal OAuth Auth Bridge ─────────────────────────────────────
 
 # Global state for in-progress auth session
