@@ -915,13 +915,16 @@ def health():
     with _last_claude_error_lock:
         last_error = _last_claude_error.copy()
 
-    # ttyd check
+    # ttyd check — accepts 401 (auth required) as "running"
     ttyd_ok = False
     try:
         import urllib.request
         req = urllib.request.Request("http://127.0.0.1:7681", method="HEAD")
         with urllib.request.urlopen(req, timeout=2):
             ttyd_ok = True
+    except urllib.error.HTTPError as he:
+        # 401 means ttyd is running but wants auth — that's fine
+        ttyd_ok = (he.code == 401)
     except Exception:
         pass
 
