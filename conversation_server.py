@@ -950,11 +950,12 @@ def terminal_new_window():
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
-            # Auto-start claude CLI in the new window
+            # Auto-start claude CLI from project dir so MEMORY.md + MCP servers load
             import time
             time.sleep(0.5)
             subprocess.run(
-                ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal", "claude", "Enter"],
+                ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal",
+                 "cd ~/Documents/Claude\\ code && claude", "Enter"],
                 capture_output=True, text=True, timeout=5
             )
             _log.info("Created new tmux window in claude-terminal (claude auto-started)")
@@ -962,6 +963,195 @@ def terminal_new_window():
         else:
             return jsonify({"ok": False, "error": result.stderr.strip()}), 500
     except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── Terminal OAuth Auth Bridge ─────────────────────────────────────
+
+# Global state for in-progress auth session
+_auth_session = {"process": None, "master_fd": None, "session_id": None, "timer": None}
+
+
+def _cleanup_auth_session():
+    """Kill auth process and clean up."""
+    proc = _auth_session.get("process")
+    if proc and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    fd = _auth_session.get("master_fd")
+    if fd is not None:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    _auth_session.update({"process": None, "master_fd": None, "session_id": None, "timer": None})
+
+
+@app.route("/terminal-auth-start", methods=["POST"])
+def terminal_auth_start():
+    """Start `claude auth login` via PTY and return the OAuth URL."""
+    import pty
+    import select
+
+    # Clean up any previous session
+    _cleanup_auth_session()
+
+    try:
+        # Unlock keychain (may already be unlocked — ignore errors)
+        try:
+            from credentials import KEYCHAIN_PASSWORD
+            subprocess.run(
+                ["security", "unlock-keychain", "-p", KEYCHAIN_PASSWORD,
+                 os.path.expanduser("~/Library/Keychains/login.keychain-db")],
+                capture_output=True, timeout=5
+            )
+        except (ImportError, Exception):
+            pass  # No password configured or unlock failed — proceed anyway
+
+        # Create PTY pair
+        master_fd, slave_fd = pty.openpty()
+
+        # Start claude auth login with PTY
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+        proc = subprocess.Popen(
+            ["/usr/local/bin/claude", "auth", "login"],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            env=env, close_fds=True
+        )
+        os.close(slave_fd)
+
+        # Read output until we find the OAuth URL (timeout 30s)
+        output = ""
+        url = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 1.0)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096).decode("utf-8", errors="replace")
+                    output += chunk
+                    # Look for OAuth URL
+                    match = re.search(r'(https://claude\.ai/oauth/authorize[^\s\x1b]*)', output)
+                    if match:
+                        url = match.group(1)
+                        break
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                break
+
+        if not url:
+            # Process died or timed out without producing URL
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            _log.warning("terminal-auth-start: no OAuth URL found. Output: %s", output[:500])
+            return jsonify({"ok": False, "error": "No OAuth URL received", "output": output[:500]}), 500
+
+        # Store session for completion
+        session_id = str(uuid.uuid4())
+        _auth_session.update({
+            "process": proc,
+            "master_fd": master_fd,
+            "session_id": session_id,
+        })
+
+        # Auto-cleanup after 5 minutes
+        timer = threading.Timer(300, _cleanup_auth_session)
+        timer.daemon = True
+        timer.start()
+        _auth_session["timer"] = timer
+
+        _log.info("terminal-auth-start: got OAuth URL, session=%s", session_id)
+        return jsonify({"ok": True, "url": url, "session_id": session_id})
+
+    except Exception as e:
+        _cleanup_auth_session()
+        _log.error("terminal-auth-start failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/terminal-auth-complete", methods=["POST"])
+def terminal_auth_complete():
+    """Feed the OAuth code to the waiting `claude auth login` process."""
+    import select
+
+    data = request.get_json(force=True)
+    code = data.get("code", "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "No code provided"}), 400
+
+    proc = _auth_session.get("process")
+    master_fd = _auth_session.get("master_fd")
+
+    if not proc or proc.poll() is not None or master_fd is None:
+        return jsonify({"ok": False, "error": "No active auth session"}), 400
+
+    try:
+        # Write the code to the PTY (simulating user pasting it)
+        os.write(master_fd, (code + "\n").encode())
+
+        # Wait for process to complete (up to 30s)
+        deadline = time.time() + 30
+        output = ""
+        while time.time() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 1.0)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096).decode("utf-8", errors="replace")
+                    output += chunk
+                except OSError:
+                    break
+            if proc.poll() is not None:
+                break
+
+        # Cancel the cleanup timer
+        timer = _auth_session.get("timer")
+        if timer:
+            timer.cancel()
+
+        # Check auth status
+        auth_check = subprocess.run(
+            ["/usr/local/bin/claude", "auth", "status"],
+            capture_output=True, text=True, timeout=10
+        )
+        auth_ok = auth_check.returncode == 0
+
+        _cleanup_auth_session()
+
+        if auth_ok:
+            # Restart tmux claude session so it picks up the new auth
+            try:
+                subprocess.run(
+                    ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal", "exit", "Enter"],
+                    capture_output=True, text=True, timeout=5
+                )
+                time.sleep(1)
+                subprocess.run(
+                    ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal",
+                     "cd ~/Documents/Claude\\ code && claude", "Enter"],
+                    capture_output=True, text=True, timeout=5
+                )
+            except Exception:
+                pass  # Non-critical
+
+        _log.info("terminal-auth-complete: auth_ok=%s", auth_ok)
+        return jsonify({
+            "ok": auth_ok,
+            "status": auth_check.stdout.strip() if auth_ok else auth_check.stderr.strip(),
+        })
+
+    except Exception as e:
+        _cleanup_auth_session()
+        _log.error("terminal-auth-complete failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
