@@ -946,7 +946,7 @@ def terminal_new_window():
     """Create a new tmux window in the claude-terminal session."""
     try:
         result = subprocess.run(
-            ["tmux", "new-window", "-t", "claude-terminal"],
+            ["/opt/homebrew/bin/tmux", "new-window", "-t", "claude-terminal"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
