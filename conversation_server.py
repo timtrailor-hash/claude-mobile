@@ -950,7 +950,14 @@ def terminal_new_window():
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
-            _log.info("Created new tmux window in claude-terminal")
+            # Auto-start claude CLI in the new window
+            import time
+            time.sleep(0.5)
+            subprocess.run(
+                ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal", "claude", "Enter"],
+                capture_output=True, text=True, timeout=5
+            )
+            _log.info("Created new tmux window in claude-terminal (claude auto-started)")
             return jsonify({"ok": True})
         else:
             return jsonify({"ok": False, "error": result.stderr.strip()}), 500
