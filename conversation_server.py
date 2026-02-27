@@ -2366,18 +2366,87 @@ def ai_check_config():
 
 
 @app.route("/work-search")
-def work_search_proxy():
-    """Proxy to wrapper's work-search endpoint."""
-    import urllib.request, urllib.parse
-    q = request.args.get("q", "")
-    try:
-        url = f"http://127.0.0.1:8080/work-search?q={urllib.parse.quote(q)}"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-            return Response(data, content_type="application/json")
-    except Exception as e:
-        return jsonify({"error": str(e), "results": []}), 502
+def work_search():
+    """Search Gmail + Calendar across configured accounts."""
+    from datetime import timezone as tz
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"results": []})
+
+    DIR = os.path.dirname(os.path.abspath(__file__))
+    results = []
+
+    GOOGLE_ACCOUNTS = [
+        {"token": os.path.join(DIR, "google_token.json"), "label": "Personal", "color": "#52b788"},
+        {"token": os.path.join(DIR, "google_token_work.json"), "label": "Work", "color": "#c9a96e"},
+    ]
+    active_accounts = [a for a in GOOGLE_ACCOUNTS if os.path.exists(a["token"])]
+    if not active_accounts:
+        return jsonify({"results": [], "error": "No Google accounts configured"})
+
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly"]
+
+    for account in active_accounts:
+        try:
+            creds = Credentials.from_authorized_user_file(account["token"], SCOPES)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+        except Exception:
+            continue
+
+        # Search Gmail
+        try:
+            gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            msgs = gmail.users().messages().list(userId="me", q=q, maxResults=10).execute()
+            for msg_meta in msgs.get("messages", []):
+                msg = gmail.users().messages().get(userId="me", id=msg_meta["id"], format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"]).execute()
+                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+                from_raw = headers.get("From", "")
+                from_name = from_raw.split("<")[0].strip().strip('"') if "<" in from_raw else from_raw
+                sort_ts = 0
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(headers.get("Date", ""))
+                    sort_ts = dt.timestamp()
+                    time_display = dt.strftime("%d %b %H:%M")
+                except Exception:
+                    time_display = ""
+                results.append({"type": "email", "from": from_name, "subject": headers.get("Subject", ""),
+                    "snippet": msg.get("snippet", ""), "time": time_display, "sort_ts": sort_ts,
+                    "account": account["label"], "account_color": account["color"]})
+        except Exception:
+            pass
+
+        # Search Calendar
+        try:
+            cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
+            events = cal.events().list(calendarId="primary", q=q, singleEvents=True, orderBy="startTime", maxResults=10).execute()
+            for ev in events.get("items", []):
+                start = ev.get("start", {})
+                sort_ts = 0
+                if "dateTime" in start:
+                    try:
+                        from dateutil.parser import parse as dt_parse
+                        st = dt_parse(start["dateTime"])
+                        sort_ts = st.timestamp()
+                        when = st.strftime("%a %d %b %H:%M")
+                    except Exception:
+                        when = start["dateTime"][:16]
+                elif "date" in start:
+                    when = start["date"]
+                else:
+                    when = ""
+                results.append({"type": "event", "summary": ev.get("summary", ""), "when": when,
+                    "sort_ts": sort_ts, "account": account["label"], "account_color": account["color"]})
+        except Exception:
+            pass
+
+    results.sort(key=lambda x: x.get("sort_ts", 0), reverse=True)
+    return jsonify({"results": results})
 
 
 @app.after_request
