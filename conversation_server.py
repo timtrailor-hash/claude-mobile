@@ -34,7 +34,12 @@ from datetime import datetime
 
 # Add shared_utils to path
 sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
-from shared_utils import env_for_claude_cli, work_dir
+from shared_utils import env_for_claude_cli, work_dir, configure_logging
+
+_log = configure_logging(
+    "conversation_server",
+    log_file="/tmp/conversation_server_structured.log",
+)
 
 # Auth token — imported from credentials.py (gitignored), fallback to None (no auth)
 try:
@@ -139,7 +144,7 @@ def _append_event(events_file, event_data):
             f.flush()
             os.fsync(f.fileno())
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] ERROR: Failed to write event: {e}", flush=True)
+        _log.error("Failed to write event: %s", e)
 
     # Wake any WebSocket handlers waiting for new events
     with _event_condition:
@@ -303,8 +308,7 @@ def _reader_thread(proc, generation):
         for raw_line in proc.stdout:
             if not first_byte_logged:
                 elapsed = time.time() - spawn_time
-                print(f"[{datetime.now().isoformat()}] [persistent] First output "
-                      f"after {elapsed:.1f}s", flush=True)
+                _log.info("[persistent] First output after %.1fs", elapsed)
                 first_byte_logged = True
 
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -362,8 +366,7 @@ def _reader_thread(proc, generation):
                         _last_response["seq"] += 1
 
                 turn_id = _current_turn_id()
-                print(f"[{datetime.now().isoformat()}] [turn:{turn_id}] Turn complete",
-                      flush=True)
+                _log.info("[turn:%s] Turn complete", turn_id)
 
                 # Reset per-turn state for next message
                 response_text = ""
@@ -374,7 +377,10 @@ def _reader_thread(proc, generation):
         events_file = _current_events_file()
         if events_file:
             _append_event(events_file, {"type": "error", "content": str(e)})
-        print(f"[{datetime.now().isoformat()}] Reader thread error: {e}", flush=True)
+        _log.error("Reader thread error: %s", e)
+        with _last_claude_error_lock:
+            _last_claude_error["message"] = str(e)
+            _last_claude_error["timestamp"] = datetime.now().isoformat()
 
     done_flag[0] = True
 
@@ -393,12 +399,10 @@ def _reader_thread(proc, generation):
             _session["pid"] = None
             _session["reader_running"] = False
         else:
-            print(f"[{datetime.now().isoformat()}] Reader thread (gen {generation}) "
-                  f"skipping cleanup — newer gen {_session.get('generation')} active",
-                  flush=True)
+            _log.info("Reader thread (gen %d) skipping cleanup — newer gen %s active",
+                      generation, _session.get('generation'))
 
-    print(f"[{datetime.now().isoformat()}] Reader thread (gen {generation}) exited "
-          f"(subprocess ended)", flush=True)
+    _log.info("Reader thread (gen %d) exited (subprocess ended)", generation)
 
 
 _spawn_lock = threading.Lock()  # Serialises check-and-spawn in _ensure_subprocess
@@ -501,8 +505,7 @@ def _ensure_subprocess():
             "terminal_and_web": EDIT_TOOLS,
             "most_actions": READ_TOOLS,
         }
-        print(f"[{datetime.now().isoformat()}] Permission level: {level} "
-              f"(allowed: {allowed_map.get(level, '?')})", flush=True)
+        _log.info("Permission level: %s (allowed: %s)", level, allowed_map.get(level, '?'))
 
         # Clean environment — subscription auth only, no API key leakage
         env = env_for_claude_cli()
@@ -539,16 +542,14 @@ def _ensure_subprocess():
                 daemon=True)
             reader.start()
 
-            print(f"[{datetime.now().isoformat()}] Spawned persistent Claude subprocess "
-                  f"(PID {proc.pid}, gen {gen})", flush=True)
+            _log.info("Spawned persistent Claude subprocess (PID %d, gen %d)", proc.pid, gen)
             return True
 
         except FileNotFoundError:
-            print(f"[{datetime.now().isoformat()}] Claude CLI not found", flush=True)
+            _log.error("Claude CLI not found")
             return False
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] Failed to spawn subprocess: {e}",
-                  flush=True)
+            _log.error("Failed to spawn subprocess: %s", e)
             return False
 
 
@@ -610,8 +611,7 @@ def _start_session(message, image_paths=None, client_session_id=None):
             _session["stdin_pipe"] = None
         return None, f"Subprocess pipe error: {e}"
 
-    print(f"[{datetime.now().isoformat()}] [turn:{sid}] Message sent to persistent "
-          f"subprocess", flush=True)
+    _log.info("[turn:%s] Message sent to persistent subprocess", sid)
 
     return {"session_id": sid, "pid": _session.get("pid")}, None
 
@@ -810,8 +810,7 @@ def permission_request():
     tool_input = data.get("input", {})
     summary = data.get("summary", f"Use tool: {tool_name}")
 
-    print(f"[{datetime.now().isoformat()}] Permission request {request_id}: "
-          f"{tool_name} — {summary}", flush=True)
+    _log.info("Permission request %s: %s — %s", request_id, tool_name, summary)
 
     # Create a pending request with an Event for synchronisation
     wait_event = threading.Event()
@@ -839,14 +838,12 @@ def permission_request():
 
     if not responded or not req or not req.get("response"):
         # Timeout — deny by default
-        print(f"[{datetime.now().isoformat()}] Permission {request_id}: "
-              f"timed out, denying", flush=True)
+        _log.warning("Permission %s: timed out, denying", request_id)
         return jsonify({"allow": False, "message": "Permission request timed out"})
 
     response = req["response"]
     allow = response.get("allow", False)
-    print(f"[{datetime.now().isoformat()}] Permission {request_id}: "
-          f"{'allowed' if allow else 'denied'}", flush=True)
+    _log.info("Permission %s: %s", request_id, 'allowed' if allow else 'denied')
 
     if allow:
         return jsonify({
@@ -867,14 +864,95 @@ def last_response():
         return jsonify(_last_response)
 
 
+_start_time = time.time()
+# Track WS reconnects (rolling 5-min window)
+_ws_connect_times = []  # timestamps of WS connections
+_ws_connect_lock = threading.Lock()
+# Track last Claude CLI error
+_last_claude_error = {"message": "", "timestamp": None}
+_last_claude_error_lock = threading.Lock()
+
+
 @app.route("/health")
 def health():
-    """Health check endpoint."""
-    return jsonify({"ok": True, "pid": os.getpid(),
-                    "uptime_s": round(time.time() - _start_time)})
+    """Extended health check endpoint for SystemHealthView."""
+    now = time.time()
+    uptime = round(now - _start_time)
+
+    # Claude auth status
+    auth_status = "unknown"
+    with _lock:
+        proc = _session.get("proc")
+        if proc and proc.poll() is None:
+            auth_status = "logged_in"
+        elif _session.get("status") == "error":
+            auth_status = "error"
+        else:
+            auth_status = "idle"
+
+    # Thread health
+    thread_health = {}
+    for t in threading.enumerate():
+        if t.name and t.name != "MainThread":
+            thread_health[t.name] = "alive" if t.is_alive() else "dead"
+
+    # WS reconnects in last 5 minutes
+    with _ws_connect_lock:
+        cutoff = now - 300
+        _ws_connect_times[:] = [t for t in _ws_connect_times if t > cutoff]
+        reconnect_count = len(_ws_connect_times)
+
+    # Work cache age
+    work_cache_age = None
+    try:
+        status_file = "/tmp/printer_status/status.json"
+        if os.path.exists(status_file):
+            work_cache_age = round(now - os.path.getmtime(status_file))
+    except OSError:
+        pass
+
+    # Last claude error
+    with _last_claude_error_lock:
+        last_error = _last_claude_error.copy()
+
+    # ttyd check
+    ttyd_ok = False
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:7681", method="HEAD")
+        with urllib.request.urlopen(req, timeout=2):
+            ttyd_ok = True
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "pid": os.getpid(),
+        "uptime_s": uptime,
+        "claude_auth_status": auth_status,
+        "thread_health": thread_health,
+        "ws_reconnect_count_5min": reconnect_count,
+        "work_cache_age_seconds": work_cache_age,
+        "last_claude_error": last_error["message"],
+        "ttyd_ok": ttyd_ok,
+    })
 
 
-_start_time = time.time()
+@app.route("/terminal-new-window", methods=["POST"])
+def terminal_new_window():
+    """Create a new tmux window in the claude-terminal session."""
+    try:
+        result = subprocess.run(
+            ["tmux", "new-window", "-t", "claude-terminal"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            _log.info("Created new tmux window in claude-terminal")
+            return jsonify({"ok": True})
+        else:
+            return jsonify({"ok": False, "error": result.stderr.strip()}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ── WebSocket endpoint ──────────────────────────────────────────────
@@ -904,8 +982,10 @@ def websocket_handler(ws):
     Accepts commands (message, resume, cancel, new_session) from the client.
     """
     client_id = str(uuid.uuid4())[:8]
-    print(f"[{datetime.now().isoformat()}] WS client {client_id} connected",
-          flush=True)
+    _log.info("WS client %s connected", client_id)
+
+    with _ws_connect_lock:
+        _ws_connect_times.append(time.time())
 
     with _ws_clients_lock:
         _ws_clients[client_id] = ws
@@ -1187,8 +1267,7 @@ def websocket_handler(ws):
                               "request_id": req_id})
                 else:
                     # Stale request (already handled or timed out) — not an error
-                    print(f"[{datetime.now().isoformat()}] Permission {req_id}: "
-                          f"stale (already handled/expired), ignoring", flush=True)
+                    _log.info("Permission %s: stale (already handled/expired), ignoring", req_id)
                     _ws_send({"type": "permission_acknowledged",
                               "request_id": req_id,
                               "stale": True})
@@ -1204,8 +1283,7 @@ def websocket_handler(ws):
 
                 old_level = _permission_level
                 _permission_level = new_level
-                print(f"[{datetime.now().isoformat()}] Permission level changed: "
-                      f"{old_level} → {new_level}", flush=True)
+                _log.info("Permission level changed: %s → %s", old_level, new_level)
 
                 # Kill subprocess so next message spawns with new mode
                 if old_level != new_level:
@@ -1234,8 +1312,7 @@ def websocket_handler(ws):
 
     except Exception as e:
         # Log ALL disconnect reasons for debugging
-        print(f"[{datetime.now().isoformat()}] WS client {client_id} "
-              f"exception: {type(e).__name__}: {e}", flush=True)
+        _log.warning("WS client %s exception: %s: %s", client_id, type(e).__name__, e)
 
     finally:
         sender_state["stop"] = True
@@ -1246,8 +1323,7 @@ def websocket_handler(ws):
         with _ws_clients_lock:
             _ws_clients.pop(client_id, None)
 
-        print(f"[{datetime.now().isoformat()}] WS client {client_id} "
-              f"disconnected", flush=True)
+        _log.info("WS client %s disconnected", client_id)
 
 
 # ── PWA static files ──────────────────────────────────────────────
@@ -1462,14 +1538,12 @@ def _check_obico_alerts():
                 "message": f"Obico AI detected possible print failure on SV08 Max "
                            f"(confidence: {confidence_pct}%). Check camera immediately.",
             })
-            print(f"[{datetime.now().isoformat()}] Obico alert: SV08 failure "
-                  f"p={failure_p:.3f}", flush=True)
+            _log.warning("Obico alert: SV08 failure p=%.3f", failure_p)
 
     except Exception as e:
         # Don't spam logs for connection errors when Obico isn't set up
         if "URLError" not in type(e).__name__:
-            print(f"[{datetime.now().isoformat()}] Obico check error: {e}",
-                  flush=True)
+            _log.warning("Obico check error: %s", e)
 
 
 def _check_bambu_camera_ai(printer_data):
@@ -1559,15 +1633,12 @@ def _check_bambu_camera_ai(printer_data):
                 "event": "ai_failure_detected",
                 "message": f"AI print analysis ({severity}): {result}",
             })
-            print(f"[{datetime.now().isoformat()}] Bambu AI alert: {result}",
-                  flush=True)
+            _log.warning("Bambu AI alert: %s", result)
         else:
-            print(f"[{datetime.now().isoformat()}] Bambu AI check: {result}",
-                  flush=True)
+            _log.info("Bambu AI check: %s", result)
 
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Bambu AI check error: {e}",
-              flush=True)
+        _log.warning("Bambu AI check error: %s", e)
 _printer_watches = []  # [{printer, field, op, value, message, id}]
 _printer_watches_lock = threading.Lock()
 
@@ -1584,8 +1655,7 @@ def _broadcast_ws(event_dict):
                 dead.append(cid)
         for cid in dead:
             _ws_clients.pop(cid, None)
-    print(f"[{datetime.now().isoformat()}] Broadcast: {event_dict.get('message', '')}",
-          flush=True)
+    _log.info("Broadcast: %s", event_dict.get('message', ''))
 
 
 def _check_printer_state():
@@ -1669,8 +1739,7 @@ def _check_printer_state():
             _check_printer_alert_file()
 
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] State monitor error: {e}",
-                  flush=True)
+            _log.warning("State monitor error: %s", e)
 
 
 _PRINTER_ALERT_FILE = "/tmp/printer_status/printer_alerts.jsonl"
@@ -1714,8 +1783,7 @@ def _check_printer_alert_file():
             pass
 
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Alert file check error: {e}",
-              flush=True)
+        _log.warning("Alert file check error: %s", e)
 
 
 def _describe_state_change(name, old, new, data):
@@ -2361,7 +2429,7 @@ def ai_check_config():
             _ai_config["bambu_interval"] = int(data["bambu_interval"])
         if "sv08_interval" in data:
             _ai_config["sv08_interval"] = int(data["sv08_interval"])
-        print(f"[{datetime.now().isoformat()}] AI config updated: {_ai_config}", flush=True)
+        _log.info("AI config updated: %s", _ai_config)
         return jsonify(_ai_config)
 
 
@@ -2483,13 +2551,11 @@ def _cleanup_thread():
                     if now - mtime > 86400:  # 24 hours
                         import shutil
                         shutil.rmtree(entry_path, ignore_errors=True)
-                        print(f"[{datetime.now().isoformat()}] Cleanup: removed stale "
-                              f"session dir {entry}", flush=True)
+                        _log.info("Cleanup: removed stale session dir %s", entry)
                 except OSError:
                     pass
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] Cleanup error (sessions): {e}",
-                  flush=True)
+            _log.warning("Cleanup error (sessions): %s", e)
 
         # Clean upload files older than 1 hour
         try:
@@ -2502,21 +2568,18 @@ def _cleanup_thread():
                         mtime = os.path.getmtime(entry_path)
                         if now - mtime > 3600:  # 1 hour
                             os.remove(entry_path)
-                            print(f"[{datetime.now().isoformat()}] Cleanup: removed stale "
-                                  f"upload {entry}", flush=True)
+                            _log.info("Cleanup: removed stale upload %s", entry)
                     except OSError:
                         pass
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] Cleanup error (uploads): {e}",
-                  flush=True)
+            _log.warning("Cleanup error (uploads): %s", e)
 
 
 def _signal_handler(signum, frame):
     """Log signal before exiting — helps diagnose unexpected daemon restarts."""
     sig_name = signal.Signals(signum).name
     uptime = round(time.time() - _start_time)
-    print(f"[{datetime.now().isoformat()}] Received {sig_name} (uptime {uptime}s), "
-          f"shutting down", flush=True)
+    _log.info("Received %s (uptime %ds), shutting down", sig_name, uptime)
 
     # Kill persistent Claude subprocess cleanly
     with _lock:
@@ -2542,24 +2605,21 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGHUP, _signal_handler)
 
-    print(f"[{datetime.now().isoformat()}] Conversation server starting "
-          f"(PID {os.getpid()})", flush=True)
+    _log.info("Conversation server starting (PID %d)", os.getpid())
 
     # Start printer state monitor in background
     monitor = threading.Thread(target=_check_printer_state, daemon=True)
     monitor.start()
-    print(f"[{datetime.now().isoformat()}] Printer state monitor started", flush=True)
+    _log.info("Printer state monitor started")
 
     # Start session/upload cleanup thread (hourly)
     cleaner = threading.Thread(target=_cleanup_thread, daemon=True)
     cleaner.start()
-    print(f"[{datetime.now().isoformat()}] Cleanup thread started (sessions >24h, uploads >1h)",
-          flush=True)
+    _log.info("Cleanup thread started (sessions >24h, uploads >1h)")
 
     # Start work status cache thread (Gmail + Calendar + Slack)
     work_t = threading.Thread(target=_work_cache_thread, daemon=True, name="work-cache")
     work_t.start()
-    print(f"[{datetime.now().isoformat()}] Work cache thread started (60s refresh)",
-          flush=True)
+    _log.info("Work cache thread started (60s refresh)")
 
     app.run(host="0.0.0.0", port=8081, threaded=True)
