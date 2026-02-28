@@ -374,54 +374,35 @@ def _bambu_mqtt_command(payload):
 
 
 def protect_bambu():
-    """Immediate Bambu A1 power-saving: pause + heaters/fans off.
+    """Pause Bambu A1 print, then shut down bed heater after grace period.
 
-    After BAMBU_GRACE_PERIOD seconds, a background thread stops the print
-    entirely (in case power doesn't return).
+    Pauses immediately to stop movement. After BAMBU_GRACE_PERIOD seconds,
+    turns off the bed heater to save power. Print stays paused for manual
+    resume once power is restored.
     """
-    logger.warning("Bambu A1: pausing and reducing power")
+    logger.warning("Bambu A1: pausing print")
 
-    # 1. Pause print
+    # 1. Pause print immediately
     _bambu_mqtt_command({"print": {"command": "pause", "sequence_id": "0"}})
-    time.sleep(1)
 
-    # 2. Turn off hotend
-    _bambu_mqtt_command({"print": {"command": "gcode_line",
-                                   "sequence_id": "0",
-                                   "param": "M104 S0\n"}})
-    # 3. Keep bed heater ON during grace period (maintains adhesion for resume)
-    #    Bed will be turned off when the print is stopped after BAMBU_GRACE_PERIOD
-    # 4. Turn off part cooling fan
-    _bambu_mqtt_command({"print": {"command": "gcode_line",
-                                   "sequence_id": "0",
-                                   "param": "M106 P1 S0\n"}})
-    # 5. Turn off aux fan
-    _bambu_mqtt_command({"print": {"command": "gcode_line",
-                                   "sequence_id": "0",
-                                   "param": "M106 P2 S0\n"}})
-
-    logger.info("Bambu A1: paused, heaters off, fans off")
-    logger.info("Bambu A1: will STOP print in %ds if still on battery",
+    logger.info("Bambu A1: paused — bed heater will shut off in %ds if still on battery",
                 BAMBU_GRACE_PERIOD)
 
-    # 6. Schedule full stop after grace period
-    def _delayed_stop():
+    # 2. After grace period, turn off bed heater to conserve UPS power
+    def _delayed_bed_off():
         time.sleep(BAMBU_GRACE_PERIOD)
-        # Check if still on battery
         state = get_power_state()
         if state["source"] == "Battery Power":
-            logger.warning("Bambu A1: grace period expired, still on battery — STOPPING print")
-            # Turn off bed heater now (was kept on during grace period)
+            logger.warning("Bambu A1: grace period expired, still on battery — bed heater OFF")
             _bambu_mqtt_command({"print": {"command": "gcode_line",
                                            "sequence_id": "0",
                                            "param": "M140 S0\n"}})
-            _bambu_mqtt_command({"print": {"command": "stop", "sequence_id": "0"}})
-            notify_app("Bambu A1 print stopped after 2 min on battery")
+            notify_app("Bambu A1 bed heater off after 2 min on battery")
         else:
             logger.info("Bambu A1: power restored during grace period — print still paused "
                         "(resume manually)")
 
-    threading.Thread(target=_delayed_stop, daemon=True).start()
+    threading.Thread(target=_delayed_bed_off, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
