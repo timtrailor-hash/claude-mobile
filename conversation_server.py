@@ -1894,6 +1894,78 @@ def printer_status():
     return jsonify(result)
 
 
+@app.route("/printer-speed-auto", methods=["POST"])
+def printer_speed_auto():
+    """Toggle auto-speed on/off for the Sovol SV08.
+
+    Accepts JSON: {"enabled": true/false}
+    Writes to /tmp/printer_status/auto_speed.json (same file gcode_profile.py uses).
+    """
+    body = request.get_json(silent=True) or {}
+    enabled = body.get("enabled")
+    if enabled is None:
+        return jsonify({"ok": False, "error": "Missing 'enabled' field"}), 400
+
+    auto_speed_file = "/tmp/printer_status/auto_speed.json"
+    try:
+        with open(auto_speed_file) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {"enabled": False, "mode": "optimal", "min_speed_pct": 80,
+               "max_speed_pct": 200, "skip_first_layers": 2}
+
+    cfg["enabled"] = bool(enabled)
+    with open(auto_speed_file, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    _log.info("printer-speed-auto: set enabled=%s", enabled)
+    return jsonify({"ok": True, "enabled": cfg["enabled"]})
+
+
+@app.route("/printer-speed-set", methods=["POST"])
+def printer_speed_set():
+    """Set manual speed factor on the Sovol SV08 via Moonraker M220 gcode.
+
+    Accepts JSON: {"speed_pct": 150}
+    Sends M220 S<pct> to Moonraker API.
+    """
+    import urllib.request
+    import urllib.parse
+
+    body = request.get_json(silent=True) or {}
+    speed_pct = body.get("speed_pct")
+    if speed_pct is None:
+        return jsonify({"ok": False, "error": "Missing 'speed_pct' field"}), 400
+
+    speed_pct = int(speed_pct)
+    if not (10 <= speed_pct <= 300):
+        return jsonify({"ok": False, "error": "speed_pct must be 10-300"}), 400
+
+    # Read Sovol IP from printer_config (same config the daemon uses)
+    try:
+        sys.path.insert(0, os.path.expanduser("~/Documents/Claude code/sv08-print-tools"))
+        from printer_config import SOVOL_IP, MOONRAKER_PORT
+    except ImportError:
+        SOVOL_IP = "192.168.87.52"
+        MOONRAKER_PORT = 7125
+
+    moonraker = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+    cmd = f"M220 S{speed_pct}"
+    enc = urllib.parse.quote(cmd)
+    url = f"{moonraker}/printer/gcode/script?script={enc}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            result = json.loads(r.read())
+        ok = result.get("result") == "ok"
+    except Exception as e:
+        _log.error("printer-speed-set: Moonraker error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    _log.info("printer-speed-set: M220 S%d -> ok=%s", speed_pct, ok)
+    return jsonify({"ok": ok, "speed_pct": speed_pct})
+
+
 @app.route("/printer-image/<name>")
 def printer_image(name):
     """Serve camera snapshots and thumbnails."""
