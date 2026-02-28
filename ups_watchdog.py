@@ -211,11 +211,30 @@ def _sovol_ssh(cmd):
         return False, str(exc)
 
 
+def _get_current_bed_max_power():
+    """Read the current heater_bed max_power from Klipper's live config."""
+    url = f"{MOONRAKER_BASE}/printer/objects/query?configfile=settings"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return data["result"]["status"]["configfile"]["settings"]["heater_bed"]["max_power"]
+    except Exception:
+        return None
+
+
 def set_bed_max_power(power):
     """Change heater_bed max_power in printer.cfg and restart firmware.
 
-    Only applies when the printer is NOT actively printing.
+    Only applies when the printer is NOT actively printing and the current
+    value differs from the target.
     """
+    # Check if already at the desired value
+    current = _get_current_bed_max_power()
+    if current is not None and abs(current - power) < 0.01:
+        logger.debug("Bed max_power already at %s — no change needed", power)
+        return True
+
     state = get_sovol_print_state()
     if state == "printing":
         logger.info("Skipping bed power change — printer is actively printing")
@@ -236,7 +255,8 @@ def set_bed_max_power(power):
 
     # Firmware restart to apply
     moonraker_request("/printer/firmware_restart")
-    logger.info("Bed max_power set to %s — firmware restarting", power)
+    logger.info("Bed max_power changed from %s to %s — firmware restarting",
+                current, power)
     return True
 
 
