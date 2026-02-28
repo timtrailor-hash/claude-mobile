@@ -957,6 +957,22 @@ def _terminal_claude_cmd():
             " && unset ANTHROPIC_API_KEY && unset CLAUDE_CODE_OAUTH_TOKEN && claude")
 
 
+@app.route("/printer-alert", methods=["POST"])
+def printer_alert_endpoint():
+    """Receive external alerts (e.g. UPS watchdog) and broadcast to iOS app."""
+    data = request.get_json(force=True)
+    msg = data.get("message", "Unknown alert")
+    level = data.get("level", "warning")
+    _broadcast_ws({
+        "type": "printer_alert",
+        "printer": "system",
+        "event": f"ups_{level}",
+        "message": msg,
+    })
+    _log.warning("External printer alert: %s", msg)
+    return jsonify({"ok": True})
+
+
 @app.route("/terminal-new-window", methods=["POST"])
 def terminal_new_window():
     """Create a new tmux window in the claude-terminal session."""
