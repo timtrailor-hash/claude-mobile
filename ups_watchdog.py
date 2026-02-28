@@ -647,8 +647,15 @@ def run():
                 logger.info(
                     "POWER RESTORED — back on AC (%s%%)", percent
                 )
+                # Re-warm beds to 45°C to preserve adhesion for resume
+                logger.info("Re-warming beds to 45°C")
+                _gcode("M140 S45")  # Sovol bed → 45°C
+                _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                               "sequence_id": "0",
+                                               "param": "M140 S45\n"}})
                 notify_all(
-                    "AC power restored — printers were paused, check and resume manually",
+                    "AC power restored — beds re-warming to 45°C, "
+                    "printers still paused. Check and resume manually.",
                     level="info"
                 )
                 emergency_sent = False
