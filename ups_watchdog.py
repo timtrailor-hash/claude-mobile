@@ -112,9 +112,10 @@ def load_saved_state():
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
-            return data.get("source"), data.get("emergency", False)
+            return (data.get("source"), data.get("emergency", False),
+                    data.get("time", 0))
     except Exception:
-        return None, False
+        return None, False, 0
 
 
 # ---------------------------------------------------------------------------
@@ -633,17 +634,18 @@ def run():
     logger.info("Emergency stop threshold: %d%%", EMERGENCY_BATTERY_PCT)
 
     # Check if we're recovering from a shutdown during a power cut
-    saved_source, saved_emergency = load_saved_state()
+    saved_source, saved_emergency, saved_time = load_saved_state()
     previous_source = saved_source  # seed with last known state
     emergency_sent = False
     mac_reduced = False
     current_bed_mode = None
     notified_levels = set()
+    outage_elapsed = time.time() - saved_time if saved_time else 0
 
     if saved_source == "Battery Power":
         logger.info("Last state before shutdown was Battery Power "
-                    "(emergency=%s) — checking if power has been restored",
-                    saved_emergency)
+                    "(emergency=%s, %.0f min ago) — checking if power restored",
+                    saved_emergency, outage_elapsed / 60)
 
     while True:
         state = get_power_state()
@@ -675,20 +677,34 @@ def run():
 
             # --- Transition: Battery → AC (power restored) ---
             elif source == "AC Power":
+                elapsed = time.time() - saved_time if saved_time else 0
+                elapsed_min = elapsed / 60
                 logger.info(
-                    "POWER RESTORED — back on AC (%s%%)", percent
+                    "POWER RESTORED — back on AC (%s%%), outage ~%.0f min",
+                    percent, elapsed_min
                 )
-                # Re-warm beds to 45°C to preserve adhesion for resume
-                logger.info("Re-warming beds to 45°C")
-                _gcode("M140 S45")  # Sovol bed → 45°C
-                _bambu_mqtt_command({"print": {"command": "gcode_line",
-                                               "sequence_id": "0",
-                                               "param": "M140 S45\n"}})
-                notify_all(
-                    "AC power restored — beds re-warming to 45°C, "
-                    "printers still paused. Check and resume manually.",
-                    level="info"
-                )
+                # Only re-warm beds if outage was under 1 hour
+                if elapsed_min < 60:
+                    logger.info("Re-warming beds to 45°C (outage < 1hr)")
+                    _gcode("M140 S45")
+                    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                                   "sequence_id": "0",
+                                                   "param": "M140 S45\n"}})
+                    notify_all(
+                        f"AC power restored after ~{elapsed_min:.0f} min — "
+                        f"beds re-warming to 45°C, printers still paused. "
+                        f"Check and resume manually.",
+                        level="info"
+                    )
+                else:
+                    logger.info("Outage was %.0f min — too long to re-warm beds, "
+                                "print likely detached", elapsed_min)
+                    notify_all(
+                        f"AC power restored after ~{elapsed_min:.0f} min — "
+                        f"beds NOT re-heated (outage too long, print likely "
+                        f"detached). Inspect and restart manually.",
+                        level="info"
+                    )
                 emergency_sent = False
                 mac_reduced = False
 
