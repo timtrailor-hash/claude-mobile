@@ -691,18 +691,18 @@ def run():
                                                    "sequence_id": "0",
                                                    "param": "M140 S45\n"}})
                     notify_all(
-                        f"AC power restored after ~{elapsed_min:.0f} min — "
-                        f"beds re-warming to 45°C, printers still paused. "
-                        f"Check and resume manually.",
+                        f"AC power restored. Bed off for ~{elapsed_min:.0f} min, "
+                        f"now reheating to 45°C. Printers still paused — "
+                        f"check and resume manually.",
                         level="info"
                     )
                 else:
                     logger.info("Outage was %.0f min — too long to re-warm beds, "
                                 "print likely detached", elapsed_min)
                     notify_all(
-                        f"AC power restored after ~{elapsed_min:.0f} min — "
-                        f"beds NOT re-heated (outage too long, print likely "
-                        f"detached). Inspect and restart manually.",
+                        f"AC power restored. Bed off for ~{elapsed_min:.0f} min "
+                        f"so not reheating — print likely detached. "
+                        f"Inspect and restart manually.",
                         level="info"
                     )
                 emergency_sent = False
