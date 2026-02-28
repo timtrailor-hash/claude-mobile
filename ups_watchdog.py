@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -27,16 +29,23 @@ from logging.handlers import RotatingFileHandler
 # ---------------------------------------------------------------------------
 try:
     sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
-    from printer_config import SOVOL_IP, MOONRAKER_PORT
+    from printer_config import (SOVOL_IP, MOONRAKER_PORT,
+                                BAMBU_IP, BAMBU_SERIAL,
+                                BAMBU_ACCESS_CODE, BAMBU_MQTT_PORT)
 except ImportError:
     SOVOL_IP = "192.168.87.52"
     MOONRAKER_PORT = 7125
+    BAMBU_IP = "192.168.87.47"
+    BAMBU_SERIAL = ""
+    BAMBU_ACCESS_CODE = ""
+    BAMBU_MQTT_PORT = 8883
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 POLL_INTERVAL = 30          # seconds between power checks
 EMERGENCY_BATTERY_PCT = 20  # below this → emergency stop
+BAMBU_GRACE_PERIOD = 120    # seconds to keep Bambu running before stopping
 MOONRAKER_BASE = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
 LOG_PATH = "/tmp/ups_watchdog.log"
 LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
@@ -317,6 +326,103 @@ def emergency_stop_sovol():
 
 
 # ---------------------------------------------------------------------------
+# Bambu A1 MQTT control
+# ---------------------------------------------------------------------------
+
+def _bambu_mqtt_command(payload):
+    """Send a command to the Bambu A1 via MQTT (one-shot connection)."""
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        logger.warning("paho-mqtt not installed — cannot control Bambu")
+        return False
+
+    if not BAMBU_SERIAL or not BAMBU_ACCESS_CODE:
+        logger.warning("Bambu credentials not configured — skipping")
+        return False
+
+    topic = f"device/{BAMBU_SERIAL}/request"
+    success = [False]
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            client.publish(topic, json.dumps(payload))
+            success[0] = True
+            logger.info("  Bambu MQTT command sent: %s", list(payload.keys()))
+        else:
+            logger.error("  Bambu MQTT connect failed: %s", reason_code)
+        client.disconnect()
+
+    try:
+        client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id="ups_watchdog_bambu",
+            protocol=mqtt.MQTTv311,
+        )
+        client.username_pw_set("bblp", BAMBU_ACCESS_CODE)
+        tls_ctx = ssl.create_default_context()
+        tls_ctx.check_hostname = False
+        tls_ctx.verify_mode = ssl.CERT_NONE
+        client.tls_set_context(tls_ctx)
+        client.on_connect = on_connect
+        client.connect(BAMBU_IP, BAMBU_MQTT_PORT, keepalive=10)
+        client.loop(timeout=5)
+        return success[0]
+    except Exception as exc:
+        logger.error("Bambu MQTT error: %s", exc)
+        return False
+
+
+def protect_bambu():
+    """Immediate Bambu A1 power-saving: pause + heaters/fans off.
+
+    After BAMBU_GRACE_PERIOD seconds, a background thread stops the print
+    entirely (in case power doesn't return).
+    """
+    logger.warning("Bambu A1: pausing and reducing power")
+
+    # 1. Pause print
+    _bambu_mqtt_command({"print": {"command": "pause", "sequence_id": "0"}})
+    time.sleep(1)
+
+    # 2. Turn off hotend
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M104 S0\n"}})
+    # 3. Turn off bed heater
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M140 S0\n"}})
+    # 4. Turn off part cooling fan
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M106 P1 S0\n"}})
+    # 5. Turn off aux fan
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M106 P2 S0\n"}})
+
+    logger.info("Bambu A1: paused, heaters off, fans off")
+    logger.info("Bambu A1: will STOP print in %ds if still on battery",
+                BAMBU_GRACE_PERIOD)
+
+    # 6. Schedule full stop after grace period
+    def _delayed_stop():
+        time.sleep(BAMBU_GRACE_PERIOD)
+        # Check if still on battery
+        state = get_power_state()
+        if state["source"] == "Battery Power":
+            logger.warning("Bambu A1: grace period expired, still on battery — STOPPING print")
+            _bambu_mqtt_command({"print": {"command": "stop", "sequence_id": "0"}})
+            notify_app("Bambu A1 print stopped after 2 min on battery")
+        else:
+            logger.info("Bambu A1: power restored during grace period — print still paused "
+                        "(resume manually)")
+
+    threading.Thread(target=_delayed_stop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Main watchdog loop
 # ---------------------------------------------------------------------------
 def run():
@@ -343,13 +449,13 @@ def run():
                 )
                 # Attempt to pause and protect printers
                 protect_sovol()
+                # Protect Bambu A1 via MQTT (pause + heaters/fans off, stop after 2 min)
+                protect_bambu()
+
                 notify_app(
-                    f"POWER FAILURE — printers paused, UPS at {percent}%"
-                    f" ({remaining or 'unknown'} remaining)"
-                )
-                logger.warning(
-                    "Bambu A1: cannot be paused remotely — "
-                    "if printing, it will continue until power fails or user intervenes"
+                    f"POWER FAILURE — both printers paused, UPS at {percent}%"
+                    f" ({remaining or 'unknown'} remaining). "
+                    f"Bambu will stop in {BAMBU_GRACE_PERIOD}s if power doesn't return."
                 )
                 emergency_sent = False  # reset in case of repeated outages
 
