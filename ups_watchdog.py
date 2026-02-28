@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from logging.handlers import RotatingFileHandler
 
 # ---------------------------------------------------------------------------
@@ -171,30 +172,138 @@ def notify_app(message, level="warning"):
         logger.warning("Failed to notify iOS app: %s", exc)
 
 
+def _gcode(cmd):
+    """Send a gcode command to the Sovol via Moonraker."""
+    encoded = urllib.parse.quote(cmd)
+    ok, msg = moonraker_request(f"/printer/gcode/script?script={encoded}")
+    if ok:
+        logger.info("  gcode OK: %s", cmd)
+    else:
+        logger.error("  gcode FAILED: %s — %s", cmd, msg)
+    return ok
+
+
+def _save_plr_state():
+    """Save print position and state via PLR variables for later resume.
+
+    Queries all current print parameters from Moonraker and saves them
+    to Klipper's saved_variables.cfg via SAVE_VARIABLE commands.
+    After power restore, POWER_RESUME macro reads these to continue.
+    """
+    url = (f"{MOONRAKER_BASE}/printer/objects/query?"
+           "gcode_move=gcode_position,speed_factor,extrude_factor"
+           "&virtual_sdcard=file_position,file_path,progress"
+           "&extruder=temperature,target"
+           "&heater_bed=temperature,target"
+           "&fan_generic%20fan0=speed")
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        status = data["result"]["status"]
+    except Exception as exc:
+        logger.error("Failed to query print state for PLR save: %s", exc)
+        return False
+
+    gm = status["gcode_move"]
+    vs = status["virtual_sdcard"]
+    ext = status["extruder"]
+    bed = status["heater_bed"]
+    fan = status.get("fan_generic fan0", {})
+
+    z_pos = gm["gcode_position"][2]
+    speed_pct = int(gm["speed_factor"] * 100)
+    flow_pct = int(gm["extrude_factor"] * 100)
+    fan_speed = int(fan.get("speed", 1.0) * 255)
+    nozzle_target = int(ext["target"])
+    bed_target = int(bed["target"])
+    file_pos = vs["file_position"]
+    progress = vs.get("progress", 0)
+
+    logger.info("Saving PLR state: Z=%.2f, speed=%d%%, flow=%d%%, fan=%d, "
+                "nozzle=%d°C, bed=%d°C, file_pos=%d, progress=%.1f%%",
+                z_pos, speed_pct, flow_pct, fan_speed,
+                nozzle_target, bed_target, file_pos, progress * 100)
+
+    variables = [
+        ("power_resume_z", z_pos),
+        ("plr_speed_pct", speed_pct),
+        ("plr_flow_pct", flow_pct),
+        ("plr_fan_speed", fan_speed),
+        ("plr_nozzle_target", nozzle_target),
+        ("plr_bed_target", bed_target),
+        ("plr_file_position", file_pos),
+        ("was_interrupted", "True"),
+    ]
+    for var, val in variables:
+        _gcode(f"SAVE_VARIABLE VARIABLE={var} VALUE={val}")
+    _gcode("save_last_file")
+
+    logger.info("PLR state saved — can resume with POWER_RESUME after power restore")
+    return True
+
+
 def protect_sovol():
-    """Pause print, drop bed to 45°C, turn off hotend."""
+    """Full power-loss protection sequence for Sovol SV08.
+
+    Goal: minimise power draw to maximise UPS runtime while preserving
+    the ability to resume the print after power restore.
+
+    Sequence:
+      1. Save print position + state to PLR variables (for POWER_RESUME)
+      2. Pause the print (stops movement, retracts filament)
+      3. Turn off hotend (saves ~50W)
+      4. Drop bed to 45°C (saves ~400W but maintains adhesion)
+      5. Turn off part cooling fan (saves ~5-10W)
+      6. Turn off LED strip (saves ~5W)
+      7. Disable X/Y/E steppers (saves ~30-60W; Z stays locked to hold height)
+
+    After power restore: run POWER_RESUME from Mainsail to re-heat, re-home,
+    and continue from saved position.
+    """
     state = get_sovol_print_state()
+
+    if state == "unreachable":
+        logger.warning("Sovol is unreachable — cannot protect")
+        return
+
     if state == "printing":
-        logger.warning("Sovol is printing — sending PAUSE command")
+        # 1. Save PLR state BEFORE pausing (captures exact position)
+        logger.warning("Sovol is printing — saving state and pausing")
+        _save_plr_state()
+
+        # 2. Pause print (retracts filament, lifts Z, parks head)
         ok, msg = moonraker_request("/printer/print/pause")
         if ok:
-            logger.info("Sovol pause command sent successfully")
+            logger.info("Sovol paused successfully")
         else:
             logger.error("Failed to pause Sovol: %s", msg)
-    elif state == "unreachable":
-        logger.warning("Sovol is unreachable — cannot pause")
+    elif state == "paused":
+        logger.info("Sovol already paused — saving state and reducing power")
+        _save_plr_state()
     else:
-        logger.info("Sovol print state is '%s' — no pause needed", state)
+        logger.info("Sovol print state is '%s' — no print to save, reducing power", state)
 
-    # Drop bed to 45°C (maintain adhesion but save power)
-    moonraker_request(
-        "/printer/gcode/script?script=SET_HEATER_TEMPERATURE%20HEATER%3Dheater_bed%20TARGET%3D45"
-    )
-    # Turn off hotend
-    moonraker_request(
-        "/printer/gcode/script?script=SET_HEATER_TEMPERATURE%20HEATER%3Dextruder%20TARGET%3D0"
-    )
-    logger.info("Sovol bed→45°C, hotend→off")
+    # 3. Turn off hotend (~50W saved)
+    _gcode("SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0")
+
+    # 4. Drop bed to 45°C (~400W saved while maintaining adhesion)
+    _gcode("SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=45")
+
+    # 5. Turn off part cooling fan
+    _gcode("M106 S0")
+
+    # 6. Turn off LED strip (if configured)
+    _gcode("SET_PIN PIN=caselight VALUE=0")
+
+    # 7. Disable X/Y/E steppers (Z stays locked to hold print height)
+    #    Saves ~30-60W. Safe because PLR state is already saved and
+    #    POWER_RESUME will re-home before continuing.
+    _gcode("SET_STEPPER_ENABLE STEPPER=stepper_x ENABLE=0")
+    _gcode("SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=0")
+    _gcode("SET_STEPPER_ENABLE STEPPER=extruder ENABLE=0")
+
+    logger.info("Sovol protected: paused, PLR saved, heaters/fans/steppers reduced")
 
 
 def emergency_stop_sovol():
