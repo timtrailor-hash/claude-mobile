@@ -612,6 +612,7 @@ def run():
     emergency_sent = False
     mac_reduced = False
     current_bed_mode = None  # "day" or "night" — tracks what we last set
+    notified_levels = set()  # track which % thresholds we've already notified
 
     while True:
         state = get_power_state()
@@ -639,6 +640,7 @@ def run():
                     f"Beds stay warm until {EMERGENCY_BATTERY_PCT}%."
                 )
                 emergency_sent = False
+                notified_levels.clear()
 
             # --- Transition: Battery → AC (power restored) ---
             elif source == "AC Power":
@@ -657,6 +659,16 @@ def run():
             # Log battery level at INFO when on battery (important to track)
             logger.info("On battery: %s%% (%s remaining)",
                         percent, remaining or "unknown")
+
+            # Milestone notifications at 75%, 50%, 25%
+            for threshold in (75, 50, 25):
+                if percent <= threshold and threshold not in notified_levels:
+                    notified_levels.add(threshold)
+                    notify_all(
+                        f"UPS at {percent}% ({remaining or 'unknown'} remaining). "
+                        f"Still on battery — beds warm at 45°C.",
+                        level="warning" if threshold > 25 else "critical"
+                    )
 
             # At EMERGENCY_BATTERY_PCT: kill all beds, stop Bambu, e-stop Sovol
             # Leaves remaining battery for Mac Mini clean shutdown
