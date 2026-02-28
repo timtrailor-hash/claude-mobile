@@ -1205,6 +1205,8 @@ def terminal_auth_start():
         # Start claude auth login with PTY
         env = os.environ.copy()
         env["TERM"] = "dumb"
+        # Ensure node and brew binaries are in PATH (needed by claude CLI)
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
         proc = subprocess.Popen(
             ["/opt/homebrew/bin/claude", "auth", "login"],
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
@@ -1307,10 +1309,12 @@ def terminal_auth_complete():
         if timer:
             timer.cancel()
 
-        # Check auth status
+        # Check auth status (needs node in PATH)
+        auth_env = os.environ.copy()
+        auth_env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + auth_env.get("PATH", "")
         auth_check = subprocess.run(
             ["/opt/homebrew/bin/claude", "auth", "status"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10, env=auth_env
         )
         auth_ok = auth_check.returncode == 0
 
