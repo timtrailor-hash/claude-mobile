@@ -956,6 +956,7 @@ def _terminal_claude_cmd():
     except (ImportError, AttributeError):
         unlock = "true"  # no-op if no password
     return (f"{unlock} && cd ~/Documents/Claude\\\\ code"
+            " && export PATH=$HOME/.local/bin:/opt/homebrew/bin:$PATH"
             " && unset ANTHROPIC_API_KEY && unset CLAUDE_CODE_OAUTH_TOKEN && claude")
 
 
@@ -1321,20 +1322,23 @@ def terminal_auth_complete():
         _cleanup_auth_session()
 
         if auth_ok:
-            # Restart tmux claude session so it picks up the new auth
+            # Kill and recreate tmux session so it picks up the new auth.
+            # Claude Code TUI ignores "exit" via send-keys, so we nuke the session.
+            _tmux = "/opt/homebrew/bin/tmux"
             try:
-                subprocess.run(
-                    ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal", "exit", "Enter"],
-                    capture_output=True, text=True, timeout=5
-                )
+                subprocess.run([_tmux, "kill-session", "-t", "claude-terminal"],
+                               capture_output=True, text=True, timeout=5)
                 time.sleep(1)
-                subprocess.run(
-                    ["/opt/homebrew/bin/tmux", "send-keys", "-t", "claude-terminal",
-                     _terminal_claude_cmd(), "Enter"],
-                    capture_output=True, text=True, timeout=5
-                )
-            except Exception:
-                pass  # Non-critical
+                subprocess.run([_tmux, "new-session", "-d", "-s", "claude-terminal",
+                               "-x", "120", "-y", "40"],
+                               capture_output=True, text=True, timeout=5)
+                time.sleep(0.5)
+                subprocess.run([_tmux, "send-keys", "-t", "claude-terminal",
+                               _terminal_claude_cmd(), "Enter"],
+                               capture_output=True, text=True, timeout=5)
+                _log.info("terminal-auth-complete: tmux session recreated")
+            except Exception as restart_err:
+                _log.warning("terminal-auth-complete: tmux restart failed: %s", restart_err)
 
         _log.info("terminal-auth-complete: auth_ok=%s", auth_ok)
         return jsonify({
