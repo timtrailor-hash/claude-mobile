@@ -374,18 +374,32 @@ def _bambu_mqtt_command(payload):
 
 
 def protect_bambu():
-    """Pause Bambu A1 print, then shut down bed heater after grace period.
+    """Pause Bambu A1 and minimise power draw immediately.
 
-    Pauses immediately to stop movement. After BAMBU_GRACE_PERIOD seconds,
-    turns off the bed heater to save power. Print stays paused for manual
-    resume once power is restored.
+    Pauses print, turns off hotend and fans straight away. Bed heater stays
+    on for BAMBU_GRACE_PERIOD seconds (maintains adhesion for resume), then
+    shuts off if still on battery. Print stays paused for manual resume.
     """
-    logger.warning("Bambu A1: pausing print")
+    logger.warning("Bambu A1: pausing print, reducing power")
 
     # 1. Pause print immediately
     _bambu_mqtt_command({"print": {"command": "pause", "sequence_id": "0"}})
+    time.sleep(1)
 
-    logger.info("Bambu A1: paused — bed heater will shut off in %ds if still on battery",
+    # 2. Turn off hotend (~40W saved)
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M104 S0\n"}})
+    # 3. Turn off part cooling fan
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M106 P1 S0\n"}})
+    # 4. Turn off aux fan
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M106 P2 S0\n"}})
+
+    logger.info("Bambu A1: paused, hotend off, fans off — bed heater off in %ds if still on battery",
                 BAMBU_GRACE_PERIOD)
 
     # 2. After grace period, turn off bed heater to conserve UPS power
