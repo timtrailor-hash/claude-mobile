@@ -97,22 +97,24 @@ logger.addHandler(console)
 # ---------------------------------------------------------------------------
 # State persistence (survives Mac shutdown + reboot)
 # ---------------------------------------------------------------------------
-def save_state(source):
-    """Write current power source to disk so we know on next boot."""
+def save_state(source, emergency=False):
+    """Write current power state to disk so we know on next boot."""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"source": source, "time": time.time()}, f)
+            json.dump({"source": source, "emergency": emergency,
+                        "time": time.time()}, f)
     except Exception:
         pass
 
 
 def load_saved_state():
-    """Read the last known power source from before shutdown."""
+    """Read the last known power state from before shutdown."""
     try:
         with open(STATE_FILE) as f:
-            return json.load(f).get("source")
+            data = json.load(f)
+            return data.get("source"), data.get("emergency", False)
     except Exception:
-        return None
+        return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +633,7 @@ def run():
     logger.info("Emergency stop threshold: %d%%", EMERGENCY_BATTERY_PCT)
 
     # Check if we're recovering from a shutdown during a power cut
-    saved_source = load_saved_state()
+    saved_source, saved_emergency = load_saved_state()
     previous_source = saved_source  # seed with last known state
     emergency_sent = False
     mac_reduced = False
@@ -639,8 +641,9 @@ def run():
     notified_levels = set()
 
     if saved_source == "Battery Power":
-        logger.info("Last state before shutdown was Battery Power — "
-                    "checking if power has been restored")
+        logger.info("Last state before shutdown was Battery Power "
+                    "(emergency=%s) — checking if power has been restored",
+                    saved_emergency)
 
     while True:
         state = get_power_state()
@@ -724,6 +727,7 @@ def run():
                     f"printers stopped. Mac Mini will shut down at 5%."
                 )
                 emergency_sent = True
+                save_state(source, emergency=True)
 
         # --- Bed heater power scheduling (night mode, AC only) ---
         if source == "AC Power":
