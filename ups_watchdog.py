@@ -61,6 +61,7 @@ NOTIFY_EMAIL = "timtrailor@gmail.com"
 POLL_INTERVAL = 30          # seconds between power checks
 EMERGENCY_BATTERY_PCT = 10  # below this → kill all beds, emergency stop Sovol
 MOONRAKER_BASE = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+STATE_FILE = "/tmp/ups_watchdog_state.json"  # persists power state across restarts
 # macOS haltlevel should be set to 5% (sudo pmset -u haltlevel 5)
 # so the watchdog has 10%→5% to act before the Mac shuts down
 
@@ -91,6 +92,27 @@ logger.addHandler(handler)
 console = logging.StreamHandler()
 console.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 logger.addHandler(console)
+
+
+# ---------------------------------------------------------------------------
+# State persistence (survives Mac shutdown + reboot)
+# ---------------------------------------------------------------------------
+def save_state(source):
+    """Write current power source to disk so we know on next boot."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"source": source, "time": time.time()}, f)
+    except Exception:
+        pass
+
+
+def load_saved_state():
+    """Read the last known power source from before shutdown."""
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f).get("source")
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -608,11 +630,17 @@ def run():
     logger.info("Sovol endpoint: %s", MOONRAKER_BASE)
     logger.info("Emergency stop threshold: %d%%", EMERGENCY_BATTERY_PCT)
 
-    previous_source = None
+    # Check if we're recovering from a shutdown during a power cut
+    saved_source = load_saved_state()
+    previous_source = saved_source  # seed with last known state
     emergency_sent = False
     mac_reduced = False
-    current_bed_mode = None  # "day" or "night" — tracks what we last set
-    notified_levels = set()  # track which % thresholds we've already notified
+    current_bed_mode = None
+    notified_levels = set()
+
+    if saved_source == "Battery Power":
+        logger.info("Last state before shutdown was Battery Power — "
+                    "checking if power has been restored")
 
     while True:
         state = get_power_state()
@@ -715,6 +743,7 @@ def run():
         )
 
         previous_source = source
+        save_state(source)
 
         try:
             time.sleep(POLL_INTERVAL)
