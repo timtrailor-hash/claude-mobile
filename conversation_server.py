@@ -29,6 +29,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime
 
@@ -971,6 +973,125 @@ def printer_alert_endpoint():
     })
     _log.warning("External printer alert: %s", msg)
     return jsonify({"ok": True})
+
+
+@app.route("/printer-resume-info")
+def printer_resume_info():
+    """Show last checkpoint data and whether a resume is possible."""
+    checkpoint_file = "/tmp/printer_status/print_checkpoint.json"
+    try:
+        with open(checkpoint_file) as f:
+            cp = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return jsonify({"available": False, "reason": "No checkpoint found"})
+
+    # Check if the file still exists on the printer
+    filename = cp.get("filename", "")
+    file_exists = False
+    if filename:
+        try:
+            sys.path.insert(0, os.path.expanduser("~/Documents/Claude code/sv08-print-tools"))
+            from printer_config import SOVOL_IP, MOONRAKER_PORT
+            encoded = urllib.parse.quote(filename, safe="")
+            url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/server/files/metadata?filename={encoded}"
+            with urllib.request.urlopen(url, timeout=5) as r:
+                meta = json.loads(r.read())
+            file_exists = meta.get("result", {}).get("filename") is not None
+        except Exception:
+            pass
+
+    # Check checkpoint age (only valid for ~24h)
+    ts = cp.get("timestamp", "")
+    age_hours = 999
+    try:
+        from datetime import datetime as dt
+        cp_time = dt.fromisoformat(ts)
+        age_hours = (dt.now() - cp_time).total_seconds() / 3600
+    except Exception:
+        pass
+
+    available = file_exists and age_hours < 24 and cp.get("progress_pct", 0) > 0
+    safe_layer = max(1, cp.get("current_layer", 0) - 2)
+
+    # Estimate time saved
+    total_layers = cp.get("total_layers", 1) or 1
+    duration_s = cp.get("print_duration_s", 0) or 0
+    estimated_total_s = duration_s / max(0.01, cp.get("progress_pct", 1) / 100)
+    skip_fraction = safe_layer / total_layers
+    time_saved_h = (estimated_total_s * skip_fraction) / 3600
+
+    return jsonify({
+        "available": available,
+        "checkpoint": cp,
+        "file_exists": file_exists,
+        "age_hours": round(age_hours, 1),
+        "suggested_layer": safe_layer,
+        "estimated_time_saved_h": round(time_saved_h, 1),
+    })
+
+
+@app.route("/printer-resume-from-layer", methods=["POST"])
+def printer_resume_from_layer():
+    """Generate a resume gcode file and optionally start the print.
+
+    Accepts JSON: {"filename": "...", "layer": 52} or {"layer": "auto"}
+    """
+    body = request.get_json(silent=True) or {}
+    layer = body.get("layer", "auto")
+    auto_start = body.get("start", False)
+
+    # Get filename from body or checkpoint
+    filename = body.get("filename", "")
+    if not filename:
+        try:
+            with open("/tmp/printer_status/print_checkpoint.json") as f:
+                cp = json.load(f)
+            filename = cp.get("filename", "")
+        except Exception:
+            return jsonify({"ok": False, "error": "No filename and no checkpoint"}), 400
+
+    if not filename:
+        return jsonify({"ok": False, "error": "No filename found"}), 400
+
+    # Run gcode_resume.py as subprocess
+    script = os.path.expanduser("~/Documents/Claude code/sv08-print-tools/gcode_resume.py")
+    cmd = [sys.executable, script, "--file", filename, "--layer", str(layer)]
+    if auto_start:
+        cmd.append("--start")
+
+    _log.info("printer-resume: running %s", " ".join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600,
+            cwd=os.path.dirname(script),
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "Resume script timed out (>10min)"}), 504
+
+    if result.returncode != 0:
+        _log.error("printer-resume failed: %s", result.stderr[:500])
+        return jsonify({
+            "ok": False,
+            "error": result.stderr[:300] or "Unknown error",
+            "stdout": result.stdout[-500:],
+        }), 500
+
+    # Parse summary JSON from stdout
+    summary = {}
+    for line in result.stdout.split("\n"):
+        if line.startswith("__SUMMARY_JSON__:"):
+            try:
+                summary = json.loads(line.split(":", 1)[1])
+            except json.JSONDecodeError:
+                pass
+
+    _log.info("printer-resume: success — %s", summary.get("resume_file", "?"))
+    return jsonify({
+        "ok": True,
+        **summary,
+        "auto_started": auto_start,
+    })
 
 
 @app.route("/terminal-new-window", methods=["POST"])
@@ -2163,8 +2284,76 @@ _printer_watches = []  # [{printer, field, op, value, message, id}]
 _printer_watches_lock = threading.Lock()
 
 
+def _notify_slack(message):
+    """Send a Slack DM to Tim for critical printer alerts."""
+    try:
+        from credentials import SLACK_BOT_TOKEN
+    except ImportError:
+        return
+    if not SLACK_BOT_TOKEN:
+        return
+    slack_user_id = "U03H1AN51MZ"  # Tim Trailor
+    try:
+        data = json.dumps({
+            "channel": slack_user_id,
+            "text": f":warning: *Printer Alert*\n{message}",
+        }).encode()
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=data, method="POST",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        if resp.get("ok"):
+            _log.info("Slack DM sent for printer alert")
+        else:
+            _log.warning("Slack API error: %s", resp.get("error", "unknown"))
+    except Exception as exc:
+        _log.warning("Slack notification failed: %s", exc)
+
+
+def _notify_email(subject, message):
+    """Send email via Gmail SMTP for critical printer alerts."""
+    try:
+        from credentials import SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+    except ImportError:
+        return
+    if not SMTP_USER:
+        return
+    notify_email = "timtrailor@gmail.com"
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(message)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = notify_email
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        _log.info("Email sent to %s for printer alert", notify_email)
+    except Exception as exc:
+        _log.warning("Email notification failed: %s", exc)
+
+
+# Events that should trigger multi-channel alerts (Slack + email + push)
+_CRITICAL_EVENTS = {
+    "firmware_error", "state_change", "failure_detected", "ai_failure_detected",
+    "config_corruption", "ups_warning", "ups_critical",
+}
+# Only certain state changes are critical
+_CRITICAL_STATE_MESSAGES = {"error", "cancelled", "complete", "paused"}
+
+
 def _broadcast_ws(event_dict):
-    """Send event to all connected WebSocket clients."""
+    """Send event to all connected WebSocket clients.
+
+    Critical alerts (errors, failures, UPS) are also sent via Slack + email.
+    """
     msg = json.dumps(event_dict)
     with _ws_clients_lock:
         dead = []
@@ -2176,6 +2365,27 @@ def _broadcast_ws(event_dict):
         for cid in dead:
             _ws_clients.pop(cid, None)
     _log.info("Broadcast: %s", event_dict.get('message', ''))
+
+    # Multi-channel alerting for critical events
+    event_type = event_dict.get("event", "")
+    alert_msg = event_dict.get("message", "")
+    is_critical = event_type in _CRITICAL_EVENTS
+
+    # For state_change events, only alert on critical transitions
+    if event_type == "state_change":
+        new_state = event_dict.get("new_state", "").lower()
+        is_critical = any(kw in new_state for kw in _CRITICAL_STATE_MESSAGES)
+
+    if is_critical and alert_msg:
+        # Run Slack + email in background threads so broadcasting doesn't block
+        threading.Thread(
+            target=_notify_slack, args=(alert_msg,), daemon=True
+        ).start()
+        threading.Thread(
+            target=_notify_email,
+            args=(f"[Printer] {alert_msg[:60]}", alert_msg),
+            daemon=True,
+        ).start()
 
 
 def _check_printer_state():
