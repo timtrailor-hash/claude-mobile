@@ -2342,7 +2342,7 @@ def _notify_email(subject, message):
 
 # Events that should trigger multi-channel alerts (Slack + email + push)
 _CRITICAL_EVENTS = {
-    "firmware_error", "state_change", "failure_detected", "ai_failure_detected",
+    "firmware_error", "state_change",
     "config_corruption", "ups_warning", "ups_critical",
 }
 # Only certain state changes are critical
