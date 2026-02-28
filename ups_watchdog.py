@@ -59,9 +59,10 @@ NOTIFY_EMAIL = "timtrailor@gmail.com"
 # Constants
 # ---------------------------------------------------------------------------
 POLL_INTERVAL = 30          # seconds between power checks
-EMERGENCY_BATTERY_PCT = 20  # below this → emergency stop
-BAMBU_GRACE_PERIOD = 120    # seconds to keep Bambu running before stopping
+EMERGENCY_BATTERY_PCT = 10  # below this → kill all beds, emergency stop Sovol
 MOONRAKER_BASE = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+# macOS haltlevel should be set to 5% (sudo pmset -u haltlevel 5)
+# so the watchdog has 10%→5% to act before the Mac shuts down
 
 # Bed heater power scheduling — limit at night to avoid UPS overload beeping
 NIGHT_START_HOUR = 22       # 10 PM — reduce bed max_power
@@ -529,9 +530,9 @@ def _bambu_mqtt_command(payload):
 def protect_bambu():
     """Pause Bambu A1 and minimise power draw immediately.
 
-    Pauses print, turns off hotend and fans straight away. Bed heater stays
-    on for BAMBU_GRACE_PERIOD seconds (maintains adhesion for resume), then
-    shuts off if still on battery. Print stays paused for manual resume.
+    Pauses print, turns off hotend/fans/light/camera, drops bed to 45°C.
+    Bed stays warm until battery hits EMERGENCY_BATTERY_PCT (managed by
+    the main loop calling shutdown_bambu_bed()).
     """
     logger.warning("Bambu A1: pausing print, reducing power")
 
@@ -543,33 +544,59 @@ def protect_bambu():
     _bambu_mqtt_command({"print": {"command": "gcode_line",
                                    "sequence_id": "0",
                                    "param": "M104 S0\n"}})
-    # 3. Turn off part cooling fan
+    # 3. Drop bed to 45°C (maintains adhesion, saves ~80W vs full temp)
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M140 S45\n"}})
+    # 4. Turn off part cooling fan
     _bambu_mqtt_command({"print": {"command": "gcode_line",
                                    "sequence_id": "0",
                                    "param": "M106 P1 S0\n"}})
-    # 4. Turn off aux fan
+    # 5. Turn off aux fan
     _bambu_mqtt_command({"print": {"command": "gcode_line",
                                    "sequence_id": "0",
                                    "param": "M106 P2 S0\n"}})
+    # 6. Turn off chamber light
+    _bambu_mqtt_command({"system": {"sequence_id": "0",
+                                    "command": "ledctrl",
+                                    "led_node": "chamber_light",
+                                    "led_mode": "off"}})
+    # 7. Turn off camera recording
+    _bambu_mqtt_command({"camera": {"sequence_id": "0",
+                                    "command": "ipcam_record_set",
+                                    "ipcam_record": "disable"}})
 
-    logger.info("Bambu A1: paused, hotend off, fans off — bed heater off in %ds if still on battery",
-                BAMBU_GRACE_PERIOD)
+    logger.info("Bambu A1: paused, hotend off, bed→45°C, fans/light/camera off")
 
-    # 2. After grace period, turn off bed heater to conserve UPS power
-    def _delayed_bed_off():
-        time.sleep(BAMBU_GRACE_PERIOD)
-        state = get_power_state()
-        if state["source"] == "Battery Power":
-            logger.warning("Bambu A1: grace period expired, still on battery — bed heater OFF")
-            _bambu_mqtt_command({"print": {"command": "gcode_line",
-                                           "sequence_id": "0",
-                                           "param": "M140 S0\n"}})
-            notify_all("Bambu A1 bed heater off after 2 min on battery")
-        else:
-            logger.info("Bambu A1: power restored during grace period — print still paused "
-                        "(resume manually)")
 
-    threading.Thread(target=_delayed_bed_off, daemon=True).start()
+def shutdown_bambu_bed():
+    """Kill Bambu bed heater and stop print — called when battery is critical."""
+    logger.warning("Bambu A1: battery critical — bed OFF, stopping print")
+    _bambu_mqtt_command({"print": {"command": "gcode_line",
+                                   "sequence_id": "0",
+                                   "param": "M140 S0\n"}})
+    _bambu_mqtt_command({"print": {"command": "stop", "sequence_id": "0"}})
+
+
+def reduce_mac_power():
+    """Reduce Mac Mini power draw by stopping non-essential services."""
+    logger.info("Reducing Mac Mini power draw")
+    cmds = [
+        # Stop non-essential services
+        ["launchctl", "bootout", f"gui/{os.getuid()}",
+         os.path.expanduser("~/Library/LaunchAgents/com.timtrailor.printer-snapshots.plist")],
+        # Kill non-essential processes
+        ["pkill", "-f", "streamlit"],
+        ["pkill", "-f", "streamlit_https_proxy"],
+        # Dim display (already set to 2 min on battery, but force it now)
+        ["pmset", "displaysleepnow"],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+    logger.info("Mac Mini: stopped printer daemon, Streamlit, HTTPS proxy, display off")
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +610,7 @@ def run():
 
     previous_source = None
     emergency_sent = False
+    mac_reduced = False
     current_bed_mode = None  # "day" or "night" — tracks what we last set
 
     while True:
@@ -591,25 +619,28 @@ def run():
         percent = state["percent"]
         remaining = state["remaining"]
 
-        # --- Transition detection ---
+        # --- Transition: AC → Battery (power cut) ---
         if previous_source is not None and source != previous_source:
             if source == "Battery Power":
                 logger.warning(
                     "POWER LOST — now on battery (%s%%, %s remaining)",
                     percent, remaining or "unknown"
                 )
-                # Attempt to pause and protect printers
+                # Immediate protection for both printers
                 protect_sovol()
-                # Protect Bambu A1 via MQTT (pause + heaters/fans off, stop after 2 min)
                 protect_bambu()
+                # Reduce Mac Mini draw (kill non-essential services)
+                reduce_mac_power()
+                mac_reduced = True
 
                 notify_all(
-                    f"POWER FAILURE — both printers paused, UPS at {percent}%"
-                    f" ({remaining or 'unknown'} remaining). "
-                    f"Bambu will stop in {BAMBU_GRACE_PERIOD}s if power doesn't return."
+                    f"POWER FAILURE — both printers paused, beds at 45°C, "
+                    f"UPS at {percent}% ({remaining or 'unknown'} remaining). "
+                    f"Beds stay warm until {EMERGENCY_BATTERY_PCT}%."
                 )
-                emergency_sent = False  # reset in case of repeated outages
+                emergency_sent = False
 
+            # --- Transition: Battery → AC (power restored) ---
             elif source == "AC Power":
                 logger.info(
                     "POWER RESTORED — back on AC (%s%%)", percent
@@ -618,18 +649,36 @@ def run():
                     "AC power restored — printers were paused, check and resume manually",
                     level="info"
                 )
-                logger.info(
-                    "Auto-resume is disabled — inspect printers and resume manually"
-                )
                 emergency_sent = False
+                mac_reduced = False
 
-        # --- Emergency stop check (while on battery) ---
+        # --- Battery level monitoring (while on battery) ---
         if source == "Battery Power" and percent is not None:
-            if percent < EMERGENCY_BATTERY_PCT and not emergency_sent:
+            # Log battery level at INFO when on battery (important to track)
+            logger.info("On battery: %s%% (%s remaining)",
+                        percent, remaining or "unknown")
+
+            # At EMERGENCY_BATTERY_PCT: kill all beds, stop Bambu, e-stop Sovol
+            # Leaves remaining battery for Mac Mini clean shutdown
+            if percent <= EMERGENCY_BATTERY_PCT and not emergency_sent:
+                logger.critical(
+                    "BATTERY CRITICAL (%s%%) — killing all heaters, "
+                    "stopping printers, reserving power for Mac shutdown",
+                    percent
+                )
+                # Kill Sovol bed + emergency stop
+                _gcode("M140 S0")  # Sovol bed OFF
                 emergency_stop_sovol()
+                # Kill Bambu bed + stop print
+                shutdown_bambu_bed()
+
+                notify_all(
+                    f"CRITICAL: UPS at {percent}% — all heaters OFF, "
+                    f"printers stopped. Mac Mini will shut down at 5%."
+                )
                 emergency_sent = True
 
-        # --- Bed heater power scheduling (night mode) ---
+        # --- Bed heater power scheduling (night mode, AC only) ---
         if source == "AC Power":
             night = _is_night_hours()
             wanted = "night" if night else "day"
