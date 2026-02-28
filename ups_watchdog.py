@@ -29,6 +29,7 @@ from logging.handlers import RotatingFileHandler
 # ---------------------------------------------------------------------------
 try:
     sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
+    sys.path.insert(0, os.path.expanduser("~/projects/claude"))
     from printer_config import (SOVOL_IP, MOONRAKER_PORT,
                                 BAMBU_IP, BAMBU_SERIAL,
                                 BAMBU_ACCESS_CODE, BAMBU_MQTT_PORT)
@@ -40,6 +41,20 @@ except ImportError:
     BAMBU_ACCESS_CODE = ""
     BAMBU_MQTT_PORT = 8883
 
+# Notification credentials — Slack DM + email + push
+try:
+    from credentials import (SLACK_BOT_TOKEN, SMTP_HOST, SMTP_PORT,
+                              SMTP_USER, SMTP_PASS)
+except ImportError:
+    SLACK_BOT_TOKEN = ""
+    SMTP_HOST = ""
+    SMTP_PORT = 587
+    SMTP_USER = ""
+    SMTP_PASS = ""
+
+SLACK_USER_ID = "U03H1AN51MZ"       # Tim Trailor
+NOTIFY_EMAIL = "timtrailor@gmail.com"
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -47,6 +62,12 @@ POLL_INTERVAL = 30          # seconds between power checks
 EMERGENCY_BATTERY_PCT = 20  # below this → emergency stop
 BAMBU_GRACE_PERIOD = 120    # seconds to keep Bambu running before stopping
 MOONRAKER_BASE = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+
+# Bed heater power scheduling — limit at night to avoid UPS overload beeping
+NIGHT_START_HOUR = 22       # 10 PM — reduce bed max_power
+NIGHT_END_HOUR = 7          # 7 AM — restore full bed max_power
+BED_POWER_DAY = 1.0         # full power during the day
+BED_POWER_NIGHT = 0.7       # 70% at night (keeps total load under UPS 900W)
 LOG_PATH = "/tmp/ups_watchdog.log"
 LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 LOG_BACKUP_COUNT = 3
@@ -167,7 +188,59 @@ def get_sovol_print_state():
         return "unreachable"
 
 
-def notify_app(message, level="warning"):
+# ---------------------------------------------------------------------------
+# Bed heater power scheduling (night mode)
+# ---------------------------------------------------------------------------
+def _is_night_hours():
+    """Return True if current time is in the night window (10pm-7am)."""
+    hour = time.localtime().tm_hour
+    return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+
+
+def _sovol_ssh(cmd):
+    """Run a command on the Sovol via SSH (uses sshpass)."""
+    try:
+        result = subprocess.run(
+            ["/opt/homebrew/bin/sshpass", "-p", "sovol",
+             "ssh", "-o", "StrictHostKeyChecking=no",
+             f"sovol@{SOVOL_IP}", cmd],
+            capture_output=True, text=True, timeout=15,
+        )
+        return result.returncode == 0, result.stdout.strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+def set_bed_max_power(power):
+    """Change heater_bed max_power in printer.cfg and restart firmware.
+
+    Only applies when the printer is NOT actively printing.
+    """
+    state = get_sovol_print_state()
+    if state == "printing":
+        logger.info("Skipping bed power change — printer is actively printing")
+        return False
+
+    if state == "unreachable":
+        logger.warning("Sovol unreachable — cannot change bed power")
+        return False
+
+    # sed: replace max_power on line 346 (heater_bed section)
+    ok, out = _sovol_ssh(
+        f'sed -i "346s/max_power: .*/max_power: {power}/" '
+        '/home/sovol/printer_data/config/printer.cfg'
+    )
+    if not ok:
+        logger.error("Failed to update printer.cfg: %s", out)
+        return False
+
+    # Firmware restart to apply
+    moonraker_request("/printer/firmware_restart")
+    logger.info("Bed max_power set to %s — firmware restarting", power)
+    return True
+
+
+def _notify_push(message, level="warning"):
     """Send alert to the iOS app via conversation server."""
     try:
         data = json.dumps({"message": message, "level": level}).encode()
@@ -177,8 +250,68 @@ def notify_app(message, level="warning"):
             headers={"Content-Type": "application/json"},
         )
         urllib.request.urlopen(req, timeout=5)
+        logger.info("Push notification sent")
     except Exception as exc:
-        logger.warning("Failed to notify iOS app: %s", exc)
+        logger.warning("Failed to send push notification: %s", exc)
+
+
+def _notify_slack(message):
+    """Send a Slack DM to Tim."""
+    if not SLACK_BOT_TOKEN:
+        logger.warning("No Slack token — skipping Slack notification")
+        return
+    try:
+        data = json.dumps({
+            "channel": SLACK_USER_ID,
+            "text": f":rotating_light: *UPS ALERT* :rotating_light:\n{message}",
+        }).encode()
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=data, method="POST",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        if resp.get("ok"):
+            logger.info("Slack DM sent")
+        else:
+            logger.warning("Slack API error: %s", resp.get("error", "unknown"))
+    except Exception as exc:
+        logger.warning("Failed to send Slack DM: %s", exc)
+
+
+def _notify_email(subject, message):
+    """Send email via SMTP (Gmail)."""
+    if not SMTP_USER:
+        logger.warning("No SMTP credentials — skipping email notification")
+        return
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(message)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIFY_EMAIL
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        logger.info("Email sent to %s", NOTIFY_EMAIL)
+    except Exception as exc:
+        logger.warning("Failed to send email: %s", exc)
+
+
+def notify_all(message, level="warning"):
+    """Blast notification across ALL channels: push, Slack DM, and email.
+
+    Each channel is independent — failure of one doesn't block the others.
+    """
+    subject = "UPS POWER FAILURE" if level == "warning" else "UPS Alert"
+    _notify_push(message, level)
+    _notify_slack(message)
+    _notify_email(f"[Mac Mini] {subject}", message)
 
 
 def _gcode(cmd):
@@ -411,7 +544,7 @@ def protect_bambu():
             _bambu_mqtt_command({"print": {"command": "gcode_line",
                                            "sequence_id": "0",
                                            "param": "M140 S0\n"}})
-            notify_app("Bambu A1 bed heater off after 2 min on battery")
+            notify_all("Bambu A1 bed heater off after 2 min on battery")
         else:
             logger.info("Bambu A1: power restored during grace period — print still paused "
                         "(resume manually)")
@@ -430,6 +563,7 @@ def run():
 
     previous_source = None
     emergency_sent = False
+    current_bed_mode = None  # "day" or "night" — tracks what we last set
 
     while True:
         state = get_power_state()
@@ -449,7 +583,7 @@ def run():
                 # Protect Bambu A1 via MQTT (pause + heaters/fans off, stop after 2 min)
                 protect_bambu()
 
-                notify_app(
+                notify_all(
                     f"POWER FAILURE — both printers paused, UPS at {percent}%"
                     f" ({remaining or 'unknown'} remaining). "
                     f"Bambu will stop in {BAMBU_GRACE_PERIOD}s if power doesn't return."
@@ -460,7 +594,7 @@ def run():
                 logger.info(
                     "POWER RESTORED — back on AC (%s%%)", percent
                 )
-                notify_app(
+                notify_all(
                     "AC power restored — printers were paused, check and resume manually",
                     level="info"
                 )
@@ -474,6 +608,17 @@ def run():
             if percent < EMERGENCY_BATTERY_PCT and not emergency_sent:
                 emergency_stop_sovol()
                 emergency_sent = True
+
+        # --- Bed heater power scheduling (night mode) ---
+        if source == "AC Power":
+            night = _is_night_hours()
+            wanted = "night" if night else "day"
+            if wanted != current_bed_mode:
+                power = BED_POWER_NIGHT if night else BED_POWER_DAY
+                logger.info("Switching bed power to %s mode (max_power=%s)",
+                            wanted, power)
+                if set_bed_max_power(power):
+                    current_bed_mode = wanted
 
         # --- Periodic status log (every poll, at DEBUG level) ---
         logger.debug(
