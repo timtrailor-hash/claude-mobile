@@ -1324,21 +1324,34 @@ def terminal_auth_complete():
         if auth_ok:
             # Kill and recreate tmux session so it picks up the new auth.
             # Claude Code TUI ignores "exit" via send-keys, so we nuke the session.
+            # Also restart ttyd so it reconnects to the new session.
             _tmux = "/opt/homebrew/bin/tmux"
             try:
+                # Kill ttyd first (it's attached to the tmux session)
+                subprocess.run(["pkill", "-f", "ttyd"], capture_output=True, timeout=5)
+                time.sleep(0.5)
                 subprocess.run([_tmux, "kill-session", "-t", "claude-terminal"],
                                capture_output=True, text=True, timeout=5)
                 time.sleep(1)
+                # Recreate tmux session
                 subprocess.run([_tmux, "new-session", "-d", "-s", "claude-terminal",
                                "-x", "120", "-y", "40"],
+                               capture_output=True, text=True, timeout=5)
+                subprocess.run([_tmux, "set", "-t", "claude-terminal",
+                               "history-limit", "50000"],
                                capture_output=True, text=True, timeout=5)
                 time.sleep(0.5)
                 subprocess.run([_tmux, "send-keys", "-t", "claude-terminal",
                                _terminal_claude_cmd(), "Enter"],
                                capture_output=True, text=True, timeout=5)
                 _log.info("terminal-auth-complete: tmux session recreated")
+                # Restart ttyd attached to new session
+                ttyd_wrapper = os.path.expanduser("~/.local/bin/ttyd_wrapper.sh")
+                subprocess.Popen([ttyd_wrapper, "start"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _log.info("terminal-auth-complete: ttyd restarted")
             except Exception as restart_err:
-                _log.warning("terminal-auth-complete: tmux restart failed: %s", restart_err)
+                _log.warning("terminal-auth-complete: tmux/ttyd restart failed: %s", restart_err)
 
         _log.info("terminal-auth-complete: auth_ok=%s", auth_ok)
         return jsonify({
@@ -3264,6 +3277,35 @@ def add_headers(response):
     return response
 
 
+def _keychain_keepalive():
+    """Background thread: unlocks macOS keychain every 5 minutes.
+
+    The Mac Mini's keychain re-locks unpredictably (sleep, idle, reboot)
+    even with set-keychain-settings no-timeout. When locked, Claude CLI
+    can't read its OAuth token → auth errors in the terminal tab.
+
+    This thread keeps the keychain unlocked as long as the server is running.
+    """
+    try:
+        from credentials import KEYCHAIN_PASSWORD
+    except (ImportError, AttributeError):
+        _log.warning("keychain-keepalive: no KEYCHAIN_PASSWORD in credentials.py — disabled")
+        return
+
+    kc_path = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    while True:
+        try:
+            result = subprocess.run(
+                ["security", "unlock-keychain", "-p", KEYCHAIN_PASSWORD, kc_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                _log.warning("keychain-keepalive: unlock failed: %s", result.stderr.strip())
+        except Exception as e:
+            _log.warning("keychain-keepalive: error: %s", e)
+        time.sleep(300)  # Every 5 minutes
+
+
 def _cleanup_thread():
     """Background thread: periodically cleans up stale session dirs and upload files.
 
@@ -3349,6 +3391,11 @@ if __name__ == "__main__":
     monitor = threading.Thread(target=_check_printer_state, daemon=True)
     monitor.start()
     _log.info("Printer state monitor started")
+
+    # Start keychain keepalive (prevents auth failures from locked keychain)
+    kc_thread = threading.Thread(target=_keychain_keepalive, daemon=True, name="keychain-keepalive")
+    kc_thread.start()
+    _log.info("Keychain keepalive started (unlock every 5 min)")
 
     # Start session/upload cleanup thread (hourly)
     cleaner = threading.Thread(target=_cleanup_thread, daemon=True)
