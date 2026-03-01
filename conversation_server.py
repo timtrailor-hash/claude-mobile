@@ -2159,7 +2159,7 @@ _last_bambu_ai_check = [0]  # Timestamp of last Bambu AI check
 
 # Configurable AI check intervals (seconds, 0 = off)
 _ai_config = {
-    "bambu_interval": 300,   # Default 5 min
+    "bambu_interval": 0,     # Disabled — too many false positives (2026-03-01)
     "sv08_interval": 300,    # Default 5 min
 }
 _ai_config_lock = threading.Lock()
