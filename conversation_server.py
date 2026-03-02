@@ -37,6 +37,7 @@ from datetime import datetime
 # Add shared_utils to path
 sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
 from shared_utils import env_for_claude_cli, work_dir, configure_logging
+from printer_registry import registry as _printer_registry
 
 _log = configure_logging(
     "conversation_server",
@@ -991,10 +992,9 @@ def printer_resume_info():
     file_exists = False
     if filename:
         try:
-            sys.path.insert(0, os.path.expanduser("~/Documents/Claude code/sv08-print-tools"))
-            from printer_config import SOVOL_IP, MOONRAKER_PORT
+            klipper = _printer_registry.list_klipper()[0]
             encoded = urllib.parse.quote(filename, safe="")
-            url = f"http://{SOVOL_IP}:{MOONRAKER_PORT}/server/files/metadata?filename={encoded}"
+            url = f"{klipper.moonraker_url}/server/files/metadata?filename={encoded}"
             with urllib.request.urlopen(url, timeout=5) as r:
                 meta = json.loads(r.read())
             file_exists = meta.get("result", {}).get("filename") is not None
@@ -1997,10 +1997,16 @@ def upload_file():
 
 # ── Printer status + images (so native app doesn't need wrapper) ──
 
+@app.route("/printers")
+def list_printers():
+    """List all configured printers from registry."""
+    return jsonify({"printers": _printer_registry.to_dict()})
+
+
 @app.route("/printer-status")
 def printer_status():
     """Serve cached printer status from daemon output."""
-    status_file = "/tmp/printer_status/status.json"
+    status_file = os.path.join(_printer_registry.status_dir, "status.json")
     try:
         with open(status_file) as f:
             data = json.load(f)
@@ -2013,24 +2019,27 @@ def printer_status():
 
     result = {"sv08": {}, "a1": {}}
 
-    sovol = data.get("printers", {}).get("sovol", {})
-    if sovol.get("online"):
-        if "state" in sovol:
-            sovol["state"] = (sovol["state"] or "unknown").capitalize()
-        result["sv08"] = sovol
-    else:
-        result["sv08"] = {"error": sovol.get("error", "Offline")}
+    # Use registry to iterate printers, build response with legacy keys
+    for printer in _printer_registry.list_enabled():
+        legacy_key = _printer_registry.legacy_key(printer.id)
+        printer_data = data.get("printers", {}).get(legacy_key, {})
 
-    bambu = data.get("printers", {}).get("bambu", {})
-    if bambu.get("online"):
-        a1 = dict(bambu)
-        a1.setdefault("layer", a1.pop("layer_num", None))
-        a1.setdefault("total_layers", a1.pop("total_layer_num", None))
-        speed_names = {1: "Silent", 2: "Standard", 3: "Sport", 4: "Ludicrous"}
-        a1["speed"] = speed_names.get(a1.get("speed_level"), "?")
-        result["a1"] = a1
-    else:
-        result["a1"] = {"error": bambu.get("error", "Offline")}
+        if printer_data.get("online"):
+            pd = dict(printer_data)
+            if printer.is_klipper and "state" in pd:
+                pd["state"] = (pd["state"] or "unknown").capitalize()
+            elif printer.is_bambu:
+                pd.setdefault("layer", pd.pop("layer_num", None))
+                pd.setdefault("total_layers", pd.pop("total_layer_num", None))
+                speed_names = printer.speed_levels
+                sl = pd.get("speed_level")
+                pd["speed"] = speed_names.get(str(sl), "?") if sl else "?"
+            # Use legacy response keys for backward compat
+            resp_key = "sv08" if legacy_key == "sovol" else "a1" if legacy_key == "bambu" else printer.id
+            result[resp_key] = pd
+        else:
+            resp_key = "sv08" if legacy_key == "sovol" else "a1" if legacy_key == "bambu" else printer.id
+            result[resp_key] = {"error": printer_data.get("error", "Offline")}
 
     result["daemon_timestamp"] = data.get("timestamp", "")
     return jsonify(result)
@@ -2083,15 +2092,13 @@ def printer_speed_set():
     if not (10 <= speed_pct <= 300):
         return jsonify({"ok": False, "error": "speed_pct must be 10-300"}), 400
 
-    # Read Sovol IP from printer_config (same config the daemon uses)
+    # Get Klipper printer from registry (default to first klipper printer)
+    printer_id = (request.get_json(silent=True) or {}).get("printer_id")
     try:
-        sys.path.insert(0, os.path.expanduser("~/Documents/Claude code/sv08-print-tools"))
-        from printer_config import SOVOL_IP, MOONRAKER_PORT
-    except ImportError:
-        SOVOL_IP = "192.168.87.52"
-        MOONRAKER_PORT = 7125
-
-    moonraker = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
+        printer = _printer_registry.get(printer_id) if printer_id else _printer_registry.list_klipper()[0]
+        moonraker = printer.moonraker_url
+    except (KeyError, IndexError):
+        return jsonify({"ok": False, "error": "No klipper printer found"}), 404
     cmd = f"M220 S{speed_pct}"
     enc = urllib.parse.quote(cmd)
     url = f"{moonraker}/printer/gcode/script?script={enc}"
@@ -2111,10 +2118,9 @@ def printer_speed_set():
 @app.route("/printer-image/<name>")
 def printer_image(name):
     """Serve camera snapshots and thumbnails."""
-    safe_names = {"sovol_camera.jpg", "sovol_thumbnail.png", "a1_camera.jpg"}
-    if name not in safe_names:
+    if name not in _printer_registry.image_whitelist():
         return "Not found", 404
-    img_dir = "/tmp/printer_status"
+    img_dir = _printer_registry.status_dir
     path = os.path.join(img_dir, name)
     if not os.path.exists(path):
         return "Not found", 404
@@ -2150,7 +2156,7 @@ def serve_file():
 
 # ── Printer state monitor + notifications ──
 
-_prev_printer_state = {"sv08": None, "a1": None}
+_prev_printer_state = {p.id: None for p in _printer_registry.list_enabled()}
 _ai_check_counter = [0]  # Mutable so nested function can modify
 _last_obico_alert_ts = [None]  # Track last Obico alert to avoid duplicates
 _last_bambu_ai_alert = [0]  # Timestamp of last Bambu AI alert (cooldown)
@@ -2166,21 +2172,27 @@ _ai_config_lock = threading.Lock()
 
 
 def _check_obico_alerts():
-    """Poll Obico API for SV08 failure detection alerts."""
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
-        from printer_config import OBICO_API_TOKEN, OBICO_PRINTER_ID, OBICO_BASE_URL
-    except (ImportError, AttributeError):
+    """Poll Obico API for failure detection alerts on printers with obico feature."""
+    # Find printers with Obico configured
+    obico_printers = [p for p in _printer_registry.list_enabled() if p.has_feature("obico")]
+    if not obico_printers:
         return
 
-    if not OBICO_API_TOKEN or not OBICO_PRINTER_ID:
-        return  # Not configured yet
+    for printer in obico_printers:
+        _check_obico_for_printer(printer)
+
+
+def _check_obico_for_printer(printer):
+    """Check Obico for a single printer."""
+    obico = printer.get_obico_config()
+    if not obico.get("api_token") or not obico.get("printer_id"):
+        return
 
     try:
         import urllib.request
-        url = f"{OBICO_BASE_URL}/api/v1/printers/{OBICO_PRINTER_ID}/"
+        url = f"{obico['base_url']}/api/v1/printers/{obico['printer_id']}/"
         req = urllib.request.Request(url)
-        req.add_header("Authorization", f"Token {OBICO_API_TOKEN}")
+        req.add_header("Authorization", f"Token {obico['api_token']}")
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
 
@@ -2195,12 +2207,12 @@ def _check_obico_alerts():
             confidence_pct = round(failure_p * 100)
             _broadcast_ws({
                 "type": "printer_alert",
-                "printer": "sv08",
+                "printer": printer.id,
                 "event": "failure_detected",
-                "message": f"Obico AI detected possible print failure on SV08 Max "
+                "message": f"Obico AI detected possible print failure on {printer.name} "
                            f"(confidence: {confidence_pct}%). Check camera immediately.",
             })
-            _log.warning("Obico alert: SV08 failure p=%.3f", failure_p)
+            _log.warning("Obico alert: %s failure p=%.3f", printer.name, failure_p)
 
     except Exception as e:
         # Don't spam logs for connection errors when Obico isn't set up
@@ -2209,98 +2221,102 @@ def _check_obico_alerts():
 
 
 def _check_bambu_camera_ai(printer_data):
-    """Analyse Bambu A1 camera image with Claude Haiku for failure detection."""
-    # Only check when A1 is actively printing
-    bambu = printer_data.get("a1") or printer_data.get("printers", {}).get("bambu", {})
-    a1_state = (bambu.get("state") or "").upper()
-    if a1_state != "RUNNING":
+    """Analyse Bambu camera image with Claude Haiku for failure detection."""
+    bambu_printers = _printer_registry.list_bambu()
+    if not bambu_printers:
         return
 
-    # Cooldown: don't alert more than once per check interval
-    with _ai_config_lock:
-        interval = _ai_config["bambu_interval"]
-    if interval <= 0:
-        return
-    if time.time() - _last_bambu_ai_alert[0] < interval:
-        return
+    for printer in bambu_printers:
+        legacy_key = _printer_registry.legacy_key(printer.id)
+        bambu = printer_data.get(printer.id) or printer_data.get("printers", {}).get(legacy_key, {})
+        state = (bambu.get("state") or "").upper()
+        if state != "RUNNING":
+            continue
 
-    # Check camera image exists and is fresh
-    # Freshness window scales with interval: 2min for 1min, 5min for 5min, 10min for 15min, 30min for 1hr
-    freshness_map = {60: 120, 300: 300, 900: 600, 3600: 1800}
-    max_age = freshness_map.get(interval, max(120, interval // 2))
-    cam_path = "/tmp/printer_status/a1_camera.jpg"
-    if not os.path.exists(cam_path):
-        return
-    age = time.time() - os.path.getmtime(cam_path)
-    if age > max_age:
-        return
+        # Cooldown: don't alert more than once per check interval
+        with _ai_config_lock:
+            interval = _ai_config.get(f"{legacy_key}_interval", _ai_config.get("bambu_interval", 0))
+        if interval <= 0:
+            continue
+        if time.time() - _last_bambu_ai_alert[0] < interval:
+            continue
 
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
-        from printer_config import ANTHROPIC_API_KEY
-    except (ImportError, AttributeError):
-        return
+        # Check camera image exists and is fresh
+        freshness_map = {60: 120, 300: 300, 900: 600, 3600: 1800}
+        max_age = freshness_map.get(interval, max(120, interval // 2))
+        cam_path = os.path.join(_printer_registry.status_dir, printer.camera_snapshot_file)
+        if not os.path.exists(cam_path):
+            continue
+        age = time.time() - os.path.getmtime(cam_path)
+        if age > max_age:
+            continue
 
-    if not ANTHROPIC_API_KEY:
-        return
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
+            from printer_config import ANTHROPIC_API_KEY
+        except (ImportError, AttributeError):
+            return
 
-    try:
-        import anthropic
-        import base64
+        if not ANTHROPIC_API_KEY:
+            return
 
-        with open(cam_path, "rb") as f:
-            img_data = base64.standard_b64encode(f.read()).decode("utf-8")
+        try:
+            import anthropic
+            import base64
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_data,
+            with open(cam_path, "rb") as f:
+                img_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": img_data,
+                            },
                         },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are a 3D print failure detector. Analyse this camera image "
-                            "of an FDM 3D printer mid-print. Look for: spaghetti/stringing, "
-                            "layer shifting, detachment from bed, blob formation, or any "
-                            "other clear print failure. Respond with ONLY one of:\n"
-                            "OK - print looks normal\n"
-                            "WARN - something looks suspicious but unclear\n"
-                            "FAIL - clear print failure detected\n"
-                            "Then a brief reason (max 15 words)."
-                        ),
-                    },
-                ],
-            }],
-        )
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are a 3D print failure detector. Analyse this camera image "
+                                "of an FDM 3D printer mid-print. Look for: spaghetti/stringing, "
+                                "layer shifting, detachment from bed, blob formation, or any "
+                                "other clear print failure. Respond with ONLY one of:\n"
+                                "OK - print looks normal\n"
+                                "WARN - something looks suspicious but unclear\n"
+                                "FAIL - clear print failure detected\n"
+                                "Then a brief reason (max 15 words)."
+                            ),
+                        },
+                    ],
+                }],
+            )
 
-        result = response.content[0].text.strip()
-        status = result.split()[0].upper() if result else "OK"
+            result = response.content[0].text.strip()
+            status = result.split()[0].upper() if result else "OK"
 
-        if status in ("FAIL", "WARN"):
-            _last_bambu_ai_alert[0] = time.time()
-            severity = "failure" if status == "FAIL" else "warning"
-            _broadcast_ws({
-                "type": "printer_alert",
-                "printer": "a1",
-                "event": "ai_failure_detected",
-                "message": f"AI print analysis ({severity}): {result}",
-            })
-            _log.warning("Bambu AI alert: %s", result)
-        else:
-            _log.info("Bambu AI check: %s", result)
+            if status in ("FAIL", "WARN"):
+                _last_bambu_ai_alert[0] = time.time()
+                severity = "failure" if status == "FAIL" else "warning"
+                _broadcast_ws({
+                    "type": "printer_alert",
+                    "printer": printer.id,
+                    "event": "ai_failure_detected",
+                    "message": f"AI print analysis on {printer.name} ({severity}): {result}",
+                })
+                _log.warning("%s AI alert: %s", printer.name, result)
+            else:
+                _log.info("%s AI check: %s", printer.name, result)
 
-    except Exception as e:
-        _log.warning("Bambu AI check error: %s", e)
+        except Exception as e:
+            _log.warning("%s AI check error: %s", printer.name, e)
 _printer_watches = []  # [{printer, field, op, value, message, id}]
 _printer_watches_lock = threading.Lock()
 
@@ -2421,45 +2437,38 @@ def _check_printer_state():
             with open(status_file) as f:
                 data = json.load(f)
 
-            # Check SV08 state changes
-            sovol = data.get("printers", {}).get("sovol", {})
-            sv08_state = (sovol.get("state") or "unknown").lower()
-            old_sv08 = _prev_printer_state["sv08"]
-            if old_sv08 and old_sv08 != sv08_state:
-                msg = _describe_state_change("SV08 Max", old_sv08, sv08_state, sovol)
-                if msg:
-                    _broadcast_ws({
-                        "type": "printer_alert",
-                        "printer": "sv08",
-                        "event": "state_change",
-                        "old_state": old_sv08,
-                        "new_state": sv08_state,
-                        "message": msg,
-                    })
-            _prev_printer_state["sv08"] = sv08_state
-
-            # Check A1 state changes
-            bambu = data.get("printers", {}).get("bambu", {})
-            a1_state = (bambu.get("state") or "unknown").lower()
-            old_a1 = _prev_printer_state["a1"]
-            if old_a1 and old_a1 != a1_state:
-                msg = _describe_state_change("Bambu A1", old_a1, a1_state, bambu)
-                if msg:
-                    _broadcast_ws({
-                        "type": "printer_alert",
-                        "printer": "a1",
-                        "event": "state_change",
-                        "old_state": old_a1,
-                        "new_state": a1_state,
-                        "message": msg,
-                    })
-            _prev_printer_state["a1"] = a1_state
+            # Check state changes for all registered printers
+            printers_data = data.get("printers", {})
+            for printer in _printer_registry.list_enabled():
+                legacy_key = _printer_registry.legacy_key(printer.id)
+                pdata = printers_data.get(legacy_key, {})
+                current_state = (pdata.get("state") or "unknown").lower()
+                old_state = _prev_printer_state.get(printer.id)
+                if old_state and old_state != current_state:
+                    msg = _describe_state_change(printer.name, old_state, current_state, pdata)
+                    if msg:
+                        _broadcast_ws({
+                            "type": "printer_alert",
+                            "printer": printer.id,
+                            "event": "state_change",
+                            "old_state": old_state,
+                            "new_state": current_state,
+                            "message": msg,
+                        })
+                _prev_printer_state[printer.id] = current_state
 
             # Check custom watches
             with _printer_watches_lock:
                 triggered = []
                 for watch in _printer_watches:
-                    printer_data = sovol if watch["printer"] == "sv08" else bambu
+                    # Resolve watch printer to registry data
+                    watch_printer_id = watch["printer"]
+                    try:
+                        wp = _printer_registry.get(watch_printer_id)
+                        wkey = _printer_registry.legacy_key(wp.id)
+                    except KeyError:
+                        wkey = watch_printer_id
+                    printer_data = printers_data.get(wkey, {})
                     val = printer_data.get(watch["field"])
                     if val is not None and _check_op(val, watch["op"], watch["value"]):
                         _broadcast_ws({
@@ -2618,7 +2627,12 @@ def delete_printer_watch(watch_id):
 def printer_objects():
     """Get EXCLUDE_OBJECT data from Klipper via Moonraker."""
     import urllib.request
-    moonraker = "http://192.168.87.52:7125"
+    printer_id = request.args.get("printer_id")
+    try:
+        printer = _printer_registry.get(printer_id) if printer_id else _printer_registry.list_klipper()[0]
+        moonraker = printer.moonraker_url
+    except (KeyError, IndexError):
+        return jsonify({"error": "No klipper printer found", "objects": []}), 404
     try:
         url = f"{moonraker}/printer/objects/query?exclude_object"
         req = urllib.request.Request(url, method="GET")
@@ -2638,7 +2652,12 @@ def printer_objects():
 def exclude_object():
     """Exclude an object from the current print via Klipper EXCLUDE_OBJECT."""
     import urllib.request
-    moonraker = "http://192.168.87.52:7125"
+    printer_id = (request.get_json(force=True) or {}).get("printer_id")
+    try:
+        printer = _printer_registry.get(printer_id) if printer_id else _printer_registry.list_klipper()[0]
+        moonraker = printer.moonraker_url
+    except (KeyError, IndexError):
+        return jsonify({"error": "No klipper printer found"}), 404
     body = request.get_json(force=True)
     name = body.get("name", "")
     if not name:
