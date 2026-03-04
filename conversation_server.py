@@ -583,11 +583,12 @@ def _start_session(message, image_paths=None, client_session_id=None):
         _session["started"] = time.time()
         _session["last_activity"] = time.time()
 
-    # Attach images if any
+    # Attach files if any
     valid_paths = [p for p in image_paths if os.path.exists(p)]
     if valid_paths:
         paths_str = ", ".join(valid_paths)
-        message = (f"I've attached {len(valid_paths)} image(s) at these paths: "
+        file_word = "file" if len(valid_paths) == 1 else "files"
+        message = (f"I've attached {len(valid_paths)} {file_word} at these paths: "
                    f"{paths_str} — please read/view them first. {message}")
 
     # Write message to stdin as NDJSON (stream-json input format)
