@@ -918,19 +918,6 @@ def health():
     with _last_claude_error_lock:
         last_error = _last_claude_error.copy()
 
-    # ttyd check — accepts 401 (auth required) as "running"
-    ttyd_ok = False
-    try:
-        import urllib.request
-        req = urllib.request.Request("http://127.0.0.1:7681", method="HEAD")
-        with urllib.request.urlopen(req, timeout=2):
-            ttyd_ok = True
-    except urllib.error.HTTPError as he:
-        # 401 means ttyd is running but wants auth — that's fine
-        ttyd_ok = (he.code == 401)
-    except Exception:
-        pass
-
     return jsonify({
         "ok": True,
         "pid": os.getpid(),
@@ -940,7 +927,6 @@ def health():
         "ws_reconnect_count_5min": reconnect_count,
         "work_cache_age_seconds": work_cache_age,
         "last_claude_error": last_error["message"],
-        "ttyd_ok": ttyd_ok,
     })
 
 
@@ -3828,6 +3814,162 @@ def system_health():
                 items.append({"name": repo_name, "timestamp": None, "detail": "git error", "uncommitted_count": -1})
 
     return jsonify({"items": items})
+
+
+# ---------------------------------------------------------------------------
+# Session Logs API — list and read Claude conversation JSONL logs
+# ---------------------------------------------------------------------------
+
+_SESSION_LOGS_DIR = os.path.expanduser(
+    "~/.claude/projects/-Users-timtrailor-Documents-Claude-code"
+)
+
+
+@app.route("/session-logs")
+def session_logs_list():
+    """Return a list of session logs sorted newest-first.
+
+    Each entry: {id, filename, date, size_bytes, first_message, message_count}
+    Query params: limit (default 50), offset (default 0)
+    """
+    from pathlib import Path
+
+    log_dir = Path(_SESSION_LOGS_DIR)
+    if not log_dir.is_dir():
+        return jsonify({"sessions": [], "error": "logs directory not found"})
+
+    limit = min(int(request.args.get("limit", 50)), 200)
+    offset = int(request.args.get("offset", 0))
+
+    # Collect all .jsonl files with metadata
+    sessions = []
+    for p in log_dir.glob("*.jsonl"):
+        stat = p.stat()
+        session_id = p.stem
+
+        # Quick scan: read first user message and count messages
+        first_msg = ""
+        msg_count = 0
+        last_ts = None
+        try:
+            with open(p, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "user":
+                        msg_count += 1
+                        if not first_msg:
+                            # Extract text from message content
+                            msg = obj.get("message", {})
+                            if isinstance(msg, dict):
+                                content = msg.get("content", "")
+                                if isinstance(content, list):
+                                    for part in content:
+                                        if isinstance(part, dict) and part.get("type") == "text":
+                                            first_msg = part.get("text", "")[:200]
+                                            break
+                                elif isinstance(content, str):
+                                    first_msg = content[:200]
+                            elif isinstance(msg, str):
+                                first_msg = msg[:200]
+                    elif obj.get("type") == "assistant":
+                        msg_count += 1
+        except Exception:
+            pass
+
+        sessions.append({
+            "id": session_id,
+            "filename": p.name,
+            "date": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "size_bytes": stat.st_size,
+            "first_message": first_msg or "(no user message found)",
+            "message_count": msg_count,
+        })
+
+    # Sort newest first
+    sessions.sort(key=lambda s: s["date"], reverse=True)
+    total = len(sessions)
+    sessions = sessions[offset : offset + limit]
+
+    return jsonify({"sessions": sessions, "total": total})
+
+
+@app.route("/session-logs/<session_id>")
+def session_logs_read(session_id):
+    """Read a specific session log. Returns user/assistant messages.
+
+    Query params: summary (bool, default true) — if true, return only
+    user messages and abbreviated assistant messages for quick review.
+    """
+    from pathlib import Path
+    import re
+
+    # Sanitise session_id to prevent path traversal
+    if not re.match(r"^[a-f0-9\-]{36}$", session_id):
+        return jsonify({"error": "invalid session id"}), 400
+
+    log_path = Path(_SESSION_LOGS_DIR) / f"{session_id}.jsonl"
+    if not log_path.exists():
+        return jsonify({"error": "session not found"}), 404
+
+    summary = request.args.get("summary", "true").lower() == "true"
+    messages = []
+
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = obj.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+
+                # Extract text content
+                text = ""
+                msg = obj.get("message", {})
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                parts.append(part.get("text", ""))
+                        text = "\n".join(parts)
+                    elif isinstance(content, str):
+                        text = content
+                elif isinstance(msg, str):
+                    text = msg
+
+                if not text.strip():
+                    continue
+
+                if summary and msg_type == "assistant":
+                    # Truncate long assistant messages in summary mode
+                    text = text[:500] + ("..." if len(text) > 500 else "")
+
+                messages.append({
+                    "type": msg_type,
+                    "text": text,
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "session_id": session_id,
+        "message_count": len(messages),
+        "messages": messages,
+    })
 
 
 @app.route("/governors-reset", methods=["POST"])
