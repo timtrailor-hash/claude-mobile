@@ -77,7 +77,7 @@ STATE_FILE = "/tmp/ups_watchdog_state.json"  # persists power state across resta
 # Google Sheets event log — set this to a Sheet ID to enable logging.
 # Create the sheet once with: python3 -c "import gws_helper; print(gws_helper.create_sheet('UPS Power Events'))"
 # Requires gws auth: gws auth setup  (or GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE for service account)
-UPS_EVENTS_SHEET_ID = ""  # e.g. "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+UPS_EVENTS_SHEET_ID = "1HKnxOZp7faqsfmxACa8rN-PrXd8acQudCWKNX4LVjvo"
 
 # Bed heater power scheduling — limit at night to avoid UPS overload beeping
 NIGHT_START_HOUR = 22       # 10 PM — reduce bed max_power
