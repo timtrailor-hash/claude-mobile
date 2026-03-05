@@ -31,12 +31,29 @@ def _gws_bin():
     return "gws"  # fall back to PATH
 
 
+def _gws_env():
+    """Build env for gws subprocess — ensures PATH and HOME are set correctly.
+
+    Daemons launched via cron/launchd often have a minimal environment that
+    doesn't include Homebrew or the user's HOME, causing gws to fail silently.
+    """
+    env = os.environ.copy()
+    # Ensure Homebrew is in PATH (gws installed via npm under Homebrew node)
+    homebrew_bin = "/opt/homebrew/bin"
+    if homebrew_bin not in env.get("PATH", ""):
+        env["PATH"] = homebrew_bin + ":" + env.get("PATH", "/usr/bin:/bin")
+    # Ensure HOME is set so gws can find ~/.config/gws credentials
+    if not env.get("HOME"):
+        env["HOME"] = os.path.expanduser("~")
+    return env
+
+
 def _gws(*args, timeout=30):
     """Run a gws CLI command. Returns parsed JSON dict/list, or None on failure."""
     cmd = [_gws_bin()] + list(args)
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, timeout=timeout, env=_gws_env()
         )
         if result.returncode != 0:
             _log.warning("gws returned %d: %s", result.returncode, result.stderr.strip()[:200])
