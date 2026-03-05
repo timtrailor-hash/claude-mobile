@@ -411,7 +411,34 @@ def _reader_thread(proc, generation):
 _spawn_lock = threading.Lock()  # Serialises check-and-spawn in _ensure_subprocess
 
 
-def _ensure_subprocess():
+def _kill_subprocess():
+    """Kill the persistent Claude CLI subprocess if running."""
+    with _lock:
+        proc = _session.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            # Wait briefly for clean exit
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _session["proc"] = None
+        _session["stdin_pipe"] = None
+        _session["pid"] = None
+        _session["status"] = "idle"
+        _session["reader_running"] = False
+
+
+def _ensure_subprocess(resume_session_id=None):
     """Ensure a persistent Claude CLI subprocess is running. Spawn if needed.
 
     The subprocess uses bidirectional stream-json: messages go in via stdin,
@@ -422,13 +449,19 @@ def _ensure_subprocess():
     the Popen call — without this, two threads could both see "not running"
     and spawn duplicate subprocesses.
 
+    If resume_session_id is provided, kills any existing subprocess and
+    spawns a new one with --resume <id> to continue that conversation.
+
     Returns True if subprocess is running, False on error.
     """
     with _spawn_lock:
-        with _lock:
-            if (_session.get("proc") and _session["proc"].poll() is None
-                    and _session.get("reader_running")):
-                return True  # Already running
+        if resume_session_id:
+            _kill_subprocess()
+        else:
+            with _lock:
+                if (_session.get("proc") and _session["proc"].poll() is None
+                        and _session.get("reader_running")):
+                    return True  # Already running
 
         # Build command — persistent subprocess with bidirectional streaming
         #
@@ -491,6 +524,10 @@ def _ensure_subprocess():
                 "--mcp-config", MCP_CONFIG,
                 "--strict-mcp-config",
             ]
+
+        # Resume a previous session if requested
+        if resume_session_id:
+            cmd += ["--resume", resume_session_id]
 
         cmd += [
             "--append-system-prompt",
@@ -781,21 +818,9 @@ def cancel():
 @app.route("/new-session", methods=["POST"])
 def new_session():
     """Kill subprocess and clear session — next /send starts fresh."""
+    _kill_subprocess()
     with _lock:
-        proc = _session.get("proc")
-        if proc and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
         _session["claude_sid"] = None
-        _session["proc"] = None
-        _session["stdin_pipe"] = None
-        _session["pid"] = None
-        _session["status"] = "idle"
     return jsonify({"ok": True})
 
 
@@ -1216,7 +1241,8 @@ def terminal_new_window():
     """Create a new tmux window in the claude-terminal session."""
     try:
         result = subprocess.run(
-            ["/opt/homebrew/bin/tmux", "new-window", "-t", "claude-terminal"],
+            ["/opt/homebrew/bin/tmux", "new-window", "-t", "claude-terminal",
+             "-c", os.path.expanduser("~/Documents/Claude code")],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
@@ -1451,7 +1477,8 @@ def terminal_auth_complete():
                 time.sleep(1)
                 # Recreate tmux session
                 subprocess.run([_tmux, "new-session", "-d", "-s", "claude-terminal",
-                               "-x", "120", "-y", "40"],
+                               "-x", "120", "-y", "40",
+                               "-c", os.path.expanduser("~/Documents/Claude code")],
                                capture_output=True, text=True, timeout=5)
                 subprocess.run([_tmux, "set", "-t", "claude-terminal",
                                "history-limit", "50000"],
@@ -1911,9 +1938,14 @@ def websocket_handler(ws):
             elif msg_type == "resume":
                 resume_sid = msg.get("session_id", "").strip()
                 if resume_sid:
-                    with _lock:
-                        _session["claude_sid"] = resume_sid
-                    _ws_send({"type": "resumed", "session_id": resume_sid})
+                    _log.info("WS resume: killing subprocess and restarting with --resume %s", resume_sid)
+                    if _ensure_subprocess(resume_session_id=resume_sid):
+                        with _lock:
+                            _session["claude_sid"] = resume_sid
+                        _ws_send({"type": "resumed", "session_id": resume_sid})
+                    else:
+                        _ws_send({"type": "ws_error",
+                                  "content": "Failed to restart Claude with --resume"})
                 else:
                     _ws_send({"type": "ws_error",
                               "content": "Missing session_id for resume"})
@@ -1939,21 +1971,9 @@ def websocket_handler(ws):
 
             elif msg_type == "new_session":
                 # Kill persistent subprocess so next message starts fresh
+                _kill_subprocess()
                 with _lock:
-                    proc = _session.get("proc")
-                    if proc and proc.poll() is None:
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                        except Exception:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
                     _session["claude_sid"] = None
-                    _session["proc"] = None
-                    _session["stdin_pipe"] = None
-                    _session["pid"] = None
-                    _session["status"] = "idle"
                 _ws_send({"type": "new_session_ok"})
 
             elif msg_type == "permission_response":
@@ -3824,7 +3844,6 @@ def system_health():
 _SESSION_LOGS_DIR = os.path.expanduser(
     "~/.claude/projects/-Users-timtrailor-Documents-Claude-code"
 )
-
 
 @app.route("/session-logs")
 def session_logs_list():
