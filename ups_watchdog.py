@@ -55,6 +55,15 @@ except ImportError:
 SLACK_USER_ID = "U03H1AN51MZ"       # Tim Trailor
 NOTIFY_EMAIL = "timtrailor@gmail.com"
 
+# Optional: Google Workspace helper for Sheets logging
+try:
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gws_helper import append_rows as _gws_append_rows
+    _GWS_AVAILABLE = True
+except ImportError:
+    _GWS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -64,6 +73,11 @@ MOONRAKER_BASE = f"http://{SOVOL_IP}:{MOONRAKER_PORT}"
 STATE_FILE = "/tmp/ups_watchdog_state.json"  # persists power state across restarts
 # macOS haltlevel should be set to 5% (sudo pmset -u haltlevel 5)
 # so the watchdog has 10%→5% to act before the Mac shuts down
+
+# Google Sheets event log — set this to a Sheet ID to enable logging.
+# Create the sheet once with: python3 -c "import gws_helper; print(gws_helper.create_sheet('UPS Power Events'))"
+# Requires gws auth: gws auth setup  (or GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE for service account)
+UPS_EVENTS_SHEET_ID = ""  # e.g. "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
 
 # Bed heater power scheduling — limit at night to avoid UPS overload beeping
 NIGHT_START_HOUR = 22       # 10 PM — reduce bed max_power
@@ -358,6 +372,29 @@ def notify_all(message, level="warning"):
     _notify_push(message, level)
     _notify_slack(message)
     _notify_email(f"[Mac Mini] {subject}", message)
+
+
+def _log_power_event(event, detail="", battery_pct=None, remaining=None):
+    """Append a power event row to the UPS Events Google Sheet (best-effort, non-blocking).
+
+    Does nothing if UPS_EVENTS_SHEET_ID is not set or gws is unavailable.
+    """
+    if not UPS_EVENTS_SHEET_ID or not _GWS_AVAILABLE:
+        return
+
+    def _do_append():
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            row = [timestamp, event, detail,
+                   str(battery_pct) if battery_pct is not None else "",
+                   remaining or ""]
+            ok = _gws_append_rows(UPS_EVENTS_SHEET_ID, "Events!A:E", [row])
+            if not ok:
+                logger.debug("Sheets log failed for event: %s", event)
+        except Exception as exc:
+            logger.debug("Sheets log error: %s", exc)
+
+    threading.Thread(target=_do_append, daemon=True).start()
 
 
 def _gcode(cmd):
@@ -672,6 +709,8 @@ def run():
                     f"UPS at {percent}% ({remaining or 'unknown'} remaining). "
                     f"Beds stay warm until {EMERGENCY_BATTERY_PCT}%."
                 )
+                _log_power_event("POWER LOST", "Printers paused, beds→45°C",
+                                 battery_pct=percent, remaining=remaining)
                 emergency_sent = False
                 notified_levels.clear()
 
@@ -705,6 +744,9 @@ def run():
                         f"Inspect and restart manually.",
                         level="info"
                     )
+                _log_power_event("POWER RESTORED",
+                                 f"Outage ~{elapsed_min:.0f} min, beds {'reheated' if elapsed_min < 60 else 'cold'}",
+                                 battery_pct=percent)
                 emergency_sent = False
                 mac_reduced = False
 
@@ -723,6 +765,9 @@ def run():
                         f"Still on battery — beds warm at 45°C.",
                         level="warning" if threshold > 25 else "critical"
                     )
+                    _log_power_event(f"BATTERY {threshold}%",
+                                     "Milestone notification sent",
+                                     battery_pct=percent, remaining=remaining)
 
             # At EMERGENCY_BATTERY_PCT: kill all beds, stop Bambu, e-stop Sovol
             # Leaves remaining battery for Mac Mini clean shutdown
@@ -742,6 +787,9 @@ def run():
                     f"CRITICAL: UPS at {percent}% — all heaters OFF, "
                     f"printers stopped. Mac Mini will shut down at 5%."
                 )
+                _log_power_event("EMERGENCY STOP",
+                                 "All heaters OFF, printers stopped, Mac shutdown imminent",
+                                 battery_pct=percent, remaining=remaining)
                 emergency_sent = True
                 save_state(source, emergency=True)
 
