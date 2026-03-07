@@ -1527,9 +1527,16 @@ def terminal_auth_complete():
 # ── Google Docs export ─────────────────────────────────────────────
 
 GOOGLE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "google_token.json")
-GOOGLE_SCOPES = [
+GOOGLE_DOCS_SCOPES = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
+]
+# All scopes that share this token file — refresh must preserve all of them
+GOOGLE_ALL_SCOPES = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
 
@@ -1540,7 +1547,7 @@ def _google_creds():
         from google.auth.transport.requests import Request
         if not os.path.exists(GOOGLE_TOKEN_FILE):
             return None
-        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, GOOGLE_SCOPES)
+        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, GOOGLE_ALL_SCOPES)
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
             with open(GOOGLE_TOKEN_FILE, "w") as f:
@@ -1638,7 +1645,7 @@ def google_docs_auth_start():
             }
         }
 
-        flow = Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES)
+        flow = Flow.from_client_config(client_config, scopes=GOOGLE_ALL_SCOPES)
         flow.redirect_uri = "http://localhost:1"
 
         auth_url, state = flow.authorization_url(
@@ -3385,13 +3392,12 @@ def _fetch_work_status():
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
 
-    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly"]
     result = {"emails": [], "events": [], "accounts": []}
 
     for account in active_accounts:
         acct_label, acct_color = account["label"], account["color"]
         try:
-            creds = Credentials.from_authorized_user_file(account["token"], SCOPES)
+            creds = Credentials.from_authorized_user_file(account["token"], GOOGLE_ALL_SCOPES)
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
                 with open(account["token"], "w") as f:
@@ -4055,11 +4061,9 @@ def work_search():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
-    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly"]
-
     for account in active_accounts:
         try:
-            creds = Credentials.from_authorized_user_file(account["token"], SCOPES)
+            creds = Credentials.from_authorized_user_file(account["token"], GOOGLE_ALL_SCOPES)
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
         except Exception:
