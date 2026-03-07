@@ -1152,7 +1152,23 @@ def printer_resume_info():
     except Exception:
         pass
 
-    available = file_exists and age_hours < 24 and cp.get("progress_pct", 0) > 0
+    # Check if printer is currently idle (print finished successfully)
+    printer_idle_after_complete = False
+    try:
+        with open("/tmp/printer_status/status.json") as sf:
+            status = json.load(sf)
+        sovol = status.get("printers", {}).get("sovol", {})
+        cur_state = (sovol.get("state") or "").lower()
+        cur_progress = sovol.get("progress", 0) or 0
+        # If printer is idle/standby with 0% progress, print is done — no resume needed
+        if cur_state in ("standby", "ready", "idle", "complete") and cur_progress < 1:
+            printer_idle_after_complete = True
+    except Exception:
+        pass
+
+    available = (file_exists and age_hours < 24
+                 and cp.get("progress_pct", 0) > 0
+                 and not printer_idle_after_complete)
     safe_layer = max(1, cp.get("current_layer", 0) - 2)
 
     # Estimate time saved
