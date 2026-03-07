@@ -2724,6 +2724,18 @@ def printer_status():
             result[resp_key] = {"error": printer_data.get("error", "Offline")}
 
     result["daemon_timestamp"] = data.get("timestamp", "")
+
+    # Overlay live auto_speed state (daemon cache may be stale between polls)
+    try:
+        auto_speed_file = os.path.join(_printer_registry.status_dir, "auto_speed.json")
+        with open(auto_speed_file) as asf:
+            auto_cfg = json.load(asf)
+        if "sv08" in result and isinstance(result["sv08"], dict) and "error" not in result["sv08"]:
+            result["sv08"]["auto_speed_enabled"] = auto_cfg.get("enabled", False)
+            result["sv08"]["auto_speed_mode"] = auto_cfg.get("mode", "optimal")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
     return jsonify(result)
 
 
