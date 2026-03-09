@@ -63,11 +63,14 @@ sock = Sock(app)
 
 @app.before_request
 def check_auth():
-    """Require auth token for non-localhost requests (iOS app via Tailscale)."""
+    """Require auth token for non-localhost/Tailscale requests."""
     if not AUTH_TOKEN:
         return  # No token configured, skip auth
     # Trust localhost (MCP server, health check, etc.)
     if request.remote_addr in ('127.0.0.1', '::1'):
+        return
+    # Trust Tailscale network (100.x.x.x) — already authenticated at network level
+    if request.remote_addr and request.remote_addr.startswith('100.'):
         return
     # Check Authorization header or query param
     auth = request.headers.get('Authorization', '')
