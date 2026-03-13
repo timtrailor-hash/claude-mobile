@@ -35,7 +35,7 @@ import uuid
 from datetime import datetime
 
 # Add shared_utils to path
-sys.path.insert(0, os.path.expanduser("~/Documents/Claude code"))
+sys.path.insert(0, os.path.expanduser("~/projects/claude"))
 from shared_utils import env_for_claude_cli, work_dir, configure_logging
 from printer_registry import registry as _printer_registry
 
@@ -3200,7 +3200,7 @@ def _check_printer_state():
 
 
 _PRINTER_ALERT_FILE = "/tmp/printer_status/printer_alerts.jsonl"
-_last_alert_pos = [0]  # File offset — only read new lines
+_last_alert_pos = [None]  # File offset — None means "skip to end on first read"
 
 
 def _check_printer_alert_file():
@@ -3209,12 +3209,21 @@ def _check_printer_alert_file():
     The fetch process appends alerts (method changes, connection lost/restored)
     to printer_alerts.jsonl. We track our read position and only broadcast
     new entries, then truncate the file to prevent unbounded growth.
+
+    On first call after server start, we seek to the end of the file so we
+    only broadcast alerts that arrive AFTER the server starts — not old ones.
     """
     if not os.path.exists(_PRINTER_ALERT_FILE):
         return
 
     try:
         with open(_PRINTER_ALERT_FILE, "r") as f:
+            # On first read after server start, skip to end — don't replay old alerts
+            if _last_alert_pos[0] is None:
+                f.seek(0, 2)  # seek to end
+                _last_alert_pos[0] = f.tell()
+                return
+
             f.seek(_last_alert_pos[0])
             new_lines = f.readlines()
             _last_alert_pos[0] = f.tell()
