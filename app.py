@@ -71,8 +71,8 @@ STREAMLIT_URL = f'http://{STREAMLIT_IP}:{STREAMLIT_PORT}'
 
 MEMORY_DIR = os.path.expanduser("~/.claude/projects/-Users-timtrailor-Documents-Claude-code/memory")
 TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
-WORK_DIR = os.path.expanduser("~/Documents/Claude code")
-UPLOAD_DIR = os.path.expanduser("~/Documents/Claude code/claude-mobile/uploads")
+WORK_DIR = os.path.expanduser("~/code/claude-mobile")
+UPLOAD_DIR = os.path.expanduser("~/code/claude-mobile/uploads")
 # API_KEY removed — wrapper uses Claude Code subscription auth, not API billing
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
