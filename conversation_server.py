@@ -1217,7 +1217,7 @@ def printer_resume_from_layer():
         return jsonify({"ok": False, "error": "No filename found"}), 400
 
     # Run gcode_resume.py as subprocess
-    script = os.path.expanduser("~/Documents/Claude code/sv08-print-tools/gcode_resume.py")
+    script = os.path.expanduser("~/code/sv08-print-tools/gcode_resume.py")
     cmd = [sys.executable, script, "--file", filename, "--layer", str(layer)]
     if auto_start:
         cmd.append("--start")
