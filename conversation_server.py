@@ -993,7 +993,9 @@ def _get_print_state(printer):
 # Commands that are ALWAYS blocked during printing/paused
 _DANGEROUS_WHILE_PRINTING = {
     "G28", "QUAD_GANTRY_LEVEL", "BED_MESH_CALIBRATE", "PROBE",
-    "FIRMWARE_RESTART", "SET_KINEMATIC_POSITION",
+    "FIRMWARE_RESTART", "RESTART",  # Restarts Klipper — kills print
+    "SAVE_CONFIG",                    # Restarts Klipper after writing config — destroyed print 2026-03-05
+    "SET_KINEMATIC_POSITION",
 }
 
 # Commands that are always allowed regardless of state
