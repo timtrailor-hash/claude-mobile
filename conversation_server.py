@@ -35,7 +35,7 @@ import uuid
 from datetime import datetime
 
 # Add shared_utils to path
-sys.path.insert(0, os.path.expanduser("~/projects/claude"))
+sys.path.insert(0, os.path.expanduser("~/code"))
 from shared_utils import env_for_claude_cli, work_dir, configure_logging
 from printer_registry import registry as _printer_registry
 
@@ -3746,7 +3746,7 @@ def system_health():
 
     items = []
 
-    # Base path: works from both ~/projects/claude/ (cron) and ~/Documents/Claude code/ (interactive)
+    # Base path: ~/code/ (canonical location since 2026-03-20 migration)
     _base = Path(__file__).resolve().parent.parent
     _home_base = Path.home() / "Documents" / "Claude code"
 
@@ -3837,7 +3837,7 @@ def system_health():
         items.append({"name": "Memory Search DB", "timestamp": None, "detail": "not found"})
 
     # 6. GitHub repos — check last commit dates + uncommitted change counts
-    # Use both base paths for git checks (~/projects/claude/ copies may lack .git)
+    # Git repo checks — _base resolves via __file__ to ~/code/
     def _find_repo(rel):
         for b in [_base, _home_base]:
             p = b / rel
