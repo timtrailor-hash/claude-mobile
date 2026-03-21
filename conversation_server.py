@@ -54,6 +54,7 @@ from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB upload limit
 # Enable protocol-level WebSocket pings every 25s. simple-websocket's
 # internal thread handles ping/pong properly — URLSessionWebSocketTask
 # responds to pings automatically. This replaces our custom keepalive.
@@ -2151,7 +2152,10 @@ def upload_file():
 
     # Save with a unique name to avoid collisions
     import uuid
-    ext = os.path.splitext(f.filename)[1] or ".jpg"
+    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".heic", ".heif"}
+    ext = os.path.splitext(f.filename)[1].lower() or ".jpg"
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
     saved_name = f"{uuid.uuid4().hex}{ext}"
     saved_path = os.path.join(upload_dir, saved_name)
     f.save(saved_path)
