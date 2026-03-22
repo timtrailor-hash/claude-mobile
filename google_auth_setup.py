@@ -19,6 +19,19 @@ SCOPES = [
 ]
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Guard: ensure this script is being run from the canonical location.
+# Running it from ~/Documents/... saves the token in the wrong place,
+# causing silent auth failures. (Lesson learned 2026-03-22.)
+_CANONICAL = os.path.expanduser('~/code/claude-mobile')
+if os.path.realpath(DIR) != os.path.realpath(_CANONICAL):
+    print(f'ERROR: This script is at {DIR}')
+    print(f'       It must be run from {_CANONICAL}')
+    print(f'       The token will be saved next to this script.')
+    print(f'       Running from the wrong location = token in wrong place = silent auth failures.')
+    print(f'       Run instead: cd {_CANONICAL} && python3 google_auth_setup.py')
+    sys.exit(1)
+
 CREDS_FILE = os.path.join(DIR, 'google_credentials.json')
 
 ACCOUNTS = {
