@@ -906,6 +906,15 @@ _last_claude_error = {"message": "", "timestamp": None}
 _last_claude_error_lock = threading.Lock()
 
 
+def _get_ttyd_tunnel_url():
+    """Read the current ttyd cloudflared tunnel URL."""
+    try:
+        with open("/tmp/ttyd_tunnel_url.txt") as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 @app.route("/health")
 def health():
     """Extended health check endpoint for SystemHealthView."""
@@ -957,6 +966,7 @@ def health():
         "ws_reconnect_count_5min": reconnect_count,
         "work_cache_age_seconds": work_cache_age,
         "last_claude_error": last_error["message"],
+        "ttyd_tunnel_url": _get_ttyd_tunnel_url(),
     })
 
 
