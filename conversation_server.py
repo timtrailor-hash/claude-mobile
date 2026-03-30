@@ -3863,30 +3863,32 @@ def system_health():
     # 4. School docs backup status
     school_docs = Path.home() / "Desktop" / "school docs"
     if school_docs.exists():
-        # Check if docs are in the backup manifest
+        # Use subprocess to count files (avoids TCC issues with rglob in launchd)
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["find", str(school_docs), "-type", "f", "-not", "-name", ".*"],
+                text=True, timeout=10, stderr=subprocess.DEVNULL,
+            )
+            doc_count = len(out.strip().split("\n")) if out.strip() else 0
+        except Exception:
+            doc_count = 0
+        # Check backup manifest for school docs
         manifest = _find(".backup_manifest.json")
         school_in_backup = False
         if manifest.exists():
             try:
-                with open(manifest) as f:
-                    mdata = json.load(f)
+                with open(manifest) as mf:
+                    mdata = json.load(mf)
                 school_in_backup = any("school" in k.lower() for k in mdata.get("files", {}))
             except Exception:
                 pass
-        doc_count = sum(1 for _ in school_docs.rglob("*") if _.is_file() and not _.name.startswith("."))
-        if school_in_backup:
-            # Find most recent backup timestamp for school docs
-            items.append({
-                "name": "School Docs",
-                "timestamp": datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat(),
-                "detail": f"{doc_count} files, backed up",
-            })
-        else:
-            items.append({
-                "name": "School Docs",
-                "timestamp": datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat(),
-                "detail": f"{doc_count} files, NOT backed up",
-            })
+        detail = f"{doc_count} files, {'backed up' if school_in_backup else 'NOT backed up'}"
+        items.append({
+            "name": "School Docs",
+            "timestamp": datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat(),
+            "detail": detail,
+        })
     else:
         items.append({"name": "School Docs", "timestamp": None, "detail": "folder not found"})
 
