@@ -12,3 +12,6 @@ __pycache__/
 static/
 .DS_Store
 nohup.out
+conversation_server.py.bak
+google_auth_phone.py
+google_auth_refresh.py
