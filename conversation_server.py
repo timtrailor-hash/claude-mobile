@@ -3878,7 +3878,7 @@ def system_health():
         items.append({"name": "School Docs Sync", "timestamp": None, "detail": "not synced yet"})
 
     # 5. Memory search DB freshness
-    chroma_dir = _find("memory_server/data/chroma")
+    chroma_dir = _find("memory_server_data/chroma")
     if chroma_dir.exists():
         # Find most recent file in chroma dir
         latest = 0
