@@ -12,11 +12,18 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
-SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/calendar.readonly',
-    'https://www.googleapis.com/auth/drive',
-]
+# Import canonical scopes from credentials.py — single source of truth
+sys.path.insert(0, os.path.expanduser('~/code'))
+try:
+    from credentials import GOOGLE_OAUTH_SCOPES
+    SCOPES = list(GOOGLE_OAUTH_SCOPES)
+except ImportError:
+    SCOPES = [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/calendar.readonly',
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+    ]
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 

@@ -2532,10 +2532,9 @@ def _fetch_work_status():
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
 
-    SCOPES = [
-        'https://www.googleapis.com/auth/gmail.readonly',
-        'https://www.googleapis.com/auth/calendar.readonly',
-    ]
+    # Use all scopes when loading token — NEVER write back (token_refresh.py owns that)
+    from credentials import GOOGLE_OAUTH_SCOPES
+    SCOPES = list(GOOGLE_OAUTH_SCOPES)
 
     result = {'emails': [], 'events': [], 'accounts': []}
 
@@ -2546,8 +2545,6 @@ def _fetch_work_status():
             creds = Credentials.from_authorized_user_file(account['token'], SCOPES)
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-                with open(account['token'], 'w') as f:
-                    f.write(creds.to_json())
         except Exception as e:
             result.setdefault('errors', []).append(f'{acct_label}: auth error — {e}')
             continue
@@ -3055,10 +3052,9 @@ def _get_google_creds():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     DIR = os.path.dirname(os.path.abspath(__file__))
-    SCOPES = [
-        'https://www.googleapis.com/auth/gmail.readonly',
-        'https://www.googleapis.com/auth/calendar.readonly',
-    ]
+    # Use all scopes when loading token — NEVER write back (token_refresh.py owns that)
+    from credentials import GOOGLE_OAUTH_SCOPES
+    SCOPES = list(GOOGLE_OAUTH_SCOPES)
     GOOGLE_ACCOUNTS = [
         {'token': os.path.join(DIR, 'google_token.json'), 'label': 'Personal', 'color': '#52b788'},
         {'token': os.path.join(DIR, 'google_token_work.json'), 'label': 'Work', 'color': '#c9a96e'},
@@ -3071,8 +3067,6 @@ def _get_google_creds():
             creds = Credentials.from_authorized_user_file(account['token'], SCOPES)
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-                with open(account['token'], 'w') as f:
-                    f.write(creds.to_json())
             result.append((creds, account['label'], account['color']))
         except Exception:
             continue

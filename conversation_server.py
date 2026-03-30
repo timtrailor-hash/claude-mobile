@@ -1543,21 +1543,22 @@ def terminal_auth_complete():
 # ── Google Docs export ─────────────────────────────────────────────
 
 GOOGLE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "google_token.json")
-GOOGLE_DOCS_SCOPES = [
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-]
-# All scopes that share this token file — refresh must preserve all of them
-GOOGLE_ALL_SCOPES = [
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/calendar.readonly",
-]
+
+# Import canonical scopes from credentials.py — single source of truth
+# NEVER define scopes locally; NEVER write token back (token_refresh.py owns that)
+try:
+    from credentials import GOOGLE_OAUTH_SCOPES as GOOGLE_ALL_SCOPES
+except ImportError:
+    GOOGLE_ALL_SCOPES = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents",
+    ]
 
 
 def _google_creds():
-    """Load Google OAuth credentials, refreshing if needed."""
+    """Load Google OAuth credentials, refreshing if needed. NEVER saves token back."""
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
@@ -1566,8 +1567,6 @@ def _google_creds():
         creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, GOOGLE_ALL_SCOPES)
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(GOOGLE_TOKEN_FILE, "w") as f:
-                f.write(creds.to_json())
         if creds and creds.valid:
             return creds
     except Exception as e:
@@ -3486,8 +3485,6 @@ def _fetch_work_status():
             creds = Credentials.from_authorized_user_file(account["token"], GOOGLE_ALL_SCOPES)
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-                with open(account["token"], "w") as f:
-                    f.write(creds.to_json())
         except Exception as e:
             result.setdefault("errors", []).append(f"{acct_label}: auth error — {e}")
             continue
