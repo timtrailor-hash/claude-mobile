@@ -3860,7 +3860,37 @@ def system_health():
     else:
         items.append({"name": "Printer Daemon", "timestamp": None, "detail": "no status file"})
 
-    # 4. Memory search DB freshness
+    # 4. School docs backup status
+    school_docs = Path.home() / "Desktop" / "school docs"
+    if school_docs.exists():
+        # Check if docs are in the backup manifest
+        manifest = _find(".backup_manifest.json")
+        school_in_backup = False
+        if manifest.exists():
+            try:
+                with open(manifest) as f:
+                    mdata = json.load(f)
+                school_in_backup = any("school" in k.lower() for k in mdata.get("files", {}))
+            except Exception:
+                pass
+        doc_count = sum(1 for _ in school_docs.rglob("*") if _.is_file() and not _.name.startswith("."))
+        if school_in_backup:
+            # Find most recent backup timestamp for school docs
+            items.append({
+                "name": "School Docs",
+                "timestamp": datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat(),
+                "detail": f"{doc_count} files, backed up",
+            })
+        else:
+            items.append({
+                "name": "School Docs",
+                "timestamp": datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat(),
+                "detail": f"{doc_count} files, NOT backed up",
+            })
+    else:
+        items.append({"name": "School Docs", "timestamp": None, "detail": "folder not found"})
+
+    # 5. Memory search DB freshness
     chroma_dir = _find("memory_server_data/chroma")
     if chroma_dir.exists():
         # Find most recent file in chroma dir
