@@ -3860,24 +3860,7 @@ def system_health():
     else:
         items.append({"name": "Printer Daemon", "timestamp": None, "detail": "no status file"})
 
-    # 4. School docs Google Drive sync
-    gdrive_links = _find("ofsted-agent/gdrive_links.json")
-    if gdrive_links.exists():
-        mtime = gdrive_links.stat().st_mtime
-        try:
-            with open(gdrive_links) as f:
-                link_count = len(json.load(f))
-        except Exception:
-            link_count = 0
-        items.append({
-            "name": "School Docs Sync",
-            "timestamp": datetime.fromtimestamp(mtime).isoformat(),
-            "detail": f"{link_count} files mapped to Drive",
-        })
-    else:
-        items.append({"name": "School Docs Sync", "timestamp": None, "detail": "not synced yet"})
-
-    # 5. Memory search DB freshness
+    # 4. Memory search DB freshness
     chroma_dir = _find("memory_server_data/chroma")
     if chroma_dir.exists():
         # Find most recent file in chroma dir
@@ -3909,7 +3892,6 @@ def system_health():
         return None
 
     for repo_name, repo_path in [
-        ("GitHub: ClaudeCode", _find_repo("ClaudeCode")),
         ("GitHub: claude-mobile", _find_repo("claude-mobile")),
         ("GitHub: ofsted-agent", _find_repo("ofsted-agent")),
         ("GitHub: sv08-print-tools", _find_repo("sv08-print-tools")),
