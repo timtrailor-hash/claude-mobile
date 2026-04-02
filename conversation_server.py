@@ -3870,24 +3870,25 @@ def system_health():
             doc_count = len(out.strip().split("\n")) if out.strip() else 0
         except Exception:
             doc_count = 0
-        # Check backup manifest for school docs — use latest backup timestamp
+        # Check backup manifest for school docs — use groups_verified timestamp
         manifest = _find(".backup_manifest.json")
         school_in_backup = False
-        latest_backup_ts = None
+        verified_ts = None
         if manifest.exists():
             try:
                 with open(manifest) as mf:
                     mdata = json.load(mf)
                 school_files = {k: v for k, v in mdata.get("files", {}).items() if "school" in k.lower()}
                 school_in_backup = bool(school_files)
-                if school_files:
-                    latest_backup_ts = max(v.get("backed_up_at", "") for v in school_files.values())
+                # Use groups_verified (set every backup run) instead of per-file backed_up_at
+                verified_ts = mdata.get("groups_verified", {}).get("school_docs")
+                if not verified_ts and school_files:
+                    verified_ts = max(v.get("backed_up_at", "") for v in school_files.values())
             except Exception:
                 pass
         detail = f"{doc_count} files, {'backed up' if school_in_backup else 'NOT backed up'}"
-        # Use the latest school doc backup time, not the folder mtime
-        if latest_backup_ts:
-            ts = latest_backup_ts
+        if verified_ts:
+            ts = verified_ts
         else:
             ts = datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat()
         items.append({
