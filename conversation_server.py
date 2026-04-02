@@ -83,8 +83,11 @@ def check_auth():
 
 # ── Config ──
 WORK_DIR = work_dir()
-SESSIONS_DIR = "/tmp/claude_sessions"
+# Session events stored persistently in project dir (not /tmp)
+SESSIONS_DIR = os.path.join(os.path.expanduser("~/.claude/projects/-Users-timtrailor-code"), "phone_sessions")
+_TMP_LOG_DIR = "/tmp/claude_sessions"  # Server logs only
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(_TMP_LOG_DIR, exist_ok=True)
 
 MCP_CONFIG = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                           "mcp-approval.json")
@@ -555,7 +558,7 @@ def _ensure_subprocess(resume_session_id=None):
         env = env_for_claude_cli()
 
         try:
-            stderr_path = os.path.join(SESSIONS_DIR, "claude_stderr.log")
+            stderr_path = os.path.join(_TMP_LOG_DIR, "claude_stderr.log")
             stderr_handle = open(stderr_path, "ab")
 
             try:
@@ -4280,22 +4283,17 @@ def _cleanup_thread():
         time.sleep(3600)  # Run every hour
         now = time.time()
 
-        # Clean session directories older than 24 hours
+        # Session dirs are now persistent (in project dir) — no cleanup
+        # Only server logs in /tmp get cleaned up after 7 days
         try:
-            for entry in os.listdir(SESSIONS_DIR):
-                entry_path = os.path.join(SESSIONS_DIR, entry)
-                if not os.path.isdir(entry_path):
-                    continue
-                try:
-                    mtime = os.path.getmtime(entry_path)
-                    if now - mtime > 86400:  # 24 hours
-                        import shutil
-                        shutil.rmtree(entry_path, ignore_errors=True)
-                        _log.info("Cleanup: removed stale session dir %s", entry)
-                except OSError:
-                    pass
+            log_path = os.path.join(_TMP_LOG_DIR, 'server.log')
+            if os.path.exists(log_path):
+                mtime = os.path.getmtime(log_path)
+                if now - mtime > 604800:  # 7 days
+                    open(log_path, 'w').close()
+                    _log.info('Cleanup: truncated old server.log')
         except Exception as e:
-            _log.warning("Cleanup error (sessions): %s", e)
+            _log.warning('Cleanup error (logs): %s', e)
 
         # Clean upload files older than 1 hour
         try:
