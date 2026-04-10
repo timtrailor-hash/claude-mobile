@@ -367,6 +367,14 @@ def _reader_thread(proc, generation):
                 with _lock:
                     _session["status"] = "completed"
 
+                # Notify when Claude finishes (smart routing: WS if connected, else push)
+                summary = response_text[:100] + "..." if len(response_text) > 100 else response_text
+                threading.Thread(
+                    target=_notify_smart,
+                    args=("Claude finished", summary or "Task complete"),
+                    daemon=True,
+                ).start()
+
                 # Save last response
                 if response_text:
                     with _last_response_lock:
@@ -1791,6 +1799,87 @@ def task_status_endpoint():
 
 _ws_clients = {}  # {client_id: ws_object}
 _ws_clients_lock = threading.Lock()
+
+# --- APNs Push Notification Support ---
+_APNS_TOKEN_FILE = "/tmp/apns_device_token.txt"
+try:
+    with open(_APNS_TOKEN_FILE) as _f:
+        _apns_device_token = _f.read().strip() or None
+except FileNotFoundError:
+    _apns_device_token = None
+_apns_device_token_lock = threading.Lock()
+
+def _send_push_notification(title, body):
+    """Send APNs push notification via curl (HTTP/2 + JWT)."""
+    with _apns_device_token_lock:
+        token = _apns_device_token
+    if not token:
+        _log.warning("No APNs device token registered — skipping push")
+        return
+    _log.info("APNs: sending push to token=%s...", token[:8])
+    try:
+        import jwt, time as _time, subprocess, json
+
+        from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TERMINAL_BUNDLE_ID
+
+        with open(APNS_KEY_PATH) as f:
+            key = f.read()
+
+        jwt_token = jwt.encode(
+            {"iss": APNS_TEAM_ID, "iat": int(_time.time())},
+            key,
+            algorithm="ES256",
+            headers={"kid": APNS_KEY_ID},
+        )
+
+        payload = json.dumps({
+            "aps": {
+                "alert": {"title": title, "body": body},
+                "sound": "default",
+            }
+        })
+
+        url = f"https://api.sandbox.push.apple.com/3/device/{token}"
+
+        result = subprocess.run([
+            "curl", "-s", "--http2",
+            "-H", f"authorization: bearer {jwt_token}",
+            "-H", f"apns-topic: {APNS_TERMINAL_BUNDLE_ID}",
+            "-H", "apns-push-type: alert",
+            "-d", payload,
+            "-w", "\n%{http_code}",
+            url,
+        ], capture_output=True, text=True, timeout=15)
+
+        lines = result.stdout.strip().split("\n")
+        status_code = lines[-1] if lines else "?"
+        response_body = "\n".join(lines[:-1])
+
+        if status_code == "200":
+            _log.info("APNs push sent OK: %s", title)
+        else:
+            _log.warning("APNs push failed (HTTP %s): %s", status_code, response_body)
+    except Exception as exc:
+        _log.warning("APNs push error: %s", exc)
+
+
+def _notify_smart(title, message):
+    """Smart notification: WebSocket if app is connected, else APNs + email + Slack."""
+    with _ws_clients_lock:
+        has_clients = len(_ws_clients) > 0
+
+    if has_clients:
+        # App is connected — it will show a local notification
+        _broadcast_ws({"type": "push_message", "content": f"{title}: {message}"})
+        _log.info("Smart notify via WebSocket: %s", title)
+    else:
+        # App is offline — use push + email + Slack
+        _log.info("Smart notify via APNs/email/Slack (no WS clients): %s", title)
+        threading.Thread(target=_send_push_notification, args=(title, message), daemon=True).start()
+        # threading.Thread(target=_notify_email, args=(title, message), daemon=True).start()  # disabled — push only
+        # threading.Thread(target=_notify_slack, args=(f"{title}: {message}",), daemon=True).start()  # disabled — push only
+
+
 
 
 @sock.route("/ws")
@@ -3787,6 +3876,179 @@ def slack_messages():
         return jsonify({"error": str(e), "messages": []}), 502
 
 
+
+@app.route("/register-device", methods=["POST"])
+def register_device():
+    """Register an iOS device token for APNs push notifications."""
+    global _apns_device_token
+    data = request.get_json() or {}
+    token = data.get("device_token", "").strip()
+    if not token:
+        return jsonify({"error": "device_token required"}), 400
+    with _apns_device_token_lock:
+        _apns_device_token = token
+    try:
+        with open(_APNS_TOKEN_FILE, "w") as _f:
+            _f.write(token)
+    except Exception as _e:
+        _log.warning("Failed to persist APNs token: %s", _e)
+    _log.info("APNs device token registered: %s...%s", token[:8], token[-4:])
+    with open("/tmp/apns_device_token.txt", "w") as _f: _f.write(token)
+    return jsonify({"ok": True})
+
+
+
+@app.route("/tmux-windows")
+def tmux_windows():
+    """List tmux windows for the tab bar in the Terminal iOS app."""
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["tmux", "list-windows", "-F", "#{window_index}	#{window_name}	#{window_active}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"windows": [], "error": result.stderr.strip()})
+        windows = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                windows.append({
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "active": parts[2] == "1",
+                })
+        return jsonify({"windows": windows})
+    except Exception as e:
+        return jsonify({"windows": [], "error": str(e)})
+
+
+
+@app.route("/tmux-new-window", methods=["POST"])
+def tmux_new_window():
+    """Create a new tmux window."""
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["tmux", "new-window"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "error": result.stderr.strip()})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+@app.route("/tmux-kill-window", methods=["POST"])
+def tmux_kill_window():
+    """Close a tmux window by index."""
+    import subprocess as _sp
+    data = request.get_json() or {}
+    index = data.get("index")
+    if index is None:
+        return jsonify({"error": "index required"}), 400
+    try:
+        result = _sp.run(
+            ["tmux", "kill-window", "-t", str(index)],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "error": result.stderr.strip()})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/tmux-select-window", methods=["POST"])
+def tmux_select_window():
+    """Switch to a tmux window by index."""
+    import subprocess as _sp
+    data = request.get_json() or {}
+    index = data.get("index")
+    if index is None:
+        return jsonify({"error": "index required"}), 400
+    try:
+        result = _sp.run(
+            ["tmux", "select-window", "-t", str(index)],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "error": result.stderr.strip()})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+
+@app.route("/tmux-capture", methods=["GET"])
+def tmux_capture():
+    """Capture a tmux pane's content."""
+    import subprocess as _sp
+    window = request.args.get("window", "1")
+    lines = request.args.get("lines", "500")
+    session = request.args.get("session", "mobile")
+    target = f"{session}:{window}"
+    try:
+        result = _sp.run(
+            ["/opt/homebrew/bin/tmux", "capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", target],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "error": result.stderr.strip()}), 500
+        return jsonify({"ok": True, "content": result.stdout.rstrip()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/tmux-send-text", methods=["POST"])
+def tmux_send_text():
+    """Paste text into a tmux window (no Enter)."""
+    import subprocess as _sp, base64 as _b64
+    data = request.get_json() or {}
+    text = data.get("text", "")
+    window = data.get("window", 1)
+    session = data.get("session", "mobile")
+    target = f"{session}:{window}"
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    try:
+        b64_text = _b64.b64encode(text.encode()).decode()
+        _sp.run(
+            f"echo {b64_text} | base64 -d | /opt/homebrew/bin/tmux load-buffer -",
+            shell=True, check=True, timeout=5
+        )
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "paste-buffer", "-t", target, "-d"],
+            check=True, timeout=5
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/tmux-send-enter", methods=["POST"])
+def tmux_send_enter():
+    """Send Enter key to a tmux window."""
+    import subprocess as _sp
+    data = request.get_json() or {}
+    window = data.get("window", 1)
+    session = data.get("session", "mobile")
+    target = f"{session}:{window}"
+    try:
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "send-keys", "-t", target, "Enter"],
+            check=True, timeout=5
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/push-message", methods=["POST"])
 def push_message():
     """Push a message to all connected app clients (used by terminal sessions)."""
@@ -3794,10 +4056,142 @@ def push_message():
     content = data.get("content", "")
     if not content:
         return jsonify({"error": "content required"}), 400
-    _broadcast_ws({"type": "push_message", "content": content})
+    _notify_smart("Terminal", content)
     return jsonify({"ok": True})
 
 
+
+
+
+# -- Tmux response watcher for push notifications --
+_tmux_watcher_cancel = threading.Event()
+
+
+def _extract_claude_preview(content):
+    """Extract a meaningful preview from Claude Code tmux pane content."""
+    import re
+    lines = content.split("\n")
+
+    def is_chrome(line):
+        s = line.strip()
+        if not s:
+            return True
+        if s.startswith("▶▶") or s.startswith("⏵⏵") or "esc to" in s:
+            return True
+        if all(c in "─━═│┃║┌┐└┘├┤┬┴┼╭╮╯╰╱╲ " for c in s):
+            return True
+        if s.startswith("❯") or s == ">":
+            return True
+        if "Composing" in s or "Cooked for" in s or "tokens" in s or "Cogitated" in s:
+            return True
+        if re.match(r"^\d+\s+\d+\.\d+\.\d+", s):
+            return True
+        return False
+
+    last_claude_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        s = lines[i].strip()
+        if s.startswith("⏺") or s.startswith("●"):
+            last_claude_idx = i
+            break
+
+    if last_claude_idx is not None:
+        response_lines = []
+        for i in range(last_claude_idx, len(lines)):
+            line = lines[i].strip()
+            if is_chrome(line):
+                break
+            if i == last_claude_idx:
+                line = line.lstrip("⏺●").strip()
+            if line:
+                response_lines.append(line)
+        if response_lines:
+            text = " ".join(response_lines)
+            return text[:200] if len(text) > 200 else text
+
+    meaningful = [l.strip() for l in lines if l.strip() and not is_chrome(l)]
+    if meaningful:
+        return meaningful[-1][:200]
+    return "Response complete"
+
+
+def _watch_tmux_worker(session, stabilise_secs=5, timeout_secs=600):
+    """Background thread: poll tmux pane, push-notify when output stabilises."""
+    import subprocess, hashlib
+    last_hash = None
+    last_change_time = None
+    start = time.time()
+    _tmux_watcher_cancel.clear()
+    _log.info("Tmux watcher started for session '%s'", session)
+
+    while not _tmux_watcher_cancel.is_set() and (time.time() - start) < timeout_secs:
+        try:
+            result = subprocess.run(
+                ["/opt/homebrew/bin/tmux", "capture-pane", "-p", "-S", "-200", "-t", session],
+                capture_output=True, text=True, timeout=5
+            )
+            content = result.stdout.strip()
+            h = hashlib.md5(content.encode()).hexdigest()
+
+            if h != last_hash:
+                last_hash = h
+                last_change_time = time.time()
+            elif last_change_time and (time.time() - last_change_time) >= stabilise_secs:
+                preview = _extract_claude_preview(content)
+                _send_push_notification("Claude finished", preview)
+                _log.info("Tmux watcher: output stabilised, push sent: %s", preview[:60])
+                return
+        except Exception as exc:
+            _log.warning("Tmux watcher error: %s", exc)
+
+        _tmux_watcher_cancel.wait(2)
+
+    _log.info("Tmux watcher expired for session '%s'", session)
+
+
+@app.route("/watch-tmux", methods=["POST"])
+def watch_tmux():
+    """Start watching a tmux session for response completion. Sends push when done."""
+    data = request.get_json() or {}
+    session = data.get("session", "mobile")
+    cancel = data.get("cancel", False)
+
+    if cancel:
+        _tmux_watcher_cancel.set()
+        return jsonify({"ok": True, "status": "cancelled"})
+
+    _tmux_watcher_cancel.set()
+    import time as _time
+    _time.sleep(0.1)
+
+    t = threading.Thread(target=_watch_tmux_worker, args=(session,), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "status": "watching"})
+
+
+@app.route("/infrastructure-health")
+def infrastructure_health():
+    """Return health_check.py results for iOS dashboard."""
+    import json as _json
+    from pathlib import Path as _Path
+    results_file = _Path("/tmp/health_check_results.json")
+    if not results_file.exists():
+        return jsonify({"error": "no health check results yet", "checks": [], "summary": {}}), 200
+    try:
+        data = _json.loads(results_file.read_text())
+        # Add staleness check
+        ts = data.get("timestamp", "")
+        if ts:
+            from datetime import datetime, timezone
+            check_time = datetime.fromisoformat(ts)
+            if check_time.tzinfo is None:
+                check_time = check_time.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - check_time).total_seconds() / 3600
+            data["age_hours"] = round(age_h, 1)
+            data["stale"] = age_h > 6
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e), "checks": [], "summary": {}}), 200
 @app.route("/system-health")
 def system_health():
     """Return timestamps and status of key system components for the iOS health dashboard."""
