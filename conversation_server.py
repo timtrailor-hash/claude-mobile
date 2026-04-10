@@ -1825,7 +1825,7 @@ _apns_device_tokens = _load_apns_tokens()
 
 # Migrate legacy single-token file (from earlier versions)
 try:
-    with open("/tmp/apns_device_token.txt") as _f:
+    with open("/Users/timtrailor/code/apns_state/device_token.txt") as _f:
         _legacy = _f.read().strip()
         if _legacy and "com.timtrailor.terminal" not in _apns_device_tokens:
             _apns_device_tokens["com.timtrailor.terminal"] = _legacy
