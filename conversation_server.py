@@ -1800,27 +1800,58 @@ def task_status_endpoint():
 _ws_clients = {}  # {client_id: ws_object}
 _ws_clients_lock = threading.Lock()
 
-# --- APNs Push Notification Support ---
-_APNS_TOKEN_FILE = "/tmp/apns_device_token.txt"
-try:
-    with open(_APNS_TOKEN_FILE) as _f:
-        _apns_device_token = _f.read().strip() or None
-except FileNotFoundError:
-    _apns_device_token = None
-_apns_device_token_lock = threading.Lock()
+# --- APNs Push Notification Support (multi-app) ---
+# Tokens persisted to disk so they survive server restart.
+_APNS_TOKENS_FILE = "/tmp/apns_device_tokens.json"
+_apns_device_tokens_lock = threading.Lock()
 
-def _send_push_notification(title, body):
-    """Send APNs push notification via curl (HTTP/2 + JWT)."""
-    with _apns_device_token_lock:
-        token = _apns_device_token
-    if not token:
-        _log.warning("No APNs device token registered — skipping push")
-        return
-    _log.info("APNs: sending push to token=%s...", token[:8])
+def _load_apns_tokens():
+    """Load tokens dict from disk."""
     try:
-        import jwt, time as _time, subprocess, json
+        with open(_APNS_TOKENS_FILE) as _f:
+            return json.loads(_f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-        from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_TERMINAL_BUNDLE_ID
+def _save_apns_tokens():
+    """Persist tokens dict to disk."""
+    try:
+        with open(_APNS_TOKENS_FILE, "w") as _f:
+            _f.write(json.dumps(_apns_device_tokens))
+    except Exception as _e:
+        _log.warning("Failed to save APNs tokens: %s", _e)
+
+_apns_device_tokens = _load_apns_tokens()
+
+# Migrate legacy single-token file (from earlier versions)
+try:
+    with open("/tmp/apns_device_token.txt") as _f:
+        _legacy = _f.read().strip()
+        if _legacy and "com.timtrailor.terminal" not in _apns_device_tokens:
+            _apns_device_tokens["com.timtrailor.terminal"] = _legacy
+            _save_apns_tokens()
+except FileNotFoundError:
+    pass
+
+
+def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
+    """Send APNs push to a specific app via curl (HTTP/2 + JWT).
+
+    bundle_id: which app to push to. Must have a registered device token.
+        com.timtrailor.terminal     — Terminal app
+        com.timtrailor.claudecontrol — ClaudeControl
+        com.timtrailor.printerpilot  — PrinterPilot
+    """
+    with _apns_device_tokens_lock:
+        token = _apns_device_tokens.get(bundle_id)
+    if not token:
+        _log.debug("No APNs token for %s — skipping push", bundle_id)
+        return
+    _log.info("APNs: sending push to %s (token=%s...)", bundle_id, token[:8])
+    try:
+        import jwt, time as _time, subprocess
+
+        from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID
 
         with open(APNS_KEY_PATH) as f:
             key = f.read()
@@ -1844,7 +1875,7 @@ def _send_push_notification(title, body):
         result = subprocess.run([
             "curl", "-s", "--http2",
             "-H", f"authorization: bearer {jwt_token}",
-            "-H", f"apns-topic: {APNS_TERMINAL_BUNDLE_ID}",
+            "-H", f"apns-topic: {bundle_id}",
             "-H", "apns-push-type: alert",
             "-d", payload,
             "-w", "\n%{http_code}",
@@ -1856,11 +1887,17 @@ def _send_push_notification(title, body):
         response_body = "\n".join(lines[:-1])
 
         if status_code == "200":
-            _log.info("APNs push sent OK: %s", title)
+            _log.info("APNs push sent OK to %s: %s", bundle_id, title)
+        elif status_code == "410":
+            # Token no longer valid — remove it
+            _log.info("APNs token for %s no longer valid, removing", bundle_id)
+            with _apns_device_tokens_lock:
+                _apns_device_tokens.pop(bundle_id, None)
+                _save_apns_tokens()
         else:
-            _log.warning("APNs push failed (HTTP %s): %s", status_code, response_body)
+            _log.warning("APNs push to %s failed (HTTP %s): %s", bundle_id, status_code, response_body)
     except Exception as exc:
-        _log.warning("APNs push error: %s", exc)
+        _log.warning("APNs push error (%s): %s", bundle_id, exc)
 
 
 def _notify_smart(title, message):
@@ -1875,7 +1912,7 @@ def _notify_smart(title, message):
     else:
         # App is offline — use push + email + Slack
         _log.info("Smart notify via APNs/email/Slack (no WS clients): %s", title)
-        threading.Thread(target=_send_push_notification, args=(title, message), daemon=True).start()
+        threading.Thread(target=_send_push_notification, args=(title, message, "com.timtrailor.terminal"), daemon=True).start()
         # threading.Thread(target=_notify_email, args=(title, message), daemon=True).start()  # disabled — push only
         # threading.Thread(target=_notify_slack, args=(f"{title}: {message}",), daemon=True).start()  # disabled — push only
 
@@ -3264,7 +3301,19 @@ def _broadcast_ws(event_dict):
         is_critical = any(kw in new_state for kw in _CRITICAL_STATE_MESSAGES)
 
     if is_critical and alert_msg:
-        # Run Slack + email in background threads so broadcasting doesn't block
+        # FIRST CHOICE: push to PrinterPilot and ClaudeControl (native iOS push)
+        push_title = event_dict.get("printer", "Printer")
+        threading.Thread(
+            target=_send_push_notification,
+            args=(push_title, alert_msg, "com.timtrailor.printerpilot"),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_send_push_notification,
+            args=(push_title, alert_msg, "com.timtrailor.claudecontrol"),
+            daemon=True,
+        ).start()
+        # BACKUP: Slack + email so alerts still arrive if push fails
         threading.Thread(
             target=_notify_slack, args=(alert_msg,), daemon=True
         ).start()
@@ -3879,23 +3928,59 @@ def slack_messages():
 
 @app.route("/register-device", methods=["POST"])
 def register_device():
-    """Register an iOS device token for APNs push notifications."""
-    global _apns_device_token
+    """Register an iOS device token for APNs push notifications.
+
+    Accepts bundle_id to support multiple apps (Terminal, ClaudeControl, PrinterPilot).
+    Tokens persisted to /tmp/apns_device_tokens.json.
+    """
     data = request.get_json() or {}
     token = data.get("device_token", "").strip()
+    bundle_id = data.get("bundle_id", "com.timtrailor.terminal").strip()
     if not token:
         return jsonify({"error": "device_token required"}), 400
-    with _apns_device_token_lock:
-        _apns_device_token = token
-    try:
-        with open(_APNS_TOKEN_FILE, "w") as _f:
-            _f.write(token)
-    except Exception as _e:
-        _log.warning("Failed to persist APNs token: %s", _e)
-    _log.info("APNs device token registered: %s...%s", token[:8], token[-4:])
-    with open("/tmp/apns_device_token.txt", "w") as _f: _f.write(token)
+    with _apns_device_tokens_lock:
+        _apns_device_tokens[bundle_id] = token
+        _save_apns_tokens()
+    _log.info("APNs token registered for %s: %s...%s", bundle_id, token[:8], token[-4:])
     return jsonify({"ok": True})
 
+
+
+
+def _ensure_tmux_session(session: str = "mobile") -> None:
+    """Ensure a detached tmux session exists. Idempotent."""
+    import subprocess as _sp
+    try:
+        # Check if session exists
+        result = _sp.run(
+            ["/opt/homebrew/bin/tmux", "has-session", "-t", session],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            return  # already exists
+        # Create new detached session with default shell in home directory
+        import os as _os
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "new-session", "-d", "-s", session, "-c", _os.path.expanduser("~"), "-x", "200", "-y", "50"],
+            capture_output=True, text=True, timeout=5
+        )
+        _log.info("Created tmux session: %s", session)
+    except Exception as e:
+        _log.warning("Failed to ensure tmux session: %s", e)
+
+
+
+@app.route("/tmux-reset", methods=["POST"])
+def tmux_reset():
+    """Hard reset: kill and recreate the mobile tmux session."""
+    import subprocess as _sp
+    try:
+        _sp.run(["/opt/homebrew/bin/tmux", "kill-session", "-t", "mobile"],
+                capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+    _ensure_tmux_session("mobile")
+    return jsonify({"ok": True})
 
 
 @app.route("/tmux-windows")
@@ -3930,9 +4015,10 @@ def tmux_windows():
 def tmux_new_window():
     """Create a new tmux window."""
     import subprocess as _sp
+    _ensure_tmux_session()
     try:
         result = _sp.run(
-            ["tmux", "new-window"],
+            ["/opt/homebrew/bin/tmux", "new-window", "-t", "mobile"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -3947,13 +4033,14 @@ def tmux_new_window():
 def tmux_kill_window():
     """Close a tmux window by index."""
     import subprocess as _sp
+    _ensure_tmux_session()
     data = request.get_json() or {}
     index = data.get("index")
     if index is None:
         return jsonify({"error": "index required"}), 400
     try:
         result = _sp.run(
-            ["tmux", "kill-window", "-t", str(index)],
+            ["/opt/homebrew/bin/tmux", "kill-window", "-t", f"mobile:{index}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -3967,13 +4054,14 @@ def tmux_kill_window():
 def tmux_select_window():
     """Switch to a tmux window by index."""
     import subprocess as _sp
+    _ensure_tmux_session()
     data = request.get_json() or {}
     index = data.get("index")
     if index is None:
         return jsonify({"error": "index required"}), 400
     try:
         result = _sp.run(
-            ["tmux", "select-window", "-t", str(index)],
+            ["/opt/homebrew/bin/tmux", "select-window", "-t", f"mobile:{index}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -3989,6 +4077,7 @@ def tmux_select_window():
 def tmux_capture():
     """Capture a tmux pane's content."""
     import subprocess as _sp
+    _ensure_tmux_session()
     window = request.args.get("window", "1")
     lines = request.args.get("lines", "500")
     session = request.args.get("session", "mobile")
