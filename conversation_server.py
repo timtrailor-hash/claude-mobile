@@ -1802,7 +1802,7 @@ _ws_clients_lock = threading.Lock()
 
 # --- APNs Push Notification Support (multi-app) ---
 # Tokens persisted to disk so they survive server restart.
-_APNS_TOKENS_FILE = "/tmp/apns_device_tokens.json"
+_APNS_TOKENS_FILE = "/Users/timtrailor/code/apns_state/device_tokens.json"
 _apns_device_tokens_lock = threading.Lock()
 
 def _load_apns_tokens():
@@ -3931,7 +3931,7 @@ def register_device():
     """Register an iOS device token for APNs push notifications.
 
     Accepts bundle_id to support multiple apps (Terminal, ClaudeControl, PrinterPilot).
-    Tokens persisted to /tmp/apns_device_tokens.json.
+    Tokens persisted to /Users/timtrailor/code/apns_state/device_tokens.json.
     """
     data = request.get_json() or {}
     token = data.get("device_token", "").strip()
