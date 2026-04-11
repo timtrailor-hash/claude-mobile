@@ -367,11 +367,21 @@ def _reader_thread(proc, generation):
                 with _lock:
                     _session["status"] = "completed"
 
-                # Notify when Claude finishes (smart routing: WS if connected, else push)
-                summary = response_text[:100] + "..." if len(response_text) > 100 else response_text
+                # Notify when Claude finishes (smart routing: WS if connected, else push).
+                # Body is a Haiku-generated ~100-word summary of the last 100 lines;
+                # falls back to raw truncation if the API call fails.
+                def _summarise_and_notify(raw=response_text):
+                    body = _summarise_for_push(raw)
+                    if not body:
+                        body = (raw[:100] + "...") if len(raw) > 100 else (raw or "Task complete")
+                    _notify_smart("Claude finished", body)
+                    try:
+                        _liveactivity_on_turn_complete("mobile", body)
+                    except Exception as exc:
+                        _log.error("LiveActivity turn-complete hook failed: %s", exc, exc_info=True)
+
                 threading.Thread(
-                    target=_notify_smart,
-                    args=("Claude finished", summary or "Task complete"),
+                    target=_summarise_and_notify,
                     daemon=True,
                 ).start()
 
@@ -399,6 +409,10 @@ def _reader_thread(proc, generation):
         with _last_claude_error_lock:
             _last_claude_error["message"] = str(e)
             _last_claude_error["timestamp"] = datetime.now().isoformat()
+        try:
+            _liveactivity_on_turn_error("mobile", str(e))
+        except Exception as exc:
+            _log.error("LiveActivity turn-error hook failed: %s", exc, exc_info=True)
 
     done_flag[0] = True
 
@@ -634,6 +648,16 @@ def _start_session(message, image_paths=None, client_session_id=None):
         _session["status"] = "running"
         _session["started"] = time.time()
         _session["last_activity"] = time.time()
+
+    # Kick a thinking-phase Live Activity push (push-to-start or update).
+    try:
+        threading.Thread(
+            target=_liveactivity_on_turn_start,
+            kwargs={"session_label": "mobile", "headline": "Working…"},
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        _log.error("LiveActivity turn-start hook failed: %s", exc, exc_info=True)
 
     # Attach files if any
     valid_paths = [p for p in image_paths if os.path.exists(p)]
@@ -1834,6 +1858,376 @@ except FileNotFoundError:
     pass
 
 
+# ---- Live Activity (ActivityKit push-to-start + update) support ----
+# Persisted state for push-to-start tokens (per bundle) and per-activity
+# update tokens. State is written to disk so it survives daemon restart.
+_LIVEACTIVITY_FILE = "/Users/timtrailor/code/apns_state/liveactivity_tokens.json"
+_liveactivity_lock = threading.Lock()
+_LIVEACTIVITY_BUNDLE = "com.timtrailor.terminal"
+_LIVEACTIVITY_TOPIC = "com.timtrailor.terminal.push-type.liveactivity"
+
+
+def _load_liveactivity_state():
+    """Load start-token set and per-activity token map from disk.
+
+    On a corrupt file (truncated write after a crash, partial JSON), the
+    old file is renamed to .corrupt.<ts> for post-mortem and an empty
+    state is returned so the daemon can still start. This is a push-
+    notification cache, not session-critical state — failing closed would
+    take down every unrelated feature over a cache problem.
+    """
+    try:
+        with open(_LIVEACTIVITY_FILE) as f:
+            data = json.loads(f.read())
+    except FileNotFoundError:
+        return set(), {}
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        _log.error("LiveActivity state file corrupt, resetting: %s",
+                   exc, exc_info=True)
+        try:
+            os.rename(_LIVEACTIVITY_FILE,
+                      f"{_LIVEACTIVITY_FILE}.corrupt.{int(time.time())}")
+        except OSError as rename_exc:
+            _log.error("Could not rename corrupt LiveActivity state: %s",
+                       rename_exc, exc_info=True)
+        return set(), {}
+    start_tokens = set(data.get("start_tokens", {}).get(_LIVEACTIVITY_BUNDLE, []))
+    activities = data.get("activities", {}) or {}
+    return start_tokens, activities
+
+
+def _save_liveactivity_state():
+    """Persist Live Activity state to disk. Caller holds _liveactivity_lock.
+
+    Does not re-raise on I/O errors — state is kept in memory and the
+    failure is logged with a full traceback. A disk-full or permission
+    error must not kill the Flask request handler or the background
+    timer that called us.
+    """
+    payload = {
+        "start_tokens": {_LIVEACTIVITY_BUNDLE: sorted(_liveactivity_start_tokens)},
+        "activities": _liveactivity_tokens,
+    }
+    tmp = _LIVEACTIVITY_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(payload))
+        os.replace(tmp, _LIVEACTIVITY_FILE)
+    except OSError as exc:
+        _log.error("Failed to persist LiveActivity state: %s",
+                   exc, exc_info=True)
+
+
+_liveactivity_start_tokens, _liveactivity_tokens = _load_liveactivity_state()
+# Per-session-label turn state: started_at, headline, dismiss_timer, generation.
+# `generation` increments on every new turn; dismiss-timer closures capture
+# the generation they were scheduled under and bail out if the turn has
+# advanced. This is belt-and-braces alongside timer.cancel() because
+# threading.Timer.cancel() is best-effort — if the worker thread has
+# already started running, cancel is a no-op. Guarded by
+# _liveactivity_turn_state_lock (NOT _liveactivity_lock — the token state
+# and the turn state are independent and we want to avoid holding the
+# token lock across APNs I/O).
+_liveactivity_turn_state = {}
+_liveactivity_turn_state_lock = threading.Lock()
+
+# APNs endpoint — sandbox is correct as long as the app is signed with
+# aps-environment=development (see TerminalApp.entitlements). If the
+# entitlement ever flips to production, update this URL AND the
+# _send_push_notification path in lockstep.
+_APNS_HOST = "https://api.sandbox.push.apple.com"
+
+
+def _apns_jwt():
+    """Build a short-lived APNs JWT using credentials.py settings.
+
+    Shared by both the alert-push and Live Activity code paths. Raises on
+    any config error — callers must not swallow it.
+    """
+    import jwt as _jwt
+    import time as _time
+    from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID
+    with open(APNS_KEY_PATH) as _f:
+        key = _f.read()
+    return _jwt.encode(
+        {"iss": APNS_TEAM_ID, "iat": int(_time.time())},
+        key,
+        algorithm="ES256",
+        headers={"kid": APNS_KEY_ID},
+    )
+
+
+def _push_liveactivity(token, *, event, content_state,
+                       attributes=None, dismissal_date=None,
+                       alert_title=None, alert_body=None, stale_date=None):
+    """Send an ActivityKit APNs push. event is start, update or end.
+
+    Returns (status_code, response_body). Does NOT raise on APNs-level
+    failure (400/410 are logged and handled); only raises on programmer
+    errors (bad args, missing credentials, curl not runnable).
+    """
+    if event not in ("start", "update", "end"):
+        raise ValueError(f"invalid event: {event}")
+    if event == "start" and attributes is None:
+        raise ValueError("attributes required for start event")
+
+    import subprocess as _sp
+    import time as _time
+
+    aps = {
+        "timestamp": int(_time.time()),
+        "event": event,
+        "content-state": content_state,
+    }
+    if event == "start":
+        aps["attributes-type"] = "ClaudeActivityAttributes"
+        aps["attributes"] = attributes
+    if stale_date is not None:
+        aps["stale-date"] = int(stale_date)
+    if event == "end" and dismissal_date is not None:
+        aps["dismissal-date"] = int(dismissal_date)
+    if alert_title or alert_body:
+        aps["alert"] = {
+            "title": alert_title or "",
+            "body": alert_body or "",
+        }
+    payload = json.dumps({"aps": aps})
+
+    jwt_token = _apns_jwt()
+    url = f"{_APNS_HOST}/3/device/{token}"
+
+    # apns-topic for Live Activities is "<main-app-bundle-id>.push-type.liveactivity"
+    # per Apple docs (developer.apple.com/documentation/activitykit/
+    # starting-and-updating-live-activities-with-activitykit-push-notifications).
+    # This is NOT the widget extension bundle ID.
+    result = _sp.run([
+        "curl", "-s", "--http2",
+        "-H", f"authorization: bearer {jwt_token}",
+        "-H", f"apns-topic: {_LIVEACTIVITY_TOPIC}",
+        "-H", "apns-push-type: liveactivity",
+        "-H", "apns-priority: 10",
+        "-d", payload,
+        "-w", "\n%{http_code}",
+        url,
+    ], capture_output=True, text=True, timeout=15)
+
+    stdout = (result.stdout or "").strip()
+    lines = stdout.split("\n") if stdout else []
+    status_code = lines[-1] if lines else "?"
+    response_body = "\n".join(lines[:-1])
+    if result.returncode != 0 and not stdout:
+        _log.error("LiveActivity curl exit=%s stderr=%s",
+                   result.returncode, (result.stderr or "").strip()[:500])
+        return status_code, response_body
+
+    if status_code == "200":
+        _log.info("LiveActivity push ok (event=%s token=%s...)", event, token[:8])
+    elif status_code == "410":
+        _log.info("LiveActivity token %s... invalid — removing", token[:8])
+        with _liveactivity_lock:
+            _liveactivity_start_tokens.discard(token)
+            stale_aids = [aid for aid, rec in _liveactivity_tokens.items()
+                          if rec.get("token") == token]
+            for aid in stale_aids:
+                _liveactivity_tokens.pop(aid, None)
+            _save_liveactivity_state()
+    else:
+        _log.warning("LiveActivity push failed (event=%s HTTP %s): %s",
+                     event, status_code, response_body)
+    return status_code, response_body
+
+
+def _liveactivity_active_tokens(session_label):
+    """Return list of (activity_id, token) for activities matching the label."""
+    out = []
+    with _liveactivity_lock:
+        for aid, rec in _liveactivity_tokens.items():
+            attrs = rec.get("attributes") or {}
+            tok = rec.get("token")
+            if tok and attrs.get("sessionLabel") == session_label:
+                out.append((aid, tok))
+    return out
+
+
+def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
+    """Push a thinking-phase update (or start a fresh activity) for this turn.
+
+    Cancels any previously scheduled auto-dismiss timer for this session
+    and bumps the generation counter, so a new turn starting within the
+    dismiss window cannot be killed mid-flight by a stale timer.
+    """
+    started_at = time.time()
+    with _liveactivity_turn_state_lock:
+        prior = _liveactivity_turn_state.get(session_label) or {}
+        prior_timer = prior.get("dismiss_timer")
+        if prior_timer is not None:
+            try:
+                prior_timer.cancel()
+            except Exception as exc:
+                _log.error("Failed to cancel prior LiveActivity timer: %s",
+                           exc, exc_info=True)
+        new_gen = int(prior.get("generation", 0)) + 1
+        _liveactivity_turn_state[session_label] = {
+            "started_at": started_at,
+            "headline": headline,
+            "dismiss_timer": None,
+            "generation": new_gen,
+        }
+    content_state = {
+        "phase": "thinking",
+        "headline": headline,
+        "body": "",
+        "startedAt": started_at,
+        "elapsedSeconds": 0,
+    }
+    active = _liveactivity_active_tokens(session_label)
+    if active:
+        for _aid, tok in active:
+            try:
+                _push_liveactivity(tok, event="update", content_state=content_state,
+                                   alert_title="Claude", alert_body=headline)
+            except Exception as exc:
+                _log.error("LiveActivity update (turn_start) error: %s",
+                           exc, exc_info=True)
+        return
+    # No live activity yet — try push-to-start.
+    with _liveactivity_lock:
+        tokens = list(_liveactivity_start_tokens)
+    for tok in tokens:
+        try:
+            _push_liveactivity(
+                tok, event="start",
+                content_state=content_state,
+                attributes={"sessionLabel": session_label},
+                stale_date=started_at + 15 * 60,
+                alert_title="Claude", alert_body=headline,
+            )
+        except Exception as exc:
+            _log.error("LiveActivity start error: %s", exc, exc_info=True)
+
+
+def _liveactivity_on_turn_complete(session_label, body_text):
+    """Push a finished-phase update and schedule auto-dismiss after 10 min."""
+    with _liveactivity_turn_state_lock:
+        state = dict(_liveactivity_turn_state.get(session_label) or {})
+    started_at = state.get("started_at")
+    if started_at is None:
+        _log.warning("LiveActivity turn_complete: no started_at for session %s "
+                     "(out-of-order hook?) — elapsed will be 0", session_label)
+        started_at = time.time()
+    elapsed = max(0, int(time.time() - started_at))
+    summary = (body_text or "").strip() or "Task complete"
+    headline = summary
+    if len(headline) > 60:
+        cut = summary[:60]
+        space = cut.rfind(" ")
+        headline = (cut[:space] if space > 20 else cut).rstrip() + "…"
+    content_state = {
+        "phase": "finished",
+        "headline": headline,
+        "body": summary,
+        "startedAt": started_at,
+        "elapsedSeconds": elapsed,
+    }
+    active = _liveactivity_active_tokens(session_label)
+    if not active:
+        _log.debug("No Live Activity tokens for session %s — skipping finished push",
+                   session_label)
+        return
+    for _aid, tok in active:
+        try:
+            _push_liveactivity(tok, event="update", content_state=content_state,
+                               alert_title="Claude finished", alert_body=headline)
+        except Exception as exc:
+            _log.error("LiveActivity update (turn_complete) error: %s",
+                       exc, exc_info=True)
+
+    captured_gen = state.get("generation", 0)
+
+    def _end_later(tokens_snapshot=list(active), cs=content_state,
+                   gen=captured_gen, label=session_label):
+        with _liveactivity_turn_state_lock:
+            current = int((_liveactivity_turn_state.get(label) or {}).get("generation", 0))
+        if current != gen:
+            _log.info("LiveActivity dismiss-timer generation mismatch "
+                      "(captured=%s current=%s) — skipping", gen, current)
+            return
+        dismiss_at = int(time.time())
+        for _a, t in tokens_snapshot:
+            try:
+                _push_liveactivity(t, event="end", content_state=cs,
+                                   dismissal_date=dismiss_at)
+            except Exception as exc:
+                _log.error("LiveActivity end error: %s", exc, exc_info=True)
+    timer = threading.Timer(600.0, _end_later)
+    timer.daemon = True
+    with _liveactivity_turn_state_lock:
+        rec = _liveactivity_turn_state.setdefault(session_label, {})
+        rec["dismiss_timer"] = timer
+    timer.start()
+
+
+def _liveactivity_on_turn_error(session_label, error_text):
+    """Push an error-phase update and schedule a short auto-dismiss."""
+    with _liveactivity_turn_state_lock:
+        state = dict(_liveactivity_turn_state.get(session_label) or {})
+        prior_timer = state.get("dismiss_timer")
+        if prior_timer is not None:
+            try:
+                prior_timer.cancel()
+            except Exception as exc:
+                _log.error("Failed to cancel prior LiveActivity timer: %s",
+                           exc, exc_info=True)
+    started_at = state.get("started_at")
+    if started_at is None:
+        _log.warning("LiveActivity turn_error: no started_at for session %s",
+                     session_label)
+        started_at = time.time()
+    elapsed = max(0, int(time.time() - started_at))
+    msg = (error_text or "Claude errored")[:200]
+    content_state = {
+        "phase": "error",
+        "headline": msg[:60],
+        "body": msg,
+        "startedAt": started_at,
+        "elapsedSeconds": elapsed,
+    }
+    active = _liveactivity_active_tokens(session_label)
+    if not active:
+        return
+    for _aid, tok in active:
+        try:
+            _push_liveactivity(tok, event="update", content_state=content_state,
+                               alert_title="Claude error", alert_body=msg[:60])
+        except Exception as exc:
+            _log.error("LiveActivity update (turn_error) error: %s",
+                       exc, exc_info=True)
+
+    captured_gen = state.get("generation", 0)
+
+    def _end_later(tokens_snapshot=list(active), cs=content_state,
+                   gen=captured_gen, label=session_label):
+        with _liveactivity_turn_state_lock:
+            current = int((_liveactivity_turn_state.get(label) or {}).get("generation", 0))
+        if current != gen:
+            _log.info("LiveActivity dismiss-timer (error) generation mismatch "
+                      "(captured=%s current=%s) — skipping", gen, current)
+            return
+        dismiss_at = int(time.time())
+        for _a, t in tokens_snapshot:
+            try:
+                _push_liveactivity(t, event="end", content_state=cs,
+                                   dismissal_date=dismiss_at)
+            except Exception as exc:
+                _log.error("LiveActivity end error: %s", exc, exc_info=True)
+    timer = threading.Timer(30.0, _end_later)
+    timer.daemon = True
+    with _liveactivity_turn_state_lock:
+        rec = _liveactivity_turn_state.setdefault(session_label, {})
+        rec["dismiss_timer"] = timer
+    timer.start()
+
+
 def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
     """Send APNs push to a specific app via curl (HTTP/2 + JWT).
 
@@ -1849,19 +2243,9 @@ def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
         return
     _log.info("APNs: sending push to %s (token=%s...)", bundle_id, token[:8])
     try:
-        import jwt, time as _time, subprocess
+        import subprocess
 
-        from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID
-
-        with open(APNS_KEY_PATH) as f:
-            key = f.read()
-
-        jwt_token = jwt.encode(
-            {"iss": APNS_TEAM_ID, "iat": int(_time.time())},
-            key,
-            algorithm="ES256",
-            headers={"kid": APNS_KEY_ID},
-        )
+        jwt_token = _apns_jwt()
 
         payload = json.dumps({
             "aps": {
@@ -1870,7 +2254,7 @@ def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
             }
         })
 
-        url = f"https://api.sandbox.push.apple.com/3/device/{token}"
+        url = f"{_APNS_HOST}/3/device/{token}"
 
         result = subprocess.run([
             "curl", "-s", "--http2",
@@ -1897,7 +2281,59 @@ def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
         else:
             _log.warning("APNs push to %s failed (HTTP %s): %s", bundle_id, status_code, response_body)
     except Exception as exc:
-        _log.warning("APNs push error (%s): %s", bundle_id, exc)
+        _log.error("APNs push error (%s): %s", bundle_id, exc, exc_info=True)
+
+
+def _summarise_for_push(raw_text, max_lines=100, target_words=100, timeout=20.0):
+    """Summarise the tail of Claude's output into a ~100-word push body.
+
+    Feeds the last `max_lines` lines of `raw_text` to Haiku 4.5 and asks for a
+    plain-prose single paragraph suitable for a phone lock-screen. Returns the
+    summary string on success, or None on ANY failure so callers can fall back
+    to their existing truncation logic — we never want to drop a notification.
+    """
+    if not raw_text or not raw_text.strip():
+        return None
+
+    tail = "\n".join(raw_text.splitlines()[-max_lines:]).strip()
+    if not tail:
+        return None
+
+    try:
+        from shared_utils import get_api_key
+        api_key = get_api_key()
+        if not api_key:
+            _log.warning("push-summary: no ANTHROPIC_API_KEY available, falling back")
+            return None
+
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
+
+        prompt = (
+            f"Below is the tail of Claude's most recent response to the user. "
+            f"Write a single-paragraph summary of about {target_words} words that "
+            f"a human will read on their phone lock screen. Lead with the outcome "
+            f"or headline finding. No preamble like 'Claude' or 'The assistant'. "
+            f"No markdown, no bullets — plain prose only.\n\n"
+            f"---\n{tail}\n---"
+        )
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=260,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        summary = " ".join(p.strip() for p in parts).strip()
+        if not summary:
+            _log.warning("push-summary: Haiku returned empty content, falling back")
+            return None
+        _log.info("push-summary: Haiku produced %d-char summary", len(summary))
+        return summary
+    except Exception as exc:
+        _log.warning("push-summary: Haiku call failed (%s), falling back", exc)
+        return None
 
 
 def _notify_smart(title, message):
@@ -3945,6 +4381,63 @@ def register_device():
     return jsonify({"ok": True})
 
 
+@app.route("/register-liveactivity-start-token", methods=["POST"])
+def register_liveactivity_start_token():
+    """Register an ActivityKit push-to-start token for the Terminal app.
+
+    Called by the iOS app's LiveActivityManager observer whenever a fresh
+    push-to-start token is issued. Tokens are deduped in a set and survive
+    daemon restart via /tmp/claude_sessions/liveactivity_tokens.json.
+    """
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    bundle_id = (data.get("bundle_id") or "com.timtrailor.terminal").strip()
+    if not token:
+        return jsonify({"error": "token required"}), 400
+    if bundle_id != _LIVEACTIVITY_BUNDLE:
+        return jsonify({"error": "unsupported bundle_id"}), 400
+    with _liveactivity_lock:
+        _liveactivity_start_tokens.add(token)
+        _save_liveactivity_state()
+    _log.info("LiveActivity start-token registered: %s...%s", token[:8], token[-4:])
+    return jsonify({"ok": True})
+
+
+@app.route("/register-liveactivity-token", methods=["POST"])
+def register_liveactivity_token():
+    """Register a per-activity update token from the iOS app.
+
+    The iOS app posts this when an Activity is created locally or started
+    via push-to-start — it carries the activity_id, attributes, and the
+    push update token (optional on the first call because it arrives
+    asynchronously, filled in on a follow-up).
+    """
+    data = request.get_json(silent=True) or {}
+    activity_id = (data.get("activity_id") or "").strip()
+    token = (data.get("token") or "").strip()
+    attributes = data.get("attributes") or {}
+    if not activity_id:
+        return jsonify({"error": "activity_id required"}), 400
+    if not token:
+        return jsonify({"error": "token required"}), 400
+    if not isinstance(attributes, dict):
+        return jsonify({"error": "attributes must be an object"}), 400
+    session_label = attributes.get("sessionLabel")
+    if not isinstance(session_label, str) or not session_label:
+        return jsonify({"error": "attributes.sessionLabel required"}), 400
+    with _liveactivity_lock:
+        rec = _liveactivity_tokens.setdefault(activity_id, {})
+        if token:
+            rec["token"] = token
+        rec["attributes"] = attributes
+        rec["last_update"] = int(time.time())
+        _save_liveactivity_state()
+    _log.info("LiveActivity activity-token registered: aid=%s token=%s",
+              activity_id, (token[:8] + "..." if token else "(pending)"))
+    return jsonify({"ok": True})
+
+
+
 
 
 def _ensure_tmux_session(session: str = "mobile") -> None:
@@ -3989,7 +4482,7 @@ def tmux_windows():
     import subprocess as _sp
     try:
         result = _sp.run(
-            ["tmux", "list-windows", "-F", "#{window_index}	#{window_name}	#{window_active}"],
+            ["tmux", "list-windows", "-F", "#{window_index}	#{window_name}	#{window_active}	#{pane_current_command}	#{b:pane_current_path}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -4004,6 +4497,8 @@ def tmux_windows():
                     "index": int(parts[0]),
                     "name": parts[1],
                     "active": parts[2] == "1",
+                    "command": parts[3] if len(parts) > 3 else "",
+                    "cwd": parts[4] if len(parts) > 4 else "",
                 })
         return jsonify({"windows": windows})
     except Exception as e:
@@ -4090,6 +4585,46 @@ def tmux_capture():
         if result.returncode != 0:
             return jsonify({"ok": False, "error": result.stderr.strip()}), 500
         return jsonify({"ok": True, "content": result.stdout.rstrip()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/tmux-resize", methods=["POST"])
+def tmux_resize():
+    """Resize every window in the mobile session so TUI apps inside (Claude Code CLI)
+    wrap at the phone's actual visual column count. Without this the pane defaults to
+    80 cols, Claude Code wraps at ~78, and the iPhone's ~48-col SwiftUI view re-wraps
+    every line mid-paragraph."""
+    import subprocess as _sp
+    _ensure_tmux_session()
+    data = request.get_json(silent=True) or {}
+    try:
+        cols = int(data.get("cols", 0))
+        rows = int(data.get("rows", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "cols/rows must be integers"}), 400
+    if cols < 20 or cols > 500 or rows < 5 or rows > 500:
+        return jsonify({"ok": False, "error": "cols/rows out of range"}), 400
+    session = data.get("session", "mobile")
+    try:
+        # List windows, resize each one individually. resize-window -A adapts the
+        # smallest client but detached sessions need explicit -x/-y.
+        lw = _sp.run(
+            ["/opt/homebrew/bin/tmux", "list-windows", "-t", session, "-F", "#{window_index}"],
+            capture_output=True, text=True, timeout=5
+        )
+        if lw.returncode != 0:
+            return jsonify({"ok": False, "error": lw.stderr.strip()}), 500
+        indices = [i.strip() for i in lw.stdout.splitlines() if i.strip()]
+        resized = []
+        for idx in indices:
+            r = _sp.run(
+                ["/opt/homebrew/bin/tmux", "resize-window", "-t", f"{session}:{idx}", "-x", str(cols), "-y", str(rows)],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0:
+                resized.append(idx)
+        return jsonify({"ok": True, "cols": cols, "rows": rows, "resized": resized})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4226,9 +4761,9 @@ def _watch_tmux_worker(session, stabilise_secs=5, timeout_secs=600):
                 last_hash = h
                 last_change_time = time.time()
             elif last_change_time and (time.time() - last_change_time) >= stabilise_secs:
-                preview = _extract_claude_preview(content)
-                _send_push_notification("Claude finished", preview)
-                _log.info("Tmux watcher: output stabilised, push sent: %s", preview[:60])
+                body = _summarise_for_push(content) or _extract_claude_preview(content)
+                _send_push_notification("Claude finished", body)
+                _log.info("Tmux watcher: output stabilised, push sent: %s", body[:60])
                 return
         except Exception as exc:
             _log.warning("Tmux watcher error: %s", exc)
