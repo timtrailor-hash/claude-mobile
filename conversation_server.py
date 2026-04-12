@@ -2,23 +2,7 @@
 """Conversation server — owns Claude CLI subprocess lifecycle.
 
 Runs as a persistent launchd daemon on port 8081.
-The wrapper (app.py) proxies to this server.
-Sessions survive wrapper restarts and iOS Safari connection drops.
-
-Architecture (v2 — persistent subprocess with permission bridge):
-  Claude CLI runs as a persistent subprocess with bidirectional stream-json.
-  Messages are written to stdin, events read from stdout.
-  Permission requests are bridged to the iOS app via an MCP approval server.
-
-Routes:
-  POST /send          — send message to persistent Claude subprocess
-  GET  /stream?offset=N — SSE stream from event N (reconnectable)
-  WS   /ws            — WebSocket: real-time bidirectional (native iOS app)
-  GET  /status        — current session status
-  POST /cancel        — kill active subprocess
-  POST /new-session   — clear session (start fresh conversation)
-  GET  /last-response — last completed response text
-  POST /internal/permission-request — MCP approval server long-poll
+Split into conv/ package (2026-04-12). See CLAUDE.md for module map.
 """
 
 import json
@@ -34,88 +18,15 @@ import urllib.request
 import uuid
 from datetime import datetime
 
-# Add shared_utils to path
-sys.path.insert(0, os.path.expanduser("~/code"))
-from shared_utils import env_for_claude_cli, work_dir, configure_logging
-from printer_registry import registry as _printer_registry
-
-_log = configure_logging(
-    "conversation_server",
-    log_file="/tmp/conversation_server_structured.log",
+# Shared foundation — Flask app, auth, config, session state
+from conv.app import (  # noqa: F401
+    app, sock, _log, _lock, _session, _last_response,
+    _last_response_lock, _event_condition,
+    WORK_DIR, SESSIONS_DIR, _TMP_LOG_DIR, MCP_CONFIG,
+    env_for_claude_cli, _printer_registry, AUTH_TOKEN,
+    check_auth,  # re-exported for backward compat with existing tests
 )
-
-# Auth token — imported from credentials.py (gitignored), fallback to None (no auth)
-try:
-    from credentials import AUTH_TOKEN
-except ImportError:
-    AUTH_TOKEN = None
-
-from flask import Flask, Response, jsonify, request
-from flask_sock import Sock
-
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB upload limit
-# Enable protocol-level WebSocket pings every 25s. simple-websocket's
-# internal thread handles ping/pong properly — URLSessionWebSocketTask
-# responds to pings automatically. This replaces our custom keepalive.
-app.config['SOCK_SERVER_OPTIONS'] = {'ping_interval': 25}
-sock = Sock(app)
-
-
-@app.before_request
-def check_auth():
-    """Require auth token for non-localhost/Tailscale requests."""
-    if not AUTH_TOKEN:
-        return  # No token configured, skip auth
-    # Trust localhost (MCP server, health check, etc.)
-    if request.remote_addr in ('127.0.0.1', '::1'):
-        return
-    # Trust Tailscale network (100.x.x.x) — already authenticated at network level
-    if request.remote_addr and request.remote_addr.startswith('100.'):
-        return
-    # Check Authorization header or query param
-    auth = request.headers.get('Authorization', '')
-    if auth == f'Bearer {AUTH_TOKEN}':
-        return
-    if request.args.get('token') == AUTH_TOKEN:
-        return
-    return jsonify({"error": "Unauthorized"}), 401
-
-# ── Config ──
-WORK_DIR = work_dir()
-# Session events stored persistently in project dir (not /tmp)
-SESSIONS_DIR = os.path.join(os.path.expanduser("~/.claude/projects/-Users-timtrailor-code"), "phone_sessions")
-_TMP_LOG_DIR = "/tmp/claude_sessions"  # Server logs only
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-os.makedirs(_TMP_LOG_DIR, exist_ok=True)
-
-MCP_CONFIG = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                          "mcp-approval.json")
-
-# ── Session state (single active conversation) ──
-_lock = threading.Lock()
-_session = {
-    "id": None,            # Current turn UUID (changes per message)
-    "claude_sid": None,    # Claude conversation session ID
-    "proc": None,          # subprocess.Popen (persistent)
-    "stdin_pipe": None,    # stdin of persistent subprocess
-    "pid": None,           # PID (survives proc object loss)
-    "events_file": None,   # Current turn's events (JSONL, one per line)
-    "event_count": 0,      # Number of events written for current turn
-    "status": "idle",      # idle | running | completed | error
-    "started": None,
-    "last_activity": None,
-    "reader_running": False,  # Is the reader thread active?
-    "generation": 0,       # Incremented on each subprocess spawn; prevents stale reader cleanup
-}
-
-# Last completed response for recovery
-_last_response = {"text": "", "cost": "", "session_id": None, "seq": 0}
-_last_response_lock = threading.Lock()
-
-# Condition variable — signalled every time _append_event writes a line.
-# WebSocket handlers wait on this instead of polling with sleep.
-_event_condition = threading.Condition()
+from flask import Response, jsonify, request
 
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
@@ -5382,6 +5293,46 @@ def _tmux_target_for_label(label: str) -> str:
     return label
 
 
+def _detect_pending_approval(jsonl_path: str) -> dict:
+    """Check if the Claude session is waiting for tool-use approval by
+    reading the JSONL tail. If the most recent message record (assistant
+    or user) is an assistant with stop_reason='tool_use', the session is
+    blocked on a permission prompt. Returns {"pending": True, "tool_name":
+    "Edit"} or {"pending": False}. Deterministic — no pane text parsing."""
+    import json as _json
+    try:
+        size = os.path.getsize(jsonl_path)
+        to_read = min(size, 64 * 1024)
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - to_read))
+            blob = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {"pending": False}
+    for line in reversed(blob.strip().split("\n")):
+        if not line.strip():
+            continue
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            continue
+        t = obj.get("type")
+        if t not in ("assistant", "user"):
+            continue
+        if t == "assistant":
+            msg = obj.get("message") or {}
+            if msg.get("stop_reason") == "tool_use":
+                tool_name = "Tool"
+                for part in (msg.get("content") or []):
+                    if isinstance(part, dict) and part.get("type") == "tool_use":
+                        tool_name = part.get("name") or "Tool"
+                        break
+                return {"pending": True, "tool_name": tool_name}
+            return {"pending": False}
+        elif t == "user":
+            return {"pending": False}
+    return {"pending": False}
+
+
 def _attach_prompt_options(content_state: dict, session_label: str) -> None:
     """Populate content_state["options"] and ["serverBaseURL"] so the Live
     Activity widget can render PromptChoiceIntent buttons. Only thinking
@@ -5515,7 +5466,7 @@ def prompt_choice():
     try:
         _sp.run(
             ["/opt/homebrew/bin/tmux", "send-keys", "-t", target,
-             str(number), "Enter"],
+             str(number)],
             check=True, timeout=5,
         )
         return jsonify({"ok": True})
@@ -6069,6 +6020,7 @@ def tmux_windows():
                         status = "working" if elapsed <= 10 else "idle"
                     except Exception:
                         pass
+                approval = _detect_pending_approval(jsonl_path) if jsonl_path else {"pending": False}
                 windows.append({
                     "index": int(parts[0]),
                     "name": parts[1],
@@ -6078,6 +6030,8 @@ def tmux_windows():
                     "summary": summary,
                     "status": status,
                     "elapsed": elapsed,
+                    "pendingApproval": approval.get("pending", False),
+                    "pendingToolName": approval.get("tool_name", ""),
                 })
         return jsonify({"windows": windows})
     except Exception as e:
@@ -6260,6 +6214,31 @@ def tmux_resize():
             if r.returncode == 0:
                 resized.append(idx)
         return jsonify({"ok": True, "cols": cols, "rows": rows, "resized": resized})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/tmux-send-key", methods=["POST"])
+def tmux_send_key():
+    """Send a single keystroke to a tmux pane. Unlike /tmux-send-text (which
+    uses paste-buffer) and /tmux-send-enter (which adds Home+End+Enter),
+    this sends a bare key via `tmux send-keys` — exactly what Claude Code's
+    single-keystroke prompt handlers (permission prompts + session feedback
+    survey) expect. No paste wrapping, no Enter."""
+    import subprocess as _sp
+    data = request.get_json() or {}
+    window = data.get("window", 1)
+    key = str(data.get("key", ""))
+    session = data.get("session", "mobile")
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
+    target = f"{session}:{window}"
+    try:
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "send-keys", "-t", target, key],
+            check=True, timeout=5,
+        )
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
