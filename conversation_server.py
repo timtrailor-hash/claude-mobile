@@ -2002,6 +2002,8 @@ def _push_liveactivity(token, *, event, content_state,
     # This is NOT the widget extension bundle ID.
     result = _sp.run([
         "curl", "-s", "--http2",
+        "--connect-timeout", "5",
+        "--max-time", "12",
         "-H", f"authorization: bearer {jwt_token}",
         "-H", f"apns-topic: {_LIVEACTIVITY_TOPIC}",
         "-H", "apns-push-type: liveactivity",
@@ -2022,11 +2024,21 @@ def _push_liveactivity(token, *, event, content_state,
 
     if status_code == "200":
         _log.info("LiveActivity push ok (event=%s token=%s...)", event, token[:8])
+        try:
+            now_ts = _time.time()
+            with _liveactivity_lock:
+                for _aid, rec in _liveactivity_tokens.items():
+                    if rec.get("token") == token:
+                        rec["last_update"] = now_ts
+        except Exception as exc:
+            _log.warning("Failed to bump last_update: %s", exc)
     elif status_code == "410":
         _log.info("LiveActivity token %s... invalid — removing", token[:8])
         with _liveactivity_lock:
             _liveactivity_start_tokens.discard(token)
-            stale_aids = [aid for aid, rec in _liveactivity_tokens.items()
+            # list() snapshot — never iterate a dict while popping from it,
+            # even under a lock. Pattern 3 (silent failure) hardening.
+            stale_aids = [aid for aid, rec in list(_liveactivity_tokens.items())
                           if rec.get("token") == token]
             for aid in stale_aids:
                 _liveactivity_tokens.pop(aid, None)
@@ -2037,16 +2049,229 @@ def _push_liveactivity(token, *, event, content_state,
     return status_code, response_body
 
 
+# Activities older than this are assumed dead on the device (iOS may have
+# dismissed them but APNs still accepts updates to the stale token). Pruning
+# them forces the `_liveactivity_on_turn_start` flow to fall through to
+# push-to-start, creating a fresh activity that iOS will actually render.
+_LIVEACTIVITY_MAX_AGE_SEC = 600  # 10 minutes
+
+
+_LIVEACTIVITY_TURN_STATE_MAX_AGE_SEC = 2 * 60 * 60  # 2 hours
+
+
+def _prune_stale_turn_state():
+    """Drop _liveactivity_turn_state entries whose started_at is older
+    than 2h. Called from _liveactivity_active_tokens so we don't need a
+    separate sweeper thread."""
+    now = time.time()
+    stale = []
+    with _liveactivity_turn_state_lock:
+        for label, rec in list(_liveactivity_turn_state.items()):
+            started = rec.get("started_at") or 0
+            if started and (now - started) > _LIVEACTIVITY_TURN_STATE_MAX_AGE_SEC:
+                # Cancel any pending dismiss timer so the GC doesn't leak it.
+                timer = rec.get("dismiss_timer")
+                if timer is not None:
+                    try:
+                        timer.cancel()
+                    except Exception:
+                        pass
+                stale.append(label)
+        for label in stale:
+            _liveactivity_turn_state.pop(label, None)
+    if stale:
+        _log.info("Pruned %d stale LA turn_state record(s)", len(stale))
+
+
 def _liveactivity_active_tokens(session_label):
-    """Return list of (activity_id, token) for activities matching the label."""
+    """Return (activity_id, token) pairs for activities matching the label
+    whose last_update is within _LIVEACTIVITY_MAX_AGE_SEC. Stale records
+    are pruned inline so the next call can trigger push-to-start.
+    Also opportunistically prunes _liveactivity_turn_state."""
+    _prune_stale_turn_state()
     out = []
+    now = time.time()
+    stale = []
     with _liveactivity_lock:
-        for aid, rec in _liveactivity_tokens.items():
+        for aid, rec in list(_liveactivity_tokens.items()):
             attrs = rec.get("attributes") or {}
             tok = rec.get("token")
-            if tok and attrs.get("sessionLabel") == session_label:
-                out.append((aid, tok))
+            if not tok:
+                stale.append(aid)
+                continue
+            if attrs.get("sessionLabel") != session_label:
+                continue
+            last_update = rec.get("last_update", 0) or 0
+            if now - last_update > _LIVEACTIVITY_MAX_AGE_SEC:
+                stale.append(aid)
+                continue
+            out.append((aid, tok))
+        if stale:
+            for aid in stale:
+                _liveactivity_tokens.pop(aid, None)
+            try:
+                _save_liveactivity_state()
+                _log.info("Pruned %d stale LiveActivity record(s): %s",
+                          len(stale), ", ".join(stale))
+            except Exception as exc:
+                _log.warning("Failed to persist pruned LA state: %s", exc)
     return out
+
+
+# Swift Date uses 2001-01-01 00:00:00 UTC as its reference. JSONEncoder's
+# default strategy emits a Double of TimeIntervalSinceReferenceDate, so we
+# must subtract the Unix-to-Swift epoch delta before sending to iOS.
+_SWIFT_EPOCH_DELTA = 978307200.0
+
+
+def _swift_date(unix_ts: float) -> float:
+    return float(unix_ts) - _SWIFT_EPOCH_DELTA
+
+
+def _latest_user_prompt_for_session(session_label: str) -> str:
+    """Return the active Claude session's headline for a tmux session_label.
+
+    Uses the same ps/lsof/JSONL pipeline as the tab-summary lookup.
+    Falls back to empty string if nothing is running or no match is found.
+    """
+    import subprocess as _sp
+    try:
+        tmux_target = _tmux_target_for_label(session_label)
+        disp = _sp.run(
+            ["/opt/homebrew/bin/tmux", "display-message", "-p",
+             "-t", tmux_target, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if disp.returncode != 0:
+            return ""
+        raw = (disp.stdout or "").strip()
+        if not raw:
+            return ""
+        pane_pid = int(raw)
+        jsonl = _find_claude_session_file(pane_pid)
+        if not jsonl:
+            return ""
+        return _extract_session_summary(jsonl)
+    except Exception:
+        return ""
+
+
+_mobile_watcher_state = {}   # {pane_pid: last_user_uuid}
+_mobile_watcher_started = False
+_mobile_watcher_lock = threading.Lock()
+
+
+def _latest_real_user_uuid(jsonl_path: str) -> tuple[str, str]:
+    """Return (uuid, text) of the newest non-tool-result user message in the
+    tail of a Claude session JSONL, or ("", "") if none is found."""
+    import os as _os
+    import json as _json
+    try:
+        size = _os.path.getsize(jsonl_path)
+        to_read = min(size, 64 * 1024)
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - to_read))
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return "", ""
+    for line in reversed(tail.strip().split("\n")):
+        if not line.strip():
+            continue
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "user":
+            continue
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        txt = ""
+        if isinstance(content, str):
+            txt = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt = part.get("text") or ""
+                    break
+        cleaned = _clean_user_text(txt)
+        if cleaned and len(cleaned) >= 3 and not cleaned.startswith("<"):
+            uuid = obj.get("uuid") or obj.get("promptId") or ""
+            return uuid, cleaned
+    return "", ""
+
+
+def _mobile_session_watcher_loop():
+    """Tail every mobile-session Claude JSONL and fire a Live Activity
+    turn-start whenever a new real user message appears. This replaces the
+    need for the iOS app to explicitly call /watch-tmux — any tab spawned in
+    the mobile tmux session is implicitly app-owned, and the watcher makes
+    the Dynamic Island track activity that originates outside the app too
+    (e.g. messages typed directly at the Mac Mini or via mosh)."""
+    import subprocess as _sp
+    _log.info("mobile watcher: starting loop")
+    while True:
+        try:
+            r = _sp.run(
+                ["/opt/homebrew/bin/tmux", "list-panes", "-s", "-t", "mobile",
+                 "-F", "#{pane_pid}\t#{window_index}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode != 0:
+                time.sleep(5)
+                continue
+            live_pids = set()
+            for raw in r.stdout.strip().split("\n"):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                parts = raw.split("\t")
+                try:
+                    pane_pid = int(parts[0])
+                    window_idx = int(parts[1]) if len(parts) > 1 else 0
+                except ValueError:
+                    continue
+                live_pids.add(pane_pid)
+                jsonl = _find_claude_session_file(pane_pid)
+                if not jsonl:
+                    continue
+                uuid, _txt = _latest_real_user_uuid(jsonl)
+                if not uuid:
+                    continue
+                prior = _mobile_watcher_state.get(pane_pid)
+                if prior is None:
+                    _mobile_watcher_state[pane_pid] = uuid
+                    continue
+                if uuid != prior:
+                    _mobile_watcher_state[pane_pid] = uuid
+                    la_label = f"mobile-{window_idx}"
+                    _log.info("mobile watcher: new user message in pane %s (tab %s) uuid=%s — firing LA turn_start on %s",
+                              pane_pid, window_idx, uuid[:8], la_label)
+                    try:
+                        threading.Thread(
+                            target=_liveactivity_on_turn_start,
+                            kwargs={"session_label": la_label},
+                            daemon=True,
+                        ).start()
+                    except Exception as exc:
+                        _log.warning("mobile watcher: turn_start spawn failed: %s", exc)
+            # GC: drop state for panes that have been closed.
+            for pid in list(_mobile_watcher_state.keys()):
+                if pid not in live_pids:
+                    _mobile_watcher_state.pop(pid, None)
+        except Exception as exc:
+            _log.warning("mobile watcher loop error: %s", exc)
+        time.sleep(5)
+
+
+def _start_mobile_session_watcher():
+    global _mobile_watcher_started
+    with _mobile_watcher_lock:
+        if _mobile_watcher_started:
+            return
+        _mobile_watcher_started = True
+    threading.Thread(target=_mobile_session_watcher_loop,
+                     daemon=True,
+                     name="mobile-session-watcher").start()
 
 
 def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
@@ -2057,6 +2282,70 @@ def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
     dismiss window cannot be killed mid-flight by a stale timer.
     """
     started_at = time.time()
+    # If caller passed the default placeholder, try to resolve a real label
+    # from the active Claude session JSONL. Falls back cleanly if no session
+    # is running in the pane yet.
+    if headline in ("", "Working…", "Working..."):
+        import subprocess as _sp
+        headline = "Working…"
+        try:
+            tmux_target = _tmux_target_for_label(session_label)
+            disp = _sp.run(
+                ["/opt/homebrew/bin/tmux", "display-message", "-p",
+                 "-t", tmux_target, "-F", "#{pane_pid}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if disp.returncode == 0 and disp.stdout.strip():
+                pane_pid = int(disp.stdout.strip())
+                jsonl_path = _find_claude_session_file(pane_pid)
+                if jsonl_path:
+                    theme = _thematic_title_for_session(jsonl_path)
+                    if theme:
+                        headline = theme
+        except Exception as exc:
+            _log.warning("LA thematic headline lookup failed: %s", exc)
+    # If the LLM title wasn't cached yet we just returned raw text; schedule
+    # an async follow-up that re-pushes the headline once the background
+    # generator populates the cache.
+    _LiveActivity_headline_refresh_snapshot = started_at
+    def _refresh_headline_when_ready(label=session_label,
+                                     snap_started=_LiveActivity_headline_refresh_snapshot):
+        for _ in range(6):  # up to ~30s
+            time.sleep(5)
+            resolved2 = _latest_user_prompt_for_session(label)
+            if not resolved2:
+                return
+            hkey = _prompt_hash(resolved2.strip())
+            with _summary_llm_lock:
+                rec = _summary_llm_cache.get(hkey)
+            if not rec:
+                continue
+            new_headline = rec[0]
+            with _liveactivity_turn_state_lock:
+                cur = _liveactivity_turn_state.get(label) or {}
+                if cur.get("started_at") != snap_started:
+                    return
+                cur["headline"] = new_headline
+            cs = {
+                "phase": "thinking",
+                "headline": new_headline,
+                "body": "",
+                "startedAt": _swift_date(snap_started),
+                "arcStartedAt": _swift_date(time.time()),
+                "elapsedSeconds": 0,
+            }
+            _attach_prompt_options(cs, label)
+            for _aid, tok in _liveactivity_active_tokens(label):
+                try:
+                    _push_liveactivity(tok, event="update", content_state=cs,
+                                       alert_title="Claude", alert_body=new_headline)
+                except Exception as exc:
+                    _log.warning("LiveActivity headline refresh push failed: %s", exc)
+            return
+    try:
+        threading.Thread(target=_refresh_headline_when_ready, daemon=True).start()
+    except Exception as exc:
+        _log.warning("LiveActivity headline refresh scheduling failed: %s", exc)
     with _liveactivity_turn_state_lock:
         prior = _liveactivity_turn_state.get(session_label) or {}
         prior_timer = prior.get("dismiss_timer")
@@ -2073,13 +2362,17 @@ def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
             "dismiss_timer": None,
             "generation": new_gen,
         }
+    _start_la_arc_refresher()
+    _la_arc_last_reset[session_label] = started_at
     content_state = {
         "phase": "thinking",
         "headline": headline,
         "body": "",
-        "startedAt": started_at,
+        "startedAt": _swift_date(started_at),
+        "arcStartedAt": _swift_date(time.time()),
         "elapsedSeconds": 0,
     }
+    _attach_prompt_options(content_state, session_label)
     active = _liveactivity_active_tokens(session_label)
     if active:
         for _aid, tok in active:
@@ -2090,10 +2383,12 @@ def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
                 _log.error("LiveActivity update (turn_start) error: %s",
                            exc, exc_info=True)
         return
-    # No live activity yet — try push-to-start.
+    # No live activity yet — try push-to-start using ONLY the most recent
+    # start token so we don't spawn duplicate activities on every turn.
     with _liveactivity_lock:
         tokens = list(_liveactivity_start_tokens)
-    for tok in tokens:
+    if tokens:
+        tok = tokens[-1]
         try:
             _push_liveactivity(
                 tok, event="start",
@@ -2126,14 +2421,20 @@ def _liveactivity_on_turn_complete(session_label, body_text):
         "phase": "finished",
         "headline": headline,
         "body": summary,
-        "startedAt": started_at,
+        "startedAt": _swift_date(started_at),
+        "arcStartedAt": _swift_date(time.time()),
         "elapsedSeconds": elapsed,
     }
+    _attach_prompt_options(content_state, session_label)
     active = _liveactivity_active_tokens(session_label)
     if not active:
-        _log.debug("No Live Activity tokens for session %s — skipping finished push",
-                   session_label)
+        _log.warning("turn_complete(%s): no active Live Activity tokens — "
+                     "phase=finished push skipped. Island will not flip to "
+                     "Done; most likely the iOS app didn't register an "
+                     "update token after push-to-start.",
+                     session_label)
         return
+    _la_arc_last_reset.pop(session_label, None)
     for _aid, tok in active:
         try:
             _push_liveactivity(tok, event="update", content_state=content_state,
@@ -2148,10 +2449,14 @@ def _liveactivity_on_turn_complete(session_label, body_text):
                    gen=captured_gen, label=session_label):
         with _liveactivity_turn_state_lock:
             current = int((_liveactivity_turn_state.get(label) or {}).get("generation", 0))
-        if current != gen:
-            _log.info("LiveActivity dismiss-timer generation mismatch "
-                      "(captured=%s current=%s) — skipping", gen, current)
-            return
+            if current != gen:
+                _log.info("LiveActivity dismiss-timer generation mismatch "
+                          "(captured=%s current=%s) — skipping", gen, current)
+                return
+            # Clear our slot so the record doesn't leak a stale Timer ref.
+            rec = _liveactivity_turn_state.get(label) or {}
+            if rec.get("dismiss_timer") is not None:
+                rec["dismiss_timer"] = None
         dismiss_at = int(time.time())
         for _a, t in tokens_snapshot:
             try:
@@ -2159,25 +2464,52 @@ def _liveactivity_on_turn_complete(session_label, body_text):
                                    dismissal_date=dismiss_at)
             except Exception as exc:
                 _log.error("LiveActivity end error: %s", exc, exc_info=True)
-    timer = threading.Timer(600.0, _end_later)
+    timer = threading.Timer(3.0, _end_later)
     timer.daemon = True
+    # Atomic write under lock with generation check — prevents the
+    # following race: _on_turn_complete (gen=N) writes its timer into
+    # the slot AFTER a concurrent _on_turn_start has bumped the slot to
+    # gen=N+1, leaving an N-generation timer attached to the N+1 record.
+    # The timer's _end_later closure would still bail correctly via the
+    # captured-gen check, but the slot would hold a stale reference and
+    # the next _on_turn_start's prior_timer.cancel() would cancel the
+    # wrong timer.
+    started = False
     with _liveactivity_turn_state_lock:
         rec = _liveactivity_turn_state.setdefault(session_label, {})
-        rec["dismiss_timer"] = timer
-    timer.start()
+        if int(rec.get("generation", 0)) == captured_gen:
+            rec["dismiss_timer"] = timer
+            started = True
+        else:
+            _log.info("LiveActivity turn_complete: generation moved on "
+                      "(captured=%s current=%s) — not arming dismiss timer",
+                      captured_gen, rec.get("generation"))
+    if started:
+        timer.start()
 
 
 def _liveactivity_on_turn_error(session_label, error_text):
-    """Push an error-phase update and schedule a short auto-dismiss."""
+    """Push an error-phase update and schedule a short auto-dismiss.
+
+    Bumps the generation counter on entry, symmetric with _on_turn_start,
+    so that two errors fired in sequence (e.g. retry that also errors)
+    each get a distinct generation and stale timers from the prior error
+    cannot end the new error's activity.
+    """
     with _liveactivity_turn_state_lock:
-        state = dict(_liveactivity_turn_state.get(session_label) or {})
-        prior_timer = state.get("dismiss_timer")
+        prior = _liveactivity_turn_state.get(session_label) or {}
+        prior_timer = prior.get("dismiss_timer")
         if prior_timer is not None:
             try:
                 prior_timer.cancel()
             except Exception as exc:
                 _log.error("Failed to cancel prior LiveActivity timer: %s",
                            exc, exc_info=True)
+        new_gen = int(prior.get("generation", 0)) + 1
+        prior["generation"] = new_gen
+        prior["dismiss_timer"] = None
+        _liveactivity_turn_state[session_label] = prior
+        state = dict(prior)
     started_at = state.get("started_at")
     if started_at is None:
         _log.warning("LiveActivity turn_error: no started_at for session %s",
@@ -2189,7 +2521,7 @@ def _liveactivity_on_turn_error(session_label, error_text):
         "phase": "error",
         "headline": msg[:60],
         "body": msg,
-        "startedAt": started_at,
+        "startedAt": _swift_date(started_at),
         "elapsedSeconds": elapsed,
     }
     active = _liveactivity_active_tokens(session_label)
@@ -2209,10 +2541,13 @@ def _liveactivity_on_turn_error(session_label, error_text):
                    gen=captured_gen, label=session_label):
         with _liveactivity_turn_state_lock:
             current = int((_liveactivity_turn_state.get(label) or {}).get("generation", 0))
-        if current != gen:
-            _log.info("LiveActivity dismiss-timer (error) generation mismatch "
-                      "(captured=%s current=%s) — skipping", gen, current)
-            return
+            if current != gen:
+                _log.info("LiveActivity dismiss-timer (error) generation mismatch "
+                          "(captured=%s current=%s) — skipping", gen, current)
+                return
+            rec = _liveactivity_turn_state.get(label) or {}
+            if rec.get("dismiss_timer") is not None:
+                rec["dismiss_timer"] = None
         dismiss_at = int(time.time())
         for _a, t in tokens_snapshot:
             try:
@@ -2222,10 +2557,18 @@ def _liveactivity_on_turn_error(session_label, error_text):
                 _log.error("LiveActivity end error: %s", exc, exc_info=True)
     timer = threading.Timer(30.0, _end_later)
     timer.daemon = True
+    started = False
     with _liveactivity_turn_state_lock:
         rec = _liveactivity_turn_state.setdefault(session_label, {})
-        rec["dismiss_timer"] = timer
-    timer.start()
+        if int(rec.get("generation", 0)) == captured_gen:
+            rec["dismiss_timer"] = timer
+            started = True
+        else:
+            _log.info("LiveActivity turn_error: generation moved on "
+                      "(captured=%s current=%s) — not arming dismiss timer",
+                      captured_gen, rec.get("generation"))
+    if started:
+        timer.start()
 
 
 def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
@@ -4387,7 +4730,7 @@ def register_liveactivity_start_token():
 
     Called by the iOS app's LiveActivityManager observer whenever a fresh
     push-to-start token is issued. Tokens are deduped in a set and survive
-    daemon restart via /tmp/claude_sessions/liveactivity_tokens.json.
+    daemon restart via /Users/timtrailor/code/apns_state/liveactivity_tokens.json.
     """
     data = request.get_json(silent=True) or {}
     token = (data.get("token") or "").strip()
@@ -4476,29 +4819,1265 @@ def tmux_reset():
     return jsonify({"ok": True})
 
 
+_CLAUDE_CLI_BIN = "/Users/timtrailor/.local/bin/claude"
+_summary_llm_cache: dict = {}
+_summary_llm_inflight: set = set()
+_summary_llm_lock = threading.Lock()
+
+
+def _prompt_hash(text: str) -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _generate_summary_llm(raw: str, timeout: float = 20.0) -> str:
+    """Spawn `claude -p --model haiku` to produce a 3-5 word task title.
+
+    Uses Tim's Claude subscription via OAuth (no --bare), so this does not
+    consume API credits. Returns empty string on failure so callers can
+    fall back to the raw prompt.
+    """
+    import subprocess as _sp
+    clean = raw.strip()
+    if not clean:
+        return ""
+    prompt = (
+        "Summarize this user request as a 3-5 word task title. "
+        "Output ONLY the title. No punctuation, no quotes, no prefix, no labels. "
+        "Request: " + clean[:800]
+    )
+    try:
+        result = _sp.run(
+            [_CLAUDE_CLI_BIN, "-p", "--model", "haiku", prompt],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            _log.warning("claude -p summary failed rc=%s stderr=%s",
+                         result.returncode, (result.stderr or "").strip()[:200])
+            return ""
+        lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        title = lines[0].strip("\"\'`.:;,")
+        for prefix in ("Title:", "Task:", "Summary:"):
+            if title.lower().startswith(prefix.lower()):
+                title = title[len(prefix):].strip()
+        return title[:60]
+    except _sp.TimeoutExpired:
+        _log.warning("claude -p summary timed out after %ss", timeout)
+        return ""
+    except Exception as exc:
+        _log.warning("claude -p summary error: %s", exc)
+        return ""
+
+
+_DEFAULT_SHELL_NAMES = {"zsh", "bash", "sh", "fish", "ksh", "tcsh", "dash"}
+
+_THEME_WINDOW = 10        # number of recent user prompts fed to the LLM
+_THEME_BUCKET_SIZE = 3    # regenerate thematic title every N new user messages
+
+
+def _collect_session_user_prompts(jsonl_path: str, max_bytes: int = 4 * 1024 * 1024) -> list:
+    """Return cleaned text of real user messages from a Claude session JSONL.
+    Tool_result wrappers, image-only stubs and very short junk are dropped."""
+    import os as _os
+    import json as _json
+    out = []
+    try:
+        size = _os.path.getsize(jsonl_path)
+        to_read = min(size, max_bytes)
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - to_read))
+            blob = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return out
+    for line in blob.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "user":
+            continue
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        txt = ""
+        if isinstance(content, str):
+            txt = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt = part.get("text") or ""
+                    break
+        cleaned = _clean_user_text(txt)
+        if cleaned and len(cleaned) >= 3 and not cleaned.startswith("<"):
+            out.append(cleaned[:400])
+    return out
+
+
+def _generate_thematic_title_llm(prompts_blob: str, timeout: float = 25.0) -> str:
+    """Ask Haiku for the overall theme of the last N user messages."""
+    import subprocess as _sp
+    if not prompts_blob.strip():
+        return ""
+    prompt = (
+        "The lines below are the most recent user messages from an ongoing "
+        "coding session. Generate a 3-5 word THEMATIC title describing the "
+        "overarching work being done — not the latest message, but the "
+        "overall theme across these messages. Output ONLY the title. "
+        "No punctuation, no quotes, no prefix, no label.\n\n"
+        "Messages:\n" + prompts_blob[:4000]
+    )
+    try:
+        result = _sp.run(
+            [_CLAUDE_CLI_BIN, "-p", "--model", "haiku", prompt],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            _log.warning("thematic title failed rc=%s stderr=%s",
+                         result.returncode, (result.stderr or "").strip()[:200])
+            return ""
+        lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        title = lines[0].strip("\"\'`.:;,")
+        for prefix in ("Title:", "Task:", "Summary:", "Theme:"):
+            if title.lower().startswith(prefix.lower()):
+                title = title[len(prefix):].strip()
+        return title[:60]
+    except _sp.TimeoutExpired:
+        _log.warning("thematic title timed out after %ss", timeout)
+        return ""
+    except Exception as exc:
+        _log.warning("thematic title error: %s", exc)
+        return ""
+
+
+def _thematic_title_for_session(jsonl_path: str) -> str:
+    """Return a cached thematic title derived from the last _THEME_WINDOW user
+    prompts. Regenerates only when a new bucket of _THEME_BUCKET_SIZE messages
+    arrives, so the title stays stable across normal turn-taking."""
+    import os as _os
+    all_prompts = _collect_session_user_prompts(jsonl_path)
+    if not all_prompts:
+        return ""
+    recent = all_prompts[-_THEME_WINDOW:]
+    session_id = _os.path.splitext(_os.path.basename(jsonl_path))[0]
+    bucket = len(all_prompts) // _THEME_BUCKET_SIZE
+    key = f"theme:{session_id}:{bucket}"
+
+    with _summary_llm_lock:
+        cached = _summary_llm_cache.get(key)
+        if cached:
+            return cached[0]
+        inflight = key in _summary_llm_inflight
+        if not inflight:
+            _summary_llm_inflight.add(key)
+        fallback = ""
+        for b in range(bucket - 1, -1, -1):
+            prev = _summary_llm_cache.get(f"theme:{session_id}:{b}")
+            if prev:
+                fallback = prev[0]
+                break
+
+    if inflight:
+        return fallback or recent[-1][:60]
+
+    blob = "\n".join(f"- {p}" for p in recent)
+
+    def _bg(messages: str, hash_key: str, sid: str, b: int):
+        try:
+            title = _generate_thematic_title_llm(messages)
+        finally:
+            with _summary_llm_lock:
+                _summary_llm_inflight.discard(hash_key)
+        if not title:
+            return
+        with _summary_llm_lock:
+            _summary_llm_cache[hash_key] = (title, time.time())
+            stale = [k for k in list(_summary_llm_cache.keys())
+                     if k.startswith(f"theme:{sid}:") and k != hash_key]
+            for k in stale:
+                try:
+                    if int(k.split(":")[-1]) < b:
+                        _summary_llm_cache.pop(k, None)
+                except Exception:
+                    pass
+            # Global cap across all session themes + non-thematic titles.
+            if len(_summary_llm_cache) > 256:
+                oldest = sorted(_summary_llm_cache.items(), key=lambda kv: kv[1][1])
+                for k, _ in oldest[:-256]:
+                    _summary_llm_cache.pop(k, None)
+
+    threading.Thread(target=_bg, args=(blob, key, session_id, bucket), daemon=True).start()
+    return fallback or recent[-1][:60]
+
+
+_PANE_SESSION_FILE = "/tmp/claude_sessions/pane_session_map.json"
+_pane_session_map = {}   # {pane_pid: {"session_id", "jsonl", "last_seen", "pane_id", "tmux_session"}}
+_pane_session_lock = threading.Lock()
+
+
+def _load_pane_session_map():
+    """Load persisted pane→session mapping from disk and prune dead PIDs."""
+    global _pane_session_map
+    try:
+        if not os.path.exists(_PANE_SESSION_FILE):
+            return
+        with open(_PANE_SESSION_FILE) as f:
+            raw = json.load(f)
+        # PIDs come back as strings from JSON; convert, and drop any whose
+        # process is no longer alive so a reboot / stale entries get cleaned.
+        import subprocess as _sp
+        ps = _sp.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True, timeout=3)
+        alive = set()
+        for ln in ps.stdout.split("\n"):
+            try:
+                alive.add(int(ln.strip()))
+            except ValueError:
+                pass
+        loaded = {}
+        for k, v in (raw or {}).items():
+            try:
+                pid = int(k)
+            except ValueError:
+                continue
+            if pid in alive and isinstance(v, dict) and v.get("jsonl"):
+                loaded[pid] = v
+        _pane_session_map = loaded
+        _log.info("Loaded %d pane→session mappings from %s",
+                  len(loaded), _PANE_SESSION_FILE)
+    except Exception as exc:
+        _log.warning("Failed to load pane session map: %s", exc)
+
+
+def _save_pane_session_map():
+    """Persist the map. Called under _pane_session_lock."""
+    try:
+        os.makedirs(os.path.dirname(_PANE_SESSION_FILE), exist_ok=True)
+        tmp = _PANE_SESSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(k): v for k, v in _pane_session_map.items()}, f)
+        os.replace(tmp, _PANE_SESSION_FILE)
+    except Exception as exc:
+        _log.warning("Failed to persist pane session map: %s", exc)
+
+
+def _register_pane_session(pane_pid: int, *, session_id: str, jsonl: str,
+                           pane_id: str = "", tmux_session: str = ""):
+    if not pane_pid:
+        return
+    with _pane_session_lock:
+        _pane_session_map[pane_pid] = {
+            "session_id": session_id,
+            "jsonl": jsonl,
+            "last_seen": time.time(),
+            "pane_id": pane_id,
+            "tmux_session": tmux_session,
+        }
+        _save_pane_session_map()
+
+
+def _pane_session_lookup(pane_pid: int) -> dict:
+    with _pane_session_lock:
+        return dict(_pane_session_map.get(pane_pid) or {})
+
+
+_load_pane_session_map()
+
+
+_autonomous_tasks = {}  # {task_id: {"label", "headline", "started_at", "status", "pid"}}
+_autonomous_tasks_lock = threading.Lock()
+
+
+def _autonomous_label(task_id: str) -> str:
+    return f"auto-{task_id}" if task_id else "auto"
+
+
+def _autonomous_heartbeat_loop():
+    """Every ~8 min, push a no-op update to every active autonomous LA so
+    iOS doesn't mark it stale (Apple's stale-date cap is 15 min and a
+    long-running autonomous task may go that long between real events).
+
+    Also reaps entries whose runner pid has died so the registry doesn't
+    accumulate forever on crashes or SIGKILL — picked up by the first
+    tick after the process exits."""
+    import subprocess as _sp
+    while True:
+        try:
+            # Prune dead runners before heartbeating.
+            with _autonomous_tasks_lock:
+                snapshot_ids = list(_autonomous_tasks.items())
+            alive = set()
+            try:
+                ps = _sp.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True, timeout=3)
+                for ln in ps.stdout.split("\n"):
+                    try:
+                        alive.add(int(ln.strip()))
+                    except ValueError:
+                        pass
+            except Exception:
+                alive = None  # skip pruning this tick if ps failed
+            if alive is not None:
+                with _autonomous_tasks_lock:
+                    for task_id, rec in snapshot_ids:
+                        pid = rec.get("pid")
+                        if isinstance(pid, int) and pid not in alive:
+                            _log.info("autonomous: reaping dead task %s (pid %s)",
+                                      task_id, pid)
+                            _autonomous_tasks.pop(task_id, None)
+                snapshot_ids = [(k, v) for k, v in snapshot_ids if v.get("pid") in alive or not isinstance(v.get("pid"), int)]
+
+            time.sleep(480)  # 8 minutes — do prune-before-sleep so first sleep isn't wasted
+            with _autonomous_tasks_lock:
+                snapshot = list(_autonomous_tasks.items())
+            for task_id, rec in snapshot:
+                label = rec.get("label") or _autonomous_label(task_id)
+                started_at = rec.get("started_at") or time.time()
+                content_state = {
+                    "phase": "thinking",
+                    "headline": rec.get("headline") or "Autonomous task",
+                    "body": rec.get("status") or "",
+                    "startedAt": _swift_date(started_at),
+                    "arcStartedAt": _swift_date(time.time()),
+                    "elapsedSeconds": int(time.time() - started_at),
+                }
+                _attach_prompt_options(content_state, label)
+                active = _liveactivity_active_tokens(label)
+                for _aid, tok in active:
+                    try:
+                        _push_liveactivity(tok, event="update",
+                                           content_state=content_state,
+                                           stale_date=time.time() + 15 * 60)
+                    except Exception as exc:
+                        _log.warning("autonomous heartbeat push failed: %s", exc)
+        except Exception as exc:
+            _log.warning("autonomous heartbeat loop error: %s", exc)
+
+
+_autonomous_heartbeat_started = False
+_autonomous_heartbeat_lock = threading.Lock()
+
+
+_la_arc_refresher_started = False
+_la_arc_refresher_lock = threading.Lock()
+_la_arc_last_reset = {}  # {session_label: ts of last arc reset push}
+
+
+def _la_arc_refresher_loop():
+    """Every ~10 seconds, scan _liveactivity_turn_state for activities that
+    are still in the thinking phase (no dismiss_timer armed) and push an
+    event=update with a fresh arcStartedAt if the previous one was more
+    than 55 seconds ago. This is what makes the circular arc on the
+    Dynamic Island actually loop — iOS will not fire a widget TimelineView
+    often enough in a Live Activity to re-render the ProgressView on its
+    own, so the reset has to come from a real push."""
+    while True:
+        try:
+            now = time.time()
+            with _liveactivity_turn_state_lock:
+                snapshot = [
+                    (label, dict(rec))
+                    for label, rec in _liveactivity_turn_state.items()
+                    if rec.get("dismiss_timer") is None
+                ]
+            for label, rec in snapshot:
+                last = _la_arc_last_reset.get(label, 0)
+                if now - last < 55:
+                    continue
+                started_at = rec.get("started_at") or now
+                headline = rec.get("headline") or "Working…"
+                content_state = {
+                    "phase": "thinking",
+                    "headline": headline,
+                    "body": "",
+                    "startedAt": _swift_date(started_at),
+                    "arcStartedAt": _swift_date(now),
+                    "elapsedSeconds": int(now - started_at),
+                }
+                _attach_prompt_options(content_state, label)
+                active = _liveactivity_active_tokens(label)
+                if not active:
+                    continue
+                for _aid, tok in active:
+                    try:
+                        _push_liveactivity(tok, event="update",
+                                           content_state=content_state,
+                                           stale_date=now + 15 * 60)
+                    except Exception as exc:
+                        _log.warning("arc refresher push failed for %s: %s",
+                                     label, exc)
+                _la_arc_last_reset[label] = now
+        except Exception as exc:
+            _log.warning("arc refresher loop error: %s", exc)
+        time.sleep(10)
+
+
+def _start_la_arc_refresher():
+    global _la_arc_refresher_started
+    with _la_arc_refresher_lock:
+        if _la_arc_refresher_started:
+            return
+        _la_arc_refresher_started = True
+    threading.Thread(target=_la_arc_refresher_loop,
+                     daemon=True, name="la-arc-refresher").start()
+
+
+def _start_autonomous_heartbeat():
+    global _autonomous_heartbeat_started
+    with _autonomous_heartbeat_lock:
+        if _autonomous_heartbeat_started:
+            return
+        _autonomous_heartbeat_started = True
+    threading.Thread(target=_autonomous_heartbeat_loop,
+                     daemon=True, name="autonomous-heartbeat").start()
+
+
+@app.route("/internal/autonomous-event", methods=["POST"])
+def autonomous_event():
+    """Receive lifecycle events from autonomous_runner.py and drive a
+    per-task Live Activity (sessionLabel=auto-<task_id>). The runner is a
+    detached nohup process with no iOS/tmux affinity, so this is the only
+    channel by which the Island can track it."""
+    remote = (request.remote_addr or "")
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"ok": False, "error": "localhost only"}), 403
+
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        data = {}
+    event = (data.get("event") or "").strip()
+    task_id = (data.get("task_id") or "").strip() or "anon"
+    label = _autonomous_label(task_id)
+    prompt = (data.get("prompt") or "").strip()
+    attempt = data.get("attempt")
+    max_retries = data.get("max_retries")
+    body = (data.get("body") or "").strip()
+    preview = (data.get("preview") or "").strip()
+
+    _log.info("[auto] event=%s task=%s attempt=%s/%s",
+              event, task_id, attempt, max_retries)
+
+    if event == "task_started":
+        headline_raw = prompt or "Autonomous task"
+        # Thematic title up front so the Island shows a concise label
+        # instead of the full 2 KB autonomous prompt. The generator is
+        # synchronous here but cached by prompt hash so subsequent
+        # invocations for the same task are fast.
+        headline = _generate_summary_llm(headline_raw) or headline_raw[:60]
+        started_at = time.time()
+        with _autonomous_tasks_lock:
+            _autonomous_tasks[task_id] = {
+                "label": label,
+                "headline": headline,
+                "started_at": started_at,
+                "status": "starting",
+                "pid": data.get("pid"),
+            }
+        try:
+            threading.Thread(
+                target=_liveactivity_on_turn_start,
+                kwargs={"session_label": label, "headline": headline},
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            _log.warning("[auto] turn_start spawn failed: %s", exc)
+        _start_autonomous_heartbeat()
+
+    elif event == "attempt_started":
+        with _autonomous_tasks_lock:
+            rec = _autonomous_tasks.get(task_id) or {}
+            rec["status"] = f"attempt {attempt}/{max_retries}"
+            _autonomous_tasks[task_id] = rec
+        # Push a plain update reflecting the new attempt count.
+        started_at = (rec.get("started_at") or time.time()) if rec else time.time()
+        content_state = {
+            "phase": "thinking",
+            "headline": (rec.get("headline") if rec else "") or "Autonomous task",
+            "body": f"attempt {attempt}/{max_retries}",
+            "startedAt": _swift_date(started_at),
+            "arcStartedAt": _swift_date(time.time()),
+            "elapsedSeconds": int(time.time() - started_at),
+        }
+        _attach_prompt_options(content_state, label)
+        for _aid, tok in _liveactivity_active_tokens(label):
+            try:
+                _push_liveactivity(tok, event="update",
+                                   content_state=content_state,
+                                   stale_date=time.time() + 15 * 60)
+            except Exception as exc:
+                _log.warning("[auto] attempt update failed: %s", exc)
+
+    elif event == "attempt_failed":
+        with _autonomous_tasks_lock:
+            rec = _autonomous_tasks.get(task_id) or {}
+            rec["status"] = f"retry after attempt {attempt}"
+            _autonomous_tasks[task_id] = rec
+
+    elif event == "task_completed":
+        try:
+            threading.Thread(
+                target=_liveactivity_on_turn_complete,
+                args=(label, body or "Task complete"),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            _log.warning("[auto] turn_complete spawn failed: %s", exc)
+        with _autonomous_tasks_lock:
+            _autonomous_tasks.pop(task_id, None)
+
+    elif event == "task_failed":
+        # Push phase=error, then let turn_complete's dismiss timer clear it.
+        with _autonomous_tasks_lock:
+            rec = _autonomous_tasks.get(task_id) or {}
+            started_at = rec.get("started_at") or time.time()
+            headline = rec.get("headline") or "Autonomous task"
+        content_state = {
+            "phase": "error",
+            "headline": headline,
+            "body": (body or "Task failed")[:400],
+            "startedAt": _swift_date(started_at),
+            "arcStartedAt": _swift_date(time.time()),
+            "elapsedSeconds": int(time.time() - started_at),
+        }
+        _attach_prompt_options(content_state, label)
+        for _aid, tok in _liveactivity_active_tokens(label):
+            try:
+                _push_liveactivity(tok, event="update",
+                                   content_state=content_state,
+                                   alert_title="Autonomous task failed",
+                                   alert_body=headline)
+            except Exception as exc:
+                _log.warning("[auto] error update failed: %s", exc)
+        # Schedule a dismiss in 10s so the error is visible briefly.
+        def _end_later(lbl=label):
+            time.sleep(10)
+            cs = content_state
+            for _aid, tok in _liveactivity_active_tokens(lbl):
+                try:
+                    _push_liveactivity(tok, event="end", content_state=cs,
+                                       dismissal_date=int(time.time()))
+                except Exception as exc:
+                    _log.warning("[auto] end push failed: %s", exc)
+        threading.Thread(target=_end_later, daemon=True).start()
+        with _autonomous_tasks_lock:
+            _autonomous_tasks.pop(task_id, None)
+
+    return jsonify({"ok": True, "label": label})
+
+
+_SERVER_BASE_URL_FOR_LA = "http://100.126.253.40:8081"
+
+
+def _tmux_target_for_label(label: str) -> str:
+    """Translate a Live Activity session label (e.g. "mobile-3") into a
+    tmux target string (e.g. "mobile:3"). Non-mobile labels are returned
+    unchanged so existing tmux session names still work."""
+    if label.startswith("mobile-"):
+        suffix = label[len("mobile-"):]
+        if suffix.isdigit():
+            return f"mobile:{suffix}"
+    return label
+
+
+def _attach_prompt_options(content_state: dict, session_label: str) -> None:
+    """Populate content_state["options"] and ["serverBaseURL"] so the Live
+    Activity widget can render PromptChoiceIntent buttons. Only thinking
+    phase states receive options — finished/error clear them."""
+    content_state["serverBaseURL"] = _SERVER_BASE_URL_FOR_LA
+    if content_state.get("phase") == "thinking":
+        content_state["options"] = _capture_pane_options_for_label(session_label)
+    else:
+        content_state["options"] = []
+
+
+def _is_prompt_chrome_line(raw: str) -> bool:
+    t = raw.strip()
+    if not t:
+        return True
+    if t.startswith("╭") or t.startswith("╰") or t.startswith("─"):
+        return True
+    if t.startswith("│") and t.endswith("│"):
+        inner = t[1:-1].strip()
+        return not inner
+    for hint in ("esc to interrupt", "Press up to edit",
+                 "ctrl+t to hide tasks", "shift+tab to"):
+        if hint in t:
+            return True
+    return t in ("❯", ">")
+
+
+def _parse_prompt_option_line(raw: str):
+    t = raw.strip()
+    while t and t[0] in "│❯>•·":
+        t = t[1:].strip()
+    while t and t[-1] == "│":
+        t = t[:-1].strip()
+    if "." not in t:
+        return None
+    dot = t.index(".")
+    try:
+        num = int(t[:dot])
+    except ValueError:
+        return None
+    if not (1 <= num <= 9):
+        return None
+    rest = t[dot + 1:].strip()
+    if not rest:
+        return None
+    if len(rest) > 40:
+        rest = rest[:37] + "…"
+    return (num, rest)
+
+
+def _detect_pane_prompt_options(pane_text: str):
+    """Mirror of the iOS detectPromptOptions. Returns the active prompt's
+    numbered options as [{number, label}, ...] or [] if no active prompt."""
+    if not pane_text:
+        return []
+    lines = pane_text.split("\n")
+    tail = lines[-25:]
+    last_opt_idx = None
+    for i in range(len(tail) - 1, -1, -1):
+        raw = tail[i]
+        if _parse_prompt_option_line(raw) is not None:
+            last_opt_idx = i
+            break
+        if not _is_prompt_chrome_line(raw):
+            return []
+    if last_opt_idx is None:
+        return []
+    start_idx = last_opt_idx
+    while start_idx > 0 and _parse_prompt_option_line(tail[start_idx - 1]) is not None:
+        start_idx -= 1
+    collected = []
+    for i in range(start_idx, last_opt_idx + 1):
+        parsed = _parse_prompt_option_line(tail[i])
+        if parsed is None:
+            return []
+        collected.append(parsed)
+    if len(collected) < 2:
+        return []
+    for idx, (num, _) in enumerate(collected):
+        if num != idx + 1:
+            return []
+    return [{"number": n, "label": lbl} for n, lbl in collected]
+
+
+def _capture_pane_options_for_label(session_label: str):
+    """Capture the current pane for a mobile-<N> label and run the option
+    detector. Returns [] for any non-mobile label or capture failure."""
+    target = _tmux_target_for_label(session_label)
+    if ":" not in target:
+        return []
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["/opt/homebrew/bin/tmux", "capture-pane", "-p",
+             "-t", target, "-S", "-40"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0:
+            return []
+        return _detect_pane_prompt_options(r.stdout)
+    except Exception as exc:
+        _log.warning("capture-pane for %s failed: %s", session_label, exc)
+        return []
+
+
+@app.route("/internal/prompt-choice", methods=["POST"])
+def prompt_choice():
+    """Receive a numbered-choice tap from the Live Activity's
+    PromptChoiceIntent and forward it to the right tmux pane. No
+    localhost restriction — widget runs on the phone via Tailscale."""
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        data = {}
+    session_label = (data.get("session_label") or "").strip()
+    number = data.get("number")
+    if not session_label or number is None:
+        return jsonify({"ok": False, "error": "session_label and number required"}), 400
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "number must be int"}), 400
+    if not (1 <= number <= 9):
+        return jsonify({"ok": False, "error": "number out of range"}), 400
+    target = _tmux_target_for_label(session_label)
+    if ":" not in target:
+        return jsonify({"ok": False, "error": "non-mobile label"}), 400
+    _log.info("[prompt-choice] label=%s target=%s number=%s",
+              session_label, target, number)
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "send-keys", "-t", target,
+             str(number), "Enter"],
+            check=True, timeout=5,
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _end_live_activity_for_label(session_label: str, reason: str = "") -> int:
+    """End every Live Activity matching session_label. Pushes an event=end
+    APNs message with dismissal_date=now, drops the token records from
+    memory + disk, cancels any pending dismiss timer, and also clears the
+    label from _la_arc_last_reset so the arc refresher stops pushing to it.
+    Returns the number of activities ended."""
+    now = int(time.time())
+    ended_count = 0
+    tokens_to_end = []
+    with _liveactivity_lock:
+        for aid, rec in list(_liveactivity_tokens.items()):
+            attrs = rec.get("attributes") or {}
+            tok = rec.get("token")
+            if not tok:
+                continue
+            if attrs.get("sessionLabel") != session_label:
+                continue
+            tokens_to_end.append((aid, tok))
+    if not tokens_to_end:
+        return 0
+    end_content_state = {
+        "phase": "finished",
+        "headline": "",
+        "body": "",
+        "startedAt": _swift_date(time.time()),
+        "arcStartedAt": _swift_date(time.time()),
+        "elapsedSeconds": 0,
+        "options": [],
+        "serverBaseURL": _SERVER_BASE_URL_FOR_LA,
+    }
+    for aid, tok in tokens_to_end:
+        try:
+            _push_liveactivity(tok, event="end",
+                               content_state=end_content_state,
+                               dismissal_date=now)
+            ended_count += 1
+        except Exception as exc:
+            _log.warning("end push failed for %s: %s", aid, exc)
+    with _liveactivity_lock:
+        for aid, _tok in tokens_to_end:
+            _liveactivity_tokens.pop(aid, None)
+        try:
+            _save_liveactivity_state()
+        except Exception as exc:
+            _log.warning("Failed to persist LA state after end: %s", exc)
+    with _liveactivity_turn_state_lock:
+        rec = _liveactivity_turn_state.pop(session_label, None)
+        if rec and rec.get("dismiss_timer") is not None:
+            try:
+                rec["dismiss_timer"].cancel()
+            except Exception:
+                pass
+    _la_arc_last_reset.pop(session_label, None)
+    _log.info("Ended %d Live Activity record(s) for %s (%s)",
+              ended_count, session_label, reason or "manual")
+    return ended_count
+
+
+@app.route("/debug/la-end-all", methods=["POST"])
+def la_end_all():
+    """Force-end every registered Live Activity, regardless of label.
+    Use to clean up stale activities that piled up before the
+    close-on-tab-kill wiring. Localhost-only."""
+    remote = (request.remote_addr or "")
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"ok": False, "error": "localhost only"}), 403
+    labels = set()
+    with _liveactivity_lock:
+        for rec in _liveactivity_tokens.values():
+            lbl = (rec.get("attributes") or {}).get("sessionLabel")
+            if lbl:
+                labels.add(lbl)
+    total = 0
+    for lbl in labels:
+        total += _end_live_activity_for_label(lbl, reason="debug la-end-all")
+    return jsonify({"ok": True, "ended": total, "labels": sorted(labels)})
+
+
+@app.route("/internal/claude-hook", methods=["POST"])
+def claude_hook():
+    """Receive UserPromptSubmit / Stop notifications from Claude Code hooks.
+
+    Each call carries the session id, transcript path, tmux pane metadata
+    and the hook event name. We record the mapping so tab-summary and
+    Live Activity code can resolve pane_pid → jsonl deterministically
+    without relying on lsof (Claude Code opens/closes the file per write
+    and doesn't keep an fd we can see). UserPromptSubmit fires a fresh
+    Live Activity turn_start. Stop fires turn_complete.
+    """
+    # Security: only accept localhost hits since Claude Code runs on the Mac Mini.
+    remote = (request.remote_addr or "")
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        _log.warning("[hook] rejected from remote=%s", remote)
+        return jsonify({"ok": False, "error": "localhost only"}), 403
+
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        data = {}
+    event = (data.get("event") or "").strip()
+    session_id = (data.get("session_id") or "").strip()
+    transcript = (data.get("transcript_path") or "").strip()
+    pane_pid_raw = (data.get("pane_pid") or "").strip()
+    pane_id = (data.get("pane_id") or "").strip()
+    tmux_session = (data.get("tmux_session") or "").strip()
+
+    try:
+        pane_pid = int(pane_pid_raw) if pane_pid_raw else 0
+    except ValueError:
+        pane_pid = 0
+
+    _log.info("[hook] event=%s session=%s pane_pid=%s pane_id=%s tmux=%s "
+              "transcript=%s",
+              event, session_id[:8] if session_id else "-",
+              pane_pid or "-", pane_id or "-", tmux_session or "-",
+              transcript or "-")
+
+    if pane_pid and transcript:
+        # Reject transcripts that aren't inside Claude Code's projects dir —
+        # a local caller shouldn't be able to pin the map to an arbitrary
+        # filesystem path we'll later read.
+        claude_projects_root = os.path.expanduser("~/.claude/projects/")
+        try:
+            real = os.path.realpath(transcript)
+        except Exception:
+            real = ""
+        if real and real.startswith(claude_projects_root) and real.endswith(".jsonl"):
+            _register_pane_session(
+                pane_pid,
+                session_id=session_id,
+                jsonl=real,
+                pane_id=pane_id,
+                tmux_session=tmux_session,
+            )
+        else:
+            _log.warning("[hook] rejected transcript path outside projects dir: %s",
+                         transcript[:200])
+
+    # Only the mobile tmux session is wired to the Live Activity flow for now.
+    if tmux_session and tmux_session != "mobile":
+        return jsonify({"ok": True, "ignored": f"non-mobile session {tmux_session}"})
+
+    # Build the per-tab LA label. Falls back to the tmux-session-wide
+    # "mobile" label if we don't know the window index (shouldn't happen
+    # under the hook path but keeps things robust).
+    window_idx_raw = (data.get("window_index") or "").strip()
+    try:
+        window_idx = int(window_idx_raw) if window_idx_raw else None
+    except ValueError:
+        window_idx = None
+    la_label = f"mobile-{window_idx}" if window_idx is not None else "mobile"
+
+    if event == "UserPromptSubmit":
+        try:
+            threading.Thread(
+                target=_liveactivity_on_turn_start,
+                kwargs={"session_label": la_label},
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            _log.warning("[hook] turn_start spawn failed: %s", exc)
+    elif event == "Stop":
+        # Extract the final assistant text from the transcript tail so the
+        # banner notification and the Live Activity body have real content.
+        body_text = ""
+        try:
+            if transcript and os.path.exists(transcript):
+                import json as _json
+                size = os.path.getsize(transcript)
+                to_read = min(size, 256 * 1024)
+                with open(transcript, "rb") as f:
+                    f.seek(max(0, size - to_read))
+                    tail = f.read().decode("utf-8", errors="replace")
+                for line in reversed(tail.strip().split("\n")):
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = _json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "assistant":
+                        continue
+                    msg = obj.get("message") or {}
+                    if (msg.get("stop_reason") or "") in ("tool_use", ""):
+                        continue
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                body_text = (part.get("text") or "").strip()
+                                break
+                    elif isinstance(content, str):
+                        body_text = content.strip()
+                    if body_text:
+                        break
+        except Exception as exc:
+            _log.warning("[hook] body extract failed: %s", exc)
+        body_text = (body_text or "Done")[:400]
+        try:
+            threading.Thread(
+                target=_liveactivity_on_turn_complete,
+                args=(la_label, body_text),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            _log.warning("[hook] turn_complete spawn failed: %s", exc)
+
+    return jsonify({"ok": True})
+
+
+_tmux_summary_cache = {}  # {pane_pid: (jsonl_path, jsonl_mtime, summary)}
+
+
+def _find_claude_session_file(pane_pid: int) -> str | None:
+    """Resolve the active Claude session JSONL for a tmux pane.
+
+    Fast path: consult `_pane_session_map`, which is populated by the
+    Claude Code `UserPromptSubmit`/`Stop` hooks — hooks give us the
+    transcript path directly and are the only reliable source because
+    Claude Code opens/closes the JSONL per write and leaves nothing
+    visible via lsof between turns.
+
+    Slow path: walk descendants for a `claude` process and try lsof on
+    it — used when no hook has fired yet for the pane (e.g. the first
+    poll right after tab creation)."""
+    import subprocess as _sp
+    import os as _os
+    import glob as _glob
+    rec = _pane_session_lookup(pane_pid)
+    jsonl = rec.get("jsonl") if rec else ""
+    if jsonl and _os.path.exists(jsonl):
+        return jsonl
+    try:
+        ps = _sp.run(["ps", "-ax", "-o", "pid=,ppid=,comm="],
+                     capture_output=True, text=True, timeout=3)
+        if ps.returncode != 0:
+            return None
+        children: dict[int, list[int]] = {}
+        comms: dict[int, str] = {}
+        for line in ps.stdout.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            toks = line.split(None, 2)
+            if len(toks) < 3:
+                continue
+            try:
+                pid_i, ppid_i = int(toks[0]), int(toks[1])
+            except ValueError:
+                continue
+            comms[pid_i] = toks[2]
+            children.setdefault(ppid_i, []).append(pid_i)
+
+        # BFS for a claude process under pane_pid
+        stack = list(children.get(pane_pid, []))
+        claude_pid = None
+        seen: set[int] = set()
+        while stack:
+            pid_i = stack.pop(0)
+            if pid_i in seen:
+                continue
+            seen.add(pid_i)
+            base = _os.path.basename(comms.get(pid_i, ""))
+            if base == "claude":
+                claude_pid = pid_i
+                break
+            stack.extend(children.get(pid_i, []))
+        if claude_pid is None:
+            return None
+
+        # Find the session UUID via lsof
+        lsof = _sp.run(["lsof", "-p", str(claude_pid)],
+                       capture_output=True, text=True, timeout=3)
+        uuid = None
+        for line in lsof.stdout.split("\n"):
+            if "/.claude/tasks/" in line:
+                path = line.split()[-1]
+                # /Users/.../.claude/tasks/<uuid>
+                uuid = _os.path.basename(path.rstrip("/"))
+                if re.fullmatch(r"[0-9a-f-]{30,40}", uuid):
+                    break
+                uuid = None
+        if uuid:
+            matches = _glob.glob(_os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+            if matches:
+                return matches[0]
+
+        # Fallback: no task-dir UUID visible via lsof. Use claude's CWD to
+        # compute the project slug, then pick the most-recently-modified
+        # jsonl whose birth time is after the claude process start time.
+        try:
+            cwd_run = _sp.run(["lsof", "-a", "-p", str(claude_pid), "-d", "cwd", "-Fn"],
+                              capture_output=True, text=True, timeout=3)
+            cwd = ""
+            for line in cwd_run.stdout.split("\n"):
+                if line.startswith("n/"):
+                    cwd = line[1:]
+                    break
+            if not cwd:
+                return None
+            slug = cwd.replace("/", "-").replace(" ", "-")
+            project_dir = _os.path.expanduser(f"~/.claude/projects/{slug}")
+            if not _os.path.isdir(project_dir):
+                return None
+            # Use etime (elapsed seconds since start) — locale-independent
+            # and unambiguous. Format: [[DD-]HH:]MM:SS.
+            import time as _time
+            start_run = _sp.run(["ps", "-o", "etime=", "-p", str(claude_pid)],
+                                capture_output=True, text=True, timeout=3)
+            claude_start_ts = 0
+            try:
+                raw = (start_run.stdout or "").strip()
+                if raw:
+                    days = 0
+                    if "-" in raw:
+                        d, raw = raw.split("-", 1)
+                        days = int(d)
+                    hms = raw.split(":")
+                    if len(hms) == 3:
+                        secs = int(hms[0]) * 3600 + int(hms[1]) * 60 + int(hms[2])
+                    elif len(hms) == 2:
+                        secs = int(hms[0]) * 60 + int(hms[1])
+                    else:
+                        secs = int(hms[0])
+                    secs += days * 86400
+                    claude_start_ts = _time.time() - secs
+            except Exception:
+                claude_start_ts = 0
+            # Pick the jsonl whose birth time is EARLIEST after claude start.
+            # Rationale: the primary session jsonl is created the moment the
+            # user's first prompt lands. Subprocess jsonls (e.g. autonomous
+            # runner spawning `claude -p`) are necessarily born later, so
+            # the earliest-birth one post-start is our session of interest.
+            # Falls back to most-recent-mtime if no birth info is usable.
+            best = None
+            best_birth = None
+            best_mtime_fallback = None
+            best_mtime = 0
+            for fn in _os.listdir(project_dir):
+                if not fn.endswith(".jsonl"):
+                    continue
+                path = _os.path.join(project_dir, fn)
+                try:
+                    st = _os.stat(path)
+                except OSError:
+                    continue
+                if claude_start_ts and st.st_birthtime < claude_start_ts - 60:
+                    continue
+                if best_birth is None or st.st_birthtime < best_birth:
+                    best = path
+                    best_birth = st.st_birthtime
+                if st.st_mtime > best_mtime:
+                    best_mtime_fallback = path
+                    best_mtime = st.st_mtime
+            return best or best_mtime_fallback
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+_IMG_MARKER_RE = re.compile(r"\[Image[^]]*\]")
+
+
+def _clean_user_text(txt: str) -> str:
+    """Strip Claude Code image markers and whitespace from a user message."""
+    if not txt:
+        return ""
+    return _IMG_MARKER_RE.sub("", txt).strip()
+
+
+def _extract_session_summary(jsonl_path: str) -> str:
+    """Read the tail of a claude session JSONL and return a short summary.
+    Prefers customTitle > lastPrompt > latest user text (image markers stripped)."""
+    import os as _os
+    import json as _json
+    try:
+        size = _os.path.getsize(jsonl_path)
+        # Read a generous tail so we reach older last-prompt / custom-title
+        # records that Claude Code only emits occasionally.
+        to_read = min(size, 2 * 1024 * 1024)
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - to_read))
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = tail.strip().split("\n")
+        custom_title = None
+        last_prompt = None
+        last_user = None
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                obj = _json.loads(line)
+            except Exception:
+                continue
+            t = obj.get("type")
+            if t == "custom-title" and custom_title is None:
+                custom_title = (obj.get("customTitle") or "").strip()
+                if custom_title:
+                    break  # highest-priority match
+            elif t == "last-prompt" and last_prompt is None:
+                last_prompt = _clean_user_text(obj.get("lastPrompt") or "")
+            elif t == "user" and last_user is None:
+                msg = obj.get("message") or {}
+                content = msg.get("content")
+                if isinstance(content, str):
+                    candidate = _clean_user_text(content)
+                elif isinstance(content, list):
+                    candidate = ""
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            candidate = _clean_user_text(part.get("text") or "")
+                            if candidate:
+                                break
+                else:
+                    candidate = ""
+                # Only accept substantive user text; skip empties, tool_result
+                # wrappers, and image-only attachment stubs.
+                if candidate and len(candidate) >= 3 and not candidate.startswith("<"):
+                    last_user = candidate
+        return (custom_title or last_prompt or last_user or "").strip()
+    except Exception:
+        return ""
+
+
+def _summary_for_window(pane_pid: int) -> str:
+    """Cached lookup of the active claude session summary for a tmux pane."""
+    import os as _os
+    try:
+        jsonl_path = _find_claude_session_file(pane_pid)
+        if not jsonl_path:
+            return ""
+        mtime = _os.path.getmtime(jsonl_path)
+        cached = _tmux_summary_cache.get(pane_pid)
+        if cached and cached[0] == jsonl_path and cached[1] == mtime:
+            return cached[2]
+        summary = _extract_session_summary(jsonl_path)
+        _tmux_summary_cache[pane_pid] = (jsonl_path, mtime, summary)
+        return summary
+    except Exception:
+        return ""
+
+
+@app.route("/la-diag", methods=["POST"])
+def la_diag():
+    """Receive a one-line diagnostic message from the iOS LiveActivityManager.
+    Each line is logged with a [LA-ios] prefix so the server log has the
+    same visibility into Activity/token state that Xcode would show."""
+    try:
+        data = request.get_json(silent=True) or {}
+        msg = (data.get("msg") or "").strip()[:500]
+        sid = (data.get("session") or "").strip()[:40]
+        if not msg:
+            return jsonify({"ok": False, "error": "msg required"}), 400
+        _log.info("[LA-ios] session=%s %s", sid or "-", msg)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/debug/la-state")
+def la_state_debug():
+    """Dump current Live Activity state + recent push history for ad-hoc
+    debugging. Localhost-only to avoid leaking token prefixes + session
+    labels over Tailscale / LAN."""
+    remote = (request.remote_addr or "")
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"error": "localhost only"}), 403
+    import os as _os
+    try:
+        with _liveactivity_lock:
+            tokens_snapshot = {
+                aid: {
+                    "sessionLabel": (rec.get("attributes") or {}).get("sessionLabel"),
+                    "token_prefix": (rec.get("token") or "")[:16],
+                    "last_update": rec.get("last_update"),
+                    "age_sec": int(time.time() - (rec.get("last_update") or 0)),
+                }
+                for aid, rec in _liveactivity_tokens.items()
+            }
+            start_tokens = {
+                bundle: [t[:16] for t in toks]
+                for bundle, toks in _liveactivity_start_tokens_by_bundle().items()
+            } if callable(globals().get("_liveactivity_start_tokens_by_bundle")) else {
+                "com.timtrailor.terminal": [t[:16] for t in _liveactivity_start_tokens]
+            }
+        with _liveactivity_turn_state_lock:
+            turn_state = {
+                k: {kk: vv for kk, vv in v.items() if kk != "dismiss_timer"}
+                for k, v in _liveactivity_turn_state.items()
+            }
+        return jsonify({
+            "now": int(time.time()),
+            "now_swift": _swift_date(time.time()),
+            "active_tokens": tokens_snapshot,
+            "start_tokens": start_tokens,
+            "turn_state": turn_state,
+            "watcher_state": {str(k): v for k, v in _mobile_watcher_state.items()},
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/tmux-windows")
 def tmux_windows():
     """List tmux windows for the tab bar in the Terminal iOS app."""
     import subprocess as _sp
+    import os as _os
     try:
         result = _sp.run(
-            ["tmux", "list-windows", "-F", "#{window_index}	#{window_name}	#{window_active}	#{pane_current_command}	#{b:pane_current_path}"],
+            ["tmux", "list-windows", "-F",
+             "#{window_index}	#{window_name}	#{window_active}	#{pane_current_command}	#{b:pane_current_path}	#{pane_pid}"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return jsonify({"windows": [], "error": result.stderr.strip()})
         windows = []
+        now = time.time()
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
             parts = line.split("\t")
             if len(parts) >= 3:
+                pane_pid = 0
+                if len(parts) > 5:
+                    try:
+                        pane_pid = int(parts[5])
+                    except ValueError:
+                        pane_pid = 0
+                window_name = parts[1]
+                jsonl_path = _find_claude_session_file(pane_pid) if pane_pid else None
+                if window_name and window_name.strip() and window_name.strip().lower() not in _DEFAULT_SHELL_NAMES:
+                    summary = window_name.strip()
+                elif jsonl_path:
+                    summary = _thematic_title_for_session(jsonl_path)
+                else:
+                    summary = ""
+                elapsed = -1
+                status = ""
+                if jsonl_path:
+                    try:
+                        mtime = _os.path.getmtime(jsonl_path)
+                        elapsed = max(0, int(now - mtime))
+                        status = "working" if elapsed <= 10 else "idle"
+                    except Exception:
+                        pass
                 windows.append({
                     "index": int(parts[0]),
                     "name": parts[1],
                     "active": parts[2] == "1",
                     "command": parts[3] if len(parts) > 3 else "",
                     "cwd": parts[4] if len(parts) > 4 else "",
+                    "summary": summary,
+                    "status": status,
+                    "elapsed": elapsed,
                 })
         return jsonify({"windows": windows})
     except Exception as e:
@@ -4508,25 +6087,72 @@ def tmux_windows():
 
 @app.route("/tmux-new-window", methods=["POST"])
 def tmux_new_window():
-    """Create a new tmux window."""
+    """Create a new tmux window and return its (1-based) index so the iOS
+    client can update its active-tab pointer in the same network round-trip
+    instead of racing polling → user-type → wrong-tab-routing."""
     import subprocess as _sp
     _ensure_tmux_session()
     try:
         result = _sp.run(
-            ["/opt/homebrew/bin/tmux", "new-window", "-t", "mobile"],
+            ["/opt/homebrew/bin/tmux", "new-window", "-P",
+             "-F", "#{window_index}", "-t", "mobile"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
             return jsonify({"ok": False, "error": result.stderr.strip()})
-        return jsonify({"ok": True})
+        try:
+            new_index = int((result.stdout or "").strip())
+        except ValueError:
+            new_index = 0
+        return jsonify({"ok": True, "index": new_index})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 
+@app.route("/tmux-rename-window", methods=["POST"])
+def tmux_rename_window():
+    """Rename a tmux window in the mobile session. Body: {index:int, name:str}."""
+    import subprocess as _sp
+    _ensure_tmux_session()
+    data = request.get_json() or {}
+    index = data.get("index")
+    name = (data.get("name") or "").strip()
+    if index is None or not name:
+        return jsonify({"ok": False, "error": "index and name required"}), 400
+    # Keep names short enough to display and strip shell-ish characters.
+    safe_name = "".join(c for c in name if c.isalnum() or c in " _-.").strip()
+    if not safe_name:
+        return jsonify({"ok": False, "error": "name empty after sanitise"}), 400
+    safe_name = safe_name[:40]
+    try:
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "set-window-option",
+             "-t", f"mobile:{int(index)}", "automatic-rename", "off"],
+            capture_output=True, text=True, timeout=5,
+        )
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "set-window-option",
+             "-t", f"mobile:{int(index)}", "allow-rename", "off"],
+            capture_output=True, text=True, timeout=5,
+        )
+        result = _sp.run(
+            ["/opt/homebrew/bin/tmux", "rename-window",
+             "-t", f"mobile:{int(index)}", safe_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "error": result.stderr.strip()}), 500
+        return jsonify({"ok": True, "name": safe_name})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/tmux-kill-window", methods=["POST"])
 def tmux_kill_window():
-    """Close a tmux window by index."""
+    """Close a tmux window by index. Also ends any Live Activities that
+    were scoped to that tab's session label so the lock-screen / Dynamic
+    Island card disappears at the same moment the tab does."""
     import subprocess as _sp
     _ensure_tmux_session()
     data = request.get_json() or {}
@@ -4540,7 +6166,16 @@ def tmux_kill_window():
         )
         if result.returncode != 0:
             return jsonify({"ok": False, "error": result.stderr.strip()})
-        return jsonify({"ok": True})
+        # Best-effort: end the corresponding LA. Failures don't block the
+        # kill itself — we've already killed the tmux window successfully.
+        try:
+            ended = _end_live_activity_for_label(
+                f"mobile-{int(index)}", reason="tab closed"
+            )
+        except Exception as exc:
+            _log.warning("end-on-tab-kill failed for %s: %s", index, exc)
+            ended = 0
+        return jsonify({"ok": True, "la_ended": ended})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4657,16 +6292,38 @@ def tmux_send_text():
 
 @app.route("/tmux-send-enter", methods=["POST"])
 def tmux_send_enter():
-    """Send Enter key to a tmux window."""
+    """Send Enter key to a tmux window.
+
+    A preceding `/tmux-send-text` call uses tmux `paste-buffer`, which
+    injects bracketed-paste escape sequences (ESC[200~ … ESC[201~) into the
+    pane. Claude Code's TUI needs a handful of milliseconds to finish
+    parsing those markers into its `[Pasted text #N]` placeholder before
+    it will treat a subsequent Enter as "submit". If the Enter arrives
+    mid-parse the TUI either swallows it as a newline inside the paste or
+    drops it — the paste sits in the input box forever and the turn never
+    starts.
+
+    Three hardeners:
+      1. Small sleep so the paste finishes first.
+      2. Send `Home` then `End` before Enter — cursor-only movement that
+         forces Claude Code to exit any lingering paste-edit state.
+      3. Then the actual Enter.
+    """
     import subprocess as _sp
+    import time as _time
     data = request.get_json() or {}
     window = data.get("window", 1)
     session = data.get("session", "mobile")
     target = f"{session}:{window}"
     try:
+        _time.sleep(0.12)
+        _sp.run(
+            ["/opt/homebrew/bin/tmux", "send-keys", "-t", target, "Home", "End"],
+            check=True, timeout=5,
+        )
         _sp.run(
             ["/opt/homebrew/bin/tmux", "send-keys", "-t", target, "Enter"],
-            check=True, timeout=5
+            check=True, timeout=5,
         )
         return jsonify({"ok": True})
     except Exception as e:
@@ -4739,35 +6396,170 @@ def _extract_claude_preview(content):
     return "Response complete"
 
 
-def _watch_tmux_worker(session, stabilise_secs=5, timeout_secs=600):
-    """Background thread: poll tmux pane, push-notify when output stabilises."""
-    import subprocess, hashlib
-    last_hash = None
-    last_change_time = None
+_TERMINAL_STOP_REASONS = frozenset({"end_turn", "max_tokens", "stop_sequence"})
+
+
+def _resolve_session_jsonl(session_label: str):
+    """Best-effort JSONL lookup for a tmux session label. Preferred path:
+    hook-registered pane→session map keyed by the active pane_pid of the
+    tmux session. Fallback: walk the active pane and use
+    _find_claude_session_file. Returns (jsonl_path, pane_pid) or (None, 0)."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["/opt/homebrew/bin/tmux", "display-message", "-p",
+             "-t", session_label, "-F", "#{pane_pid}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None, 0
+        pane_pid = int(r.stdout.strip())
+    except Exception:
+        return None, 0
+    rec = _pane_session_lookup(pane_pid)
+    jsonl = (rec or {}).get("jsonl") or ""
+    if jsonl and os.path.exists(jsonl):
+        return jsonl, pane_pid
+    fallback = _find_claude_session_file(pane_pid)
+    return (fallback, pane_pid) if fallback else (None, pane_pid)
+
+
+def _scan_assistant_tail(jsonl_path: str):
+    """Read the tail of a Claude Code JSONL and return a list of
+    (uuid, stop_reason, text) for every assistant message found. Newest
+    last. `text` is the first text content part, or '' for tool_use-only
+    turns."""
+    import json as _json
+    out = []
+    try:
+        size = os.path.getsize(jsonl_path)
+        to_read = min(size, 512 * 1024)
+        with open(jsonl_path, "rb") as f:
+            f.seek(max(0, size - to_read))
+            blob = f.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        _log.warning("jsonl tail read failed for %s: %s", jsonl_path, exc)
+        return out
+    for line in blob.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message") or {}
+        stop_reason = msg.get("stop_reason") or ""
+        uuid = obj.get("uuid") or msg.get("id") or ""
+        text = ""
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = (part.get("text") or "").strip()
+                    if text:
+                        break
+        elif isinstance(content, str):
+            text = content.strip()
+        out.append((uuid, stop_reason, text))
+    return out
+
+
+def _watch_tmux_worker(session, timeout_secs=600):
+    """Tail the session's Claude JSONL and push-notify on real turn end.
+
+    Replaces the old hash-stabilise worker which fired false positives on
+    long Claude pauses. A turn is "done" when a new assistant record
+    appears with stop_reason in {end_turn, max_tokens, stop_sequence}.
+    tool_use terminates mid-turn so we ignore it.
+
+    Falls back to doing nothing (single 'expired' log) if the JSONL for
+    the session cannot be resolved — the Stop hook still drives Live
+    Activity completion via /internal/claude-hook, so this worker is the
+    backup path for the banner push, not the primary signal.
+    """
     start = time.time()
     _tmux_watcher_cancel.clear()
-    _log.info("Tmux watcher started for session '%s'", session)
+    _log.info("Tmux watcher (JSONL) started for session '%s'", session)
 
+    jsonl_path = None
+    pane_pid = 0
+    # Give the session a beat to materialise its JSONL file before we
+    # snapshot the baseline — new sessions create the file after the
+    # first user prompt lands.
+    for _ in range(5):
+        if _tmux_watcher_cancel.is_set():
+            return
+        jsonl_path, pane_pid = _resolve_session_jsonl(session)
+        if jsonl_path:
+            break
+        _tmux_watcher_cancel.wait(1)
+
+    if not jsonl_path:
+        _log.warning("Tmux watcher: could not resolve JSONL for session %s — "
+                     "no banner push will fire; Stop hook still covers LA state.",
+                     session)
+        return
+
+    # Baseline: the newest assistant uuid at watch-start (may be empty for
+    # a brand-new session). We fire only when a NEW assistant uuid appears
+    # after this point with a terminal stop_reason.
+    baseline_uuid = ""
+    try:
+        records = _scan_assistant_tail(jsonl_path)
+        if records:
+            baseline_uuid = records[-1][0]
+    except Exception:
+        pass
+
+    _log.info("Tmux watcher: baseline uuid=%s jsonl=%s",
+              baseline_uuid[:8] if baseline_uuid else "-",
+              os.path.basename(jsonl_path))
+
+    last_mtime = 0.0
     while not _tmux_watcher_cancel.is_set() and (time.time() - start) < timeout_secs:
         try:
-            result = subprocess.run(
-                ["/opt/homebrew/bin/tmux", "capture-pane", "-p", "-S", "-200", "-t", session],
-                capture_output=True, text=True, timeout=5
-            )
-            content = result.stdout.strip()
-            h = hashlib.md5(content.encode()).hexdigest()
+            try:
+                mtime = os.path.getmtime(jsonl_path)
+            except OSError:
+                mtime = 0
+            if mtime == last_mtime:
+                _tmux_watcher_cancel.wait(2)
+                continue
+            last_mtime = mtime
 
-            if h != last_hash:
-                last_hash = h
-                last_change_time = time.time()
-            elif last_change_time and (time.time() - last_change_time) >= stabilise_secs:
-                body = _summarise_for_push(content) or _extract_claude_preview(content)
+            records = _scan_assistant_tail(jsonl_path)
+            if not records:
+                _tmux_watcher_cancel.wait(2)
+                continue
+
+            # Walk backwards to find the newest assistant record with a
+            # terminal stop reason AND a uuid we haven't seen before.
+            fired = False
+            for uuid, stop_reason, text in reversed(records):
+                if uuid == baseline_uuid:
+                    break
+                if stop_reason not in _TERMINAL_STOP_REASONS:
+                    continue
+                body = text.strip() or "Task complete"
+                if len(body) > 400:
+                    body = body[:397].rstrip() + "…"
+                baseline_uuid = uuid
                 _send_push_notification("Claude finished", body)
-                _log.info("Tmux watcher: output stabilised, push sent: %s", body[:60])
+                try:
+                    _liveactivity_on_turn_complete(session, body)
+                except Exception as exc:
+                    _log.error("LiveActivity turn-complete (tmux watcher) failed: %s",
+                               exc, exc_info=True)
+                _log.info("Tmux watcher: stop_reason=%s uuid=%s push sent: %s",
+                          stop_reason, uuid[:8], body[:60])
+                fired = True
+                break
+            if fired:
                 return
         except Exception as exc:
-            _log.warning("Tmux watcher error: %s", exc)
-
+            _log.error("Tmux watcher iteration error: %s", exc, exc_info=True)
         _tmux_watcher_cancel.wait(2)
 
     _log.info("Tmux watcher expired for session '%s'", session)
@@ -4787,6 +6579,20 @@ def watch_tmux():
     _tmux_watcher_cancel.set()
     import time as _time
     _time.sleep(0.1)
+
+    # Kick off a Live Activity thinking-phase push (or push-to-start).
+    # The LA label may be more specific than the tmux session (e.g.
+    # "mobile-2" for tab 2) so each tab owns its own Activity.
+    la_label = data.get("label") or session
+    try:
+        threading.Thread(
+            target=_liveactivity_on_turn_start,
+            kwargs={"session_label": la_label, "headline": "Working…"},
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        _log.error("LiveActivity turn-start (watch-tmux) failed: %s",
+                   exc, exc_info=True)
 
     t = threading.Thread(target=_watch_tmux_worker, args=(session,), daemon=True)
     t.start()
@@ -5382,5 +7188,8 @@ if __name__ == "__main__":
     work_t = threading.Thread(target=_work_cache_thread, daemon=True, name="work-cache")
     work_t.start()
     _log.info("Work cache thread started (60s refresh)")
+
+    _start_mobile_session_watcher()
+    _log.info("Mobile session watcher thread started")
 
     app.run(host="0.0.0.0", port=8081, threaded=True)
