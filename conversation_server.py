@@ -2482,39 +2482,54 @@ def _liveactivity_on_turn_error(session_label, error_text):
         timer.start()
 
 
-def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal"):
+def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal",
+                            window_index=None, content_available=False):
     """Send APNs push to a specific app via curl (HTTP/2 + JWT).
 
     bundle_id: which app to push to. Must have a registered device token.
         com.timtrailor.terminal     — Terminal app
         com.timtrailor.claudecontrol — ClaudeControl
         com.timtrailor.printerpilot  — PrinterPilot
+    window_index: optional tmux window index — injected as top-level "window"
+        so the iOS client can deep-link to the right tab on tap.
+    content_available: if True, send a silent background push (no alert, no
+        sound) that wakes the app to pre-fetch fresh pane content.
     """
     with _apns_device_tokens_lock:
         token = _apns_device_tokens.get(bundle_id)
     if not token:
         _log.debug("No APNs token for %s — skipping push", bundle_id)
         return
-    _log.info("APNs: sending push to %s (token=%s...)", bundle_id, token[:8])
+    kind = "silent" if content_available else "alert"
+    _log.info("APNs: sending %s push to %s (token=%s... win=%s)",
+              kind, bundle_id, token[:8], window_index)
     try:
         import subprocess
 
         jwt_token = _apns_jwt()
 
-        payload = json.dumps({
-            "aps": {
+        if content_available:
+            aps = {"content-available": 1}
+        else:
+            aps = {
                 "alert": {"title": title, "body": body},
                 "sound": "default",
             }
-        })
+        payload_obj = {"aps": aps}
+        if window_index is not None:
+            payload_obj["window"] = int(window_index)
+        payload = json.dumps(payload_obj)
 
         url = f"{_APNS_HOST}/3/device/{token}"
 
+        push_type = "background" if content_available else "alert"
+        priority = "5" if content_available else "10"
         result = subprocess.run([
             "curl", "-s", "--http2",
             "-H", f"authorization: bearer {jwt_token}",
             "-H", f"apns-topic: {bundle_id}",
-            "-H", "apns-push-type: alert",
+            "-H", f"apns-push-type: {push_type}",
+            "-H", f"apns-priority: {priority}",
             "-d", payload,
             "-w", "\n%{http_code}",
             url,
@@ -6445,7 +6460,7 @@ def _scan_assistant_tail(jsonl_path: str):
     return out
 
 
-def _watch_tmux_worker(session, timeout_secs=600):
+def _watch_tmux_worker(session, timeout_secs=600, window_index=None):
     """Tail the session's Claude JSONL and push-notify on real turn end.
 
     Replaces the old hash-stabilise worker which fired false positives on
@@ -6525,7 +6540,15 @@ def _watch_tmux_worker(session, timeout_secs=600):
                 if len(body) > 400:
                     body = body[:397].rstrip() + "…"
                 baseline_uuid = uuid
-                _send_push_notification("Claude finished", body)
+                _send_push_notification("Claude finished", body,
+                                       window_index=window_index)
+                # Silent mirror so the app (if backgrounded) wakes and
+                # pre-fetches the fresh pane before the user taps.
+                if window_index is not None:
+                    _send_push_notification(
+                        "", "", window_index=window_index,
+                        content_available=True,
+                    )
                 try:
                     _liveactivity_on_turn_complete(session, body)
                 except Exception as exc:
@@ -6573,7 +6596,24 @@ def watch_tmux():
         _log.error("LiveActivity turn-start (watch-tmux) failed: %s",
                    exc, exc_info=True)
 
-    t = threading.Thread(target=_watch_tmux_worker, args=(session,), daemon=True)
+    # Parse window index from label (e.g. "mobile-2" → 2) for deep-linkable
+    # pushes. Label is iOS-owned so it reliably tracks the tab the user sent
+    # the message from; the bare `session` is tmux-level and lacks that.
+    window_index = None
+    import re as _re
+    m = _re.search(r"(\d+)$", la_label or "")
+    if m:
+        try:
+            window_index = int(m.group(1))
+        except ValueError:
+            window_index = None
+
+    t = threading.Thread(
+        target=_watch_tmux_worker,
+        args=(session,),
+        kwargs={"window_index": window_index},
+        daemon=True,
+    )
     t.start()
     return jsonify({"ok": True, "status": "watching"})
 
