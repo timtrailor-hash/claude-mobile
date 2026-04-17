@@ -6058,9 +6058,24 @@ def tmux_windows():
 def tmux_new_window():
     """Create a new tmux window and return its (1-based) index so the iOS
     client can update its active-tab pointer in the same network round-trip
-    instead of racing polling → user-type → wrong-tab-routing."""
+    instead of racing polling → user-type → wrong-tab-routing.
+
+    Optional body: {cols:int, rows:int} — create the window at the
+    client's viewport size so the shell renders its first prompt at the
+    right dimensions. Without this, tmux new-window inherits the default
+    80x24, the client sends a resize afterward, zsh redraws its prompt
+    on SIGWINCH, and the redraw leaves the old prompt in scrollback
+    (one extra prompt per resize). Reading scrollback later shows
+    duplicated prompt lines."""
     import subprocess as _sp
+    import time as _time
     _ensure_tmux_session()
+    data = request.get_json(silent=True) or {}
+    try:
+        cols = int(data.get("cols", 0))
+        rows = int(data.get("rows", 0))
+    except (TypeError, ValueError):
+        cols, rows = 0, 0
     try:
         result = _sp.run(
             ["/opt/homebrew/bin/tmux", "new-window", "-P",
@@ -6073,6 +6088,27 @@ def tmux_new_window():
             new_index = int((result.stdout or "").strip())
         except ValueError:
             new_index = 0
+        # If the client told us its viewport size, resize the window and
+        # then clear-history. zsh redraws its prompt on SIGWINCH and
+        # leaves the pre-resize prompt in scrollback; without clearing
+        # the pane shows duplicate prompt lines ("% " stacked). A fresh
+        # window has no real history worth preserving, so wiping is
+        # safe here.
+        if 20 <= cols <= 500 and 5 <= rows <= 500 and new_index > 0:
+            target = f"mobile:{new_index}"
+            _sp.run(
+                ["/opt/homebrew/bin/tmux", "resize-window", "-t", target,
+                 "-x", str(cols), "-y", str(rows)],
+                check=False, timeout=5,
+            )
+            # Give zsh a beat to finish its SIGWINCH redraw before we
+            # wipe scrollback, otherwise the pre-resize prompt is still
+            # on the visible screen (not in scrollback yet) and survives.
+            _time.sleep(0.12)
+            _sp.run(
+                ["/opt/homebrew/bin/tmux", "clear-history", "-t", target],
+                check=False, timeout=5,
+            )
         return jsonify({"ok": True, "index": new_index})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
