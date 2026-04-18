@@ -14,7 +14,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CONTROLPLANE_READ_TOKEN }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "NOTE: CONTROLPLANE_READ_TOKEN not set; falling back to embedded baseline"
+            echo "NOTE: CONTROLPLANE_READ_TOKEN not set; using embedded baseline"
             if [ ! -f .conv_server_baseline ]; then
               echo "FAIL: no baseline available (neither remote nor local)"
               exit 1
@@ -38,3 +38,13 @@ jobs:
             exit 1
           fi
           echo "OK: ratchet green ($LINES <= $BASELINE)"
+
+      - name: Alert on main failure
+        if: failure() && github.ref == 'refs/heads/main'
+        run: |
+          curl -sS -X POST \
+            -H "Title: CI RED on main (claude-mobile / ratchet)" \
+            -H "Priority: 5" \
+            -H "Tags: rotating_light,warning" \
+            -d "ratchet.yml failed on push to main. Commit ${GITHUB_SHA::7}. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            https://ntfy.sh/timtrailor-claude
