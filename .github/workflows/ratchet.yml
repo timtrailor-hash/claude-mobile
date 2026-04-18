@@ -1,0 +1,40 @@
+name: ratchet
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  monolith-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch baseline from control plane
+        env:
+          GH_TOKEN: ${{ secrets.CONTROLPLANE_READ_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "NOTE: CONTROLPLANE_READ_TOKEN not set; falling back to embedded baseline"
+            if [ ! -f .conv_server_baseline ]; then
+              echo "FAIL: no baseline available (neither remote nor local)"
+              exit 1
+            fi
+          else
+            curl -s -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/timtrailor-hash/tim-claude-controlplane/contents/.conv_server_baseline" \
+              -o .conv_server_baseline
+          fi
+      - name: Enforce ratchet
+        run: |
+          BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
+          LINES=$(wc -l < conversation_server.py | tr -d '[:space:]')
+          echo "conversation_server.py = $LINES lines; baseline = $BASELINE"
+          if [ "$LINES" -gt "$BASELINE" ]; then
+            echo ""
+            echo "FAIL: conversation_server.py grew $BASELINE -> $LINES."
+            echo "Phase 3 decomposition requires the monolith to only shrink."
+            echo "Extract lines into conv/*.py or justify and bump the baseline."
+            exit 1
+          fi
+          echo "OK: ratchet green ($LINES <= $BASELINE)"
