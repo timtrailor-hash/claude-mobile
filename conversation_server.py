@@ -5493,6 +5493,20 @@ def _end_live_activity_for_label(session_label: str, reason: str = "") -> int:
     return ended_count
 
 
+# Background thread: reap Live Activities whose turn state has gone
+# stale or whose tokens outlived their turn state. Started exactly
+# once per server process.
+from conv.la_reaper import start_la_reaper as _start_la_reaper  # noqa: E402
+_start_la_reaper(
+    tokens_lock=_liveactivity_lock,
+    tokens_dict=_liveactivity_tokens,
+    turn_state_lock=_liveactivity_turn_state_lock,
+    turn_state=_liveactivity_turn_state,
+    end_fn=_end_live_activity_for_label,
+    logger=_log,
+)
+
+
 @app.route("/debug/la-end-all", methods=["POST"])
 def la_end_all():
     """Force-end every registered Live Activity, regardless of label.
