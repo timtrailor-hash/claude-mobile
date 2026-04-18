@@ -6597,8 +6597,18 @@ def _watch_tmux_worker(session, timeout_secs=600, window_index=None):
                         "", "", window_index=window_index,
                         content_available=True,
                     )
+                # Use the per-window label so it matches what turn_start
+                # registered (`mobile-<idx>`). Without this, turn_complete
+                # arrives with the tmux SESSION name ("mobile") and never
+                # matches the per-tab turn_state, so the LA is never
+                # flipped to phase=finished. That's why the Dynamic Island
+                # stays "working" indefinitely after a tab finishes.
+                la_label_tc = (
+                    f"{session}-{window_index}"
+                    if window_index is not None else session
+                )
                 try:
-                    _liveactivity_on_turn_complete(session, body)
+                    _liveactivity_on_turn_complete(la_label_tc, body)
                 except Exception as exc:
                     _log.error("LiveActivity turn-complete (tmux watcher) failed: %s",
                                exc, exc_info=True)
