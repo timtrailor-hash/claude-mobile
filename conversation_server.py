@@ -27,6 +27,8 @@ from conv.app import (  # noqa: F401
     check_auth,  # re-exported for backward compat with existing tests
 )
 from flask import Response, jsonify, request
+from conv.alert_responder import bp as _alert_responder_bp  # noqa: E402
+app.register_blueprint(_alert_responder_bp)
 
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
