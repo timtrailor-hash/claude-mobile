@@ -1849,23 +1849,9 @@ _liveactivity_turn_state_lock = threading.Lock()
 _APNS_HOST = "https://api.sandbox.push.apple.com"
 
 
-def _apns_jwt():
-    """Build a short-lived APNs JWT using credentials.py settings.
-
-    Shared by both the alert-push and Live Activity code paths. Raises on
-    any config error — callers must not swallow it.
-    """
-    import jwt as _jwt
-    import time as _time
-    from credentials import APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID
-    with open(APNS_KEY_PATH) as _f:
-        key = _f.read()
-    return _jwt.encode(
-        {"iss": APNS_TEAM_ID, "iat": int(_time.time())},
-        key,
-        algorithm="ES256",
-        headers={"kid": APNS_KEY_ID},
-    )
+# APNs JWT extracted 2026-04-18 — Phase 3 decomposition step 1.
+# Original implementation lived here; now in conv/apns.py.
+from conv.apns import apns_jwt as _apns_jwt  # noqa: F401,E402
 
 
 def _push_liveactivity(token, *, event, content_state,
