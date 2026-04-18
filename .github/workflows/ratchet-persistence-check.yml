@@ -1,0 +1,50 @@
+name: ratchet-persistence-check
+# Fires hourly. Sends a ntfy alert ONLY if the last `ratchet` run on main
+# is (a) a failure AND (b) has been in that state for more than 1 hour.
+# This is the "allow transient/in-flight issues to self-resolve, but
+# surface persistent red state" policy Tim set on 2026-04-18:
+# "systems can wait an hour or so to see things released or not before
+# alerting."
+on:
+  schedule:
+    - cron: '15 * * * *'  # hourly at :15
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Check last main ratchet run age
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow=ratchet.yml --branch=main --limit=1 \
+            --json conclusion,updatedAt,databaseId,headSha)
+          CONCLUSION=$(echo "$LATEST" | jq -r '.[0].conclusion // "none"')
+          UPDATED=$(echo "$LATEST" | jq -r '.[0].updatedAt // ""')
+          RUN_ID=$(echo "$LATEST" | jq -r '.[0].databaseId // ""')
+          SHA=$(echo "$LATEST" | jq -r '.[0].headSha // ""')
+          echo "latest main ratchet: conclusion=$CONCLUSION updated=$UPDATED"
+          if [ "$CONCLUSION" != "failure" ]; then
+            echo "Not in failure state — no alert."
+            exit 0
+          fi
+          NOW=$(date -u +%s)
+          # BSD vs GNU date — GitHub runners are Ubuntu, so this works
+          UPDATED_TS=$(date -u -d "$UPDATED" +%s)
+          AGE=$(( NOW - UPDATED_TS ))
+          echo "red for ${AGE}s"
+          if [ "$AGE" -gt 3600 ]; then
+            curl -sS -X POST \
+              -H "Title: Persistent CI RED (claude-mobile / ratchet) - ${AGE}s" \
+              -H "Priority: 5" \
+              -H "Tags: rotating_light,warning" \
+              -d "ratchet.yml has been failing on main for ${AGE}s. Commit ${SHA:0:7}. Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
+              https://ntfy.sh/timtrailor-claude
+            echo "alert sent"
+          else
+            echo "Red but <1h — letting it self-resolve."
+          fi
