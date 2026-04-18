@@ -5334,9 +5334,8 @@ def _detect_pending_approval(jsonl_path: str) -> dict:
 
 
 def _attach_prompt_options(content_state: dict, session_label: str) -> None:
-    """Populate content_state["options"] and ["serverBaseURL"] so the Live
-    Activity widget can render PromptChoiceIntent buttons. Only thinking
-    phase states receive options — finished/error clear them."""
+    """Populate content_state["options"]. Transition logging handled inside
+    _capture_pane_options_for_label (conv.pane_logger)."""
     content_state["serverBaseURL"] = _SERVER_BASE_URL_FOR_LA
     if content_state.get("phase") == "thinking":
         content_state["options"] = _capture_pane_options_for_label(session_label)
@@ -5345,21 +5344,25 @@ def _attach_prompt_options(content_state: dict, session_label: str) -> None:
 
 
 # Pane-text parsers extracted 2026-04-18 to conv/pane_parser.py (Phase 3 step 3).
-# Public names preserved so `_capture_pane_options_for_label` below and
-# any test mirror continue to work without change.
+# Transition logging extracted to conv/pane_logger.py (2026-04-18 late).
 from conv.pane_parser import (  # noqa: E402
     is_prompt_chrome_line as _is_prompt_chrome_line,
     is_working_indicator as _is_working_indicator,
     parse_prompt_option_line as _parse_prompt_option_line,
     detect_pane_prompt_options as _detect_pane_prompt_options,
 )
+from conv.pane_logger import (  # noqa: E402
+    detect_with_reason as _detect_with_reason,
+    record_and_log as _log_la_transition,
+)
 
 
 def _capture_pane_options_for_label(session_label: str):
-    """Capture the current pane for a mobile-<N> label and run the option
-    detector. Returns [] for any non-mobile label or capture failure."""
+    """Capture current pane for a mobile-<N> label, run detector, log the
+    transition. Returns just the options list (legacy callers unchanged)."""
     target = _tmux_target_for_label(session_label)
     if ":" not in target:
+        _log_la_transition(session_label, [], "non-mobile-label", f"target={target!r}")
         return []
     import subprocess as _sp
     try:
@@ -5369,10 +5372,14 @@ def _capture_pane_options_for_label(session_label: str):
             capture_output=True, text=True, timeout=3,
         )
         if r.returncode != 0:
+            _log_la_transition(session_label, [], "capture-failed", f"rc={r.returncode}")
             return []
-        return _detect_pane_prompt_options(r.stdout)
+        opts, reason, evidence = _detect_with_reason(r.stdout)
+        _log_la_transition(session_label, opts, reason, evidence)
+        return opts
     except Exception as exc:
         _log.warning("capture-pane for %s failed: %s", session_label, exc)
+        _log_la_transition(session_label, [], "capture-exception", str(exc)[:120])
         return []
 
 
@@ -5853,6 +5860,34 @@ def _summary_for_window(pane_pid: int) -> str:
         return summary
     except Exception:
         return ""
+
+
+@app.route("/debug-log", methods=["POST"])
+def debug_log():
+    """Append a debug event line to /tmp/terminal_button_debug.log.
+
+    Used by SplitTerminalView (iOS) + Live Activity detectors (server-side)
+    to record every prompt-button APPEAR / DISAPPEAR / CHANGE with the
+    reason. Tim 2026-04-18: "add logging so you can see every time they
+    appear and disappear and why". Fire-and-forget from clients; this
+    endpoint never blocks on I/O.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    # Cap payload size to keep the log bounded.
+    try:
+        line = json.dumps(payload, default=str)[:2000]
+    except (TypeError, ValueError):
+        line = repr(payload)[:2000]
+    try:
+        with open("/tmp/terminal_button_debug.log", "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        _log.warning("debug-log write failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/la-diag", methods=["POST"])

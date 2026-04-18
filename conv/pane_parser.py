@@ -91,16 +91,20 @@ def has_active_selector(raw: str) -> bool:
     return t[0] in ("❯", ">")
 
 
-def detect_pane_prompt_options(pane_text: str):
-    """Mirror of Swift detectPromptOptions. Returns active prompt's options
-    as [{number, label}, ...] or [] if no active prompt."""
+def detect_pane_prompt_options_with_reason(pane_text: str):
+    """Like detect_pane_prompt_options but returns (options, reason, evidence)
+    so callers can log every decision. Tim 2026-04-18: "add logging so you
+    can see every time they appear and disappear and why"."""
     if not pane_text:
-        return []
+        return ([], "empty-pane", "")
     lines = pane_text.split("\n")
     tail = lines[-25:]
-    # Gate: Claude visibly working → any option lines are stale.
-    if any(is_working_indicator(line) for line in tail):
-        return []
+    tail_sample = " | ".join(tail[-6:])[:400]
+
+    for line in tail:
+        if is_working_indicator(line):
+            return ([], "working-indicator", f"matched='{line.strip()[:60]}' tail=[{tail_sample}]")
+
     last_opt_idx = None
     for i in range(len(tail) - 1, -1, -1):
         raw = tail[i]
@@ -108,32 +112,44 @@ def detect_pane_prompt_options(pane_text: str):
             last_opt_idx = i
             break
         if not is_prompt_chrome_line(raw):
-            return []
+            return ([], "substantive-line-below", f"aborted-at='{raw.strip()[:60]}' tail=[{tail_sample}]")
     if last_opt_idx is None:
-        return []
+        return ([], "no-option-lines-in-tail", f"tail=[{tail_sample}]")
+
     start_idx = last_opt_idx
     while start_idx > 0 and parse_prompt_option_line(tail[start_idx - 1]) is not None:
         start_idx -= 1
+
     collected = []
     any_active = False
+    active_line = ""
     for i in range(start_idx, last_opt_idx + 1):
         parsed = parse_prompt_option_line(tail[i])
         if parsed is None:
-            return []
+            return ([], "unparseable-option-in-block", f"failed='{tail[i].strip()[:60]}'")
         collected.append(parsed)
         if has_active_selector(tail[i]):
             any_active = True
+            active_line = tail[i]
+
     if len(collected) < 2:
-        return []
+        return ([], f"too-few-options-{len(collected)}", "")
     for idx, (num, _) in enumerate(collected):
         if num != idx + 1:
-            return []
-    # Second stale-detection gate: if none of the option lines carry the
-    # active-selector marker, the prompt was already dismissed and its text
-    # is sitting in scrollback. This catches the failure mode the
-    # is_working_indicator gate misses (the tick between prompt answered
-    # and "Crafting…" appearing). Tim 2026-04-18: "popping up and then
-    # going without me pressing anything".
+            return ([], "non-contiguous-numbering",
+                    "collected=" + ", ".join(f"{n}.{l}" for n, l in collected))
     if not any_active:
-        return []
-    return [{"number": n, "label": lbl} for n, lbl in collected]
+        return ([], "no-active-selector",
+                "collected=" + ", ".join(f"{n}.{l}" for n, l in collected)
+                + f" tail=[{tail_sample}]")
+
+    opts = [{"number": n, "label": lbl} for n, lbl in collected]
+    return (opts, "active-prompt",
+            f"selector-on='{active_line.strip()[:60]}' options="
+            + ", ".join(f"{n}.{l}" for n, l in collected))
+
+
+def detect_pane_prompt_options(pane_text: str):
+    """Backward-compat wrapper. Returns just the options list."""
+    opts, _, _ = detect_pane_prompt_options_with_reason(pane_text)
+    return opts
