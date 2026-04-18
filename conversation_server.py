@@ -878,11 +878,27 @@ def health():
         else:
             auth_status = "idle"
 
-    # Thread health
+    # Thread health — only report persistent business-logic threads.
+    # Flask request workers (`process_request_thread`) and one-shot Tasks
+    # (e.g. `_refresh_headline_when_ready`) are ephemeral by design and
+    # created a spurious "1 dead" amber on the iOS Health panel whenever
+    # a snapshot caught one finishing (2026-04-18). Filter to the named
+    # daemon threads that SHOULD be alive for the server's lifetime.
+    _PERSISTENT_THREAD_HINTS = (
+        "_check_printer_state",
+        "_cleanup_thread",
+        "_watch_tmux_worker",
+        "la-arc-refresher",
+        "mobile-session-watcher",
+        "work-cache",
+    )
     thread_health = {}
     for t in threading.enumerate():
-        if t.name and t.name != "MainThread":
-            thread_health[t.name] = "alive" if t.is_alive() else "dead"
+        if not t.name or t.name == "MainThread":
+            continue
+        if not any(hint in t.name for hint in _PERSISTENT_THREAD_HINTS):
+            continue  # transient / request-scoped; excluded from health
+        thread_health[t.name] = "alive" if t.is_alive() else "dead"
 
     # WS reconnects in last 5 minutes
     with _ws_connect_lock:
