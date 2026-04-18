@@ -5344,103 +5344,15 @@ def _attach_prompt_options(content_state: dict, session_label: str) -> None:
         content_state["options"] = []
 
 
-def _is_prompt_chrome_line(raw: str) -> bool:
-    t = raw.strip()
-    if not t:
-        return True
-    if t.startswith("╭") or t.startswith("╰") or t.startswith("─"):
-        return True
-    if t.startswith("│") and t.endswith("│"):
-        inner = t[1:-1].strip()
-        return not inner
-    for hint in ("esc to interrupt", "Press up to edit",
-                 "ctrl+t to hide tasks", "shift+tab to"):
-        if hint in t:
-            return True
-    return t in ("❯", ">")
-
-
-def _is_working_indicator(raw: str) -> bool:
-    """Signals that Claude is actively processing, not awaiting input.
-
-    When any of these are visible in the pane tail, a prompt option block
-    in scrollback is stale and must NOT be resurfaced as live buttons.
-    """
-    t = raw.strip()
-    if not t:
-        return False
-    lower = t.lower()
-    if "esc to interrupt" in lower:
-        return True
-    if "crafting" in lower:
-        return True
-    if "thinking" in lower and ("token" in lower or "thought for" in lower):
-        return True
-    for glyph in ("✢", "✶", "✽", "✳", "⚒", "✻"):
-        if glyph in t and ("token" in lower or "s ·" in lower or "s |" in lower):
-            return True
-    return False
-
-
-def _parse_prompt_option_line(raw: str):
-    t = raw.strip()
-    while t and t[0] in "│❯>•·":
-        t = t[1:].strip()
-    while t and t[-1] == "│":
-        t = t[:-1].strip()
-    if "." not in t:
-        return None
-    dot = t.index(".")
-    try:
-        num = int(t[:dot])
-    except ValueError:
-        return None
-    if not (1 <= num <= 9):
-        return None
-    rest = t[dot + 1:].strip()
-    if not rest:
-        return None
-    if len(rest) > 40:
-        rest = rest[:37] + "…"
-    return (num, rest)
-
-
-def _detect_pane_prompt_options(pane_text: str):
-    """Mirror of the iOS detectPromptOptions. Returns the active prompt's
-    numbered options as [{number, label}, ...] or [] if no active prompt."""
-    if not pane_text:
-        return []
-    lines = pane_text.split("\n")
-    tail = lines[-25:]
-    # Gate: if Claude is visibly working, any option lines in scrollback
-    # are stale. Suppress the buttons. See Swift mirror in SplitTerminalView.
-    if any(_is_working_indicator(line) for line in tail):
-        return []
-    last_opt_idx = None
-    for i in range(len(tail) - 1, -1, -1):
-        raw = tail[i]
-        if _parse_prompt_option_line(raw) is not None:
-            last_opt_idx = i
-            break
-        if not _is_prompt_chrome_line(raw):
-            return []
-    if last_opt_idx is None:
-        return []
-    start_idx = last_opt_idx
-    while start_idx > 0 and _parse_prompt_option_line(tail[start_idx - 1]) is not None:
-        start_idx -= 1
-    collected = []
-    for i in range(start_idx, last_opt_idx + 1):
-        parsed = _parse_prompt_option_line(tail[i])
-        if parsed is None:
-            return []
-        collected.append(parsed)
-    if len(collected) < 2:
-        return []
-    for idx, (num, _) in enumerate(collected):
-        if num != idx + 1:
-            return []
-    return [{"number": n, "label": lbl} for n, lbl in collected]
+# Pane-text parsers extracted 2026-04-18 to conv/pane_parser.py (Phase 3 step 3).
+# Public names preserved so `_capture_pane_options_for_label` below and
+# any test mirror continue to work without change.
+from conv.pane_parser import (  # noqa: E402
+    is_prompt_chrome_line as _is_prompt_chrome_line,
+    is_working_indicator as _is_working_indicator,
+    parse_prompt_option_line as _parse_prompt_option_line,
+    detect_pane_prompt_options as _detect_pane_prompt_options,
+)
 
 
 def _capture_pane_options_for_label(session_label: str):
