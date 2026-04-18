@@ -1736,37 +1736,20 @@ _ws_clients = {}  # {client_id: ws_object}
 _ws_clients_lock = threading.Lock()
 
 # --- APNs Push Notification Support (multi-app) ---
-# Tokens persisted to disk so they survive server restart.
-_APNS_TOKENS_FILE = "/Users/timtrailor/code/apns_state/device_tokens.json"
-_apns_device_tokens_lock = threading.Lock()
-
-def _load_apns_tokens():
-    """Load tokens dict from disk."""
-    try:
-        with open(_APNS_TOKENS_FILE) as _f:
-            return json.loads(_f.read())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+# Extracted 2026-04-18 to conv/apns_tokens.py (Phase 3 step 2).
+# The `store` dict and load/save helpers are imported as their legacy names
+# so callers continue to work without change.
+from conv.apns_tokens import (  # noqa: E402
+    store as _apns_device_tokens,
+    load as _load_apns_tokens,
+    TOKENS_FILE as _APNS_TOKENS_FILE,
+)
+from conv.apns_tokens import _lock as _apns_device_tokens_lock  # noqa: E402
 
 def _save_apns_tokens():
-    """Persist tokens dict to disk."""
-    try:
-        with open(_APNS_TOKENS_FILE, "w") as _f:
-            _f.write(json.dumps(_apns_device_tokens))
-    except Exception as _e:
-        _log.warning("Failed to save APNs tokens: %s", _e)
-
-_apns_device_tokens = _load_apns_tokens()
-
-# Migrate legacy single-token file (from earlier versions)
-try:
-    with open("/Users/timtrailor/code/apns_state/device_token.txt") as _f:
-        _legacy = _f.read().strip()
-        if _legacy and "com.timtrailor.terminal" not in _apns_device_tokens:
-            _apns_device_tokens["com.timtrailor.terminal"] = _legacy
-            _save_apns_tokens()
-except FileNotFoundError:
-    pass
+    """Thin shim — delegates to conv.apns_tokens.save(store)."""
+    from conv.apns_tokens import save
+    save(_apns_device_tokens)
 
 
 # ---- Live Activity (ActivityKit push-to-start + update) support ----
