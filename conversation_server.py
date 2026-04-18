@@ -2470,7 +2470,8 @@ def _liveactivity_on_turn_error(session_label, error_text):
 
 
 def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal",
-                            window_index=None, content_available=False):
+                            window_index=None, content_available=False,
+                            category=None, user_info=None):
     """Send APNs push to a specific app via curl (HTTP/2 + JWT).
 
     bundle_id: which app to push to. Must have a registered device token.
@@ -2502,9 +2503,22 @@ def _send_push_notification(title, body, bundle_id="com.timtrailor.terminal",
                 "alert": {"title": title, "body": body},
                 "sound": "default",
             }
+            # Category drives iOS-side actionable buttons on the lock-screen
+            # banner. The TerminalApp registers "PROPOSAL_ACTIONS" with
+            # Accept/Reject/Discuss; the alert-responder pipeline sets it.
+            if category:
+                aps["category"] = str(category)
         payload_obj = {"aps": aps}
         if window_index is not None:
             payload_obj["window"] = int(window_index)
+        # user_info is merged at the top level of the APNs payload so the
+        # iOS-side notification handlers can read keys like "alert_id" to
+        # dispatch actionable-button taps back to the server.
+        if user_info and isinstance(user_info, dict):
+            for k, v in user_info.items():
+                if k in ("aps", "window"):
+                    continue
+                payload_obj[str(k)] = v
         payload = json.dumps(payload_obj)
 
         url = f"{_APNS_HOST}/3/device/{token}"

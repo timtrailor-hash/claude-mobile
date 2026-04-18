@@ -273,6 +273,8 @@ def proposal_ready(alert_id: str):
             body=one_liner[:200],
             bundle_id="com.timtrailor.terminal",
             window_index=window_index if window_index > 0 else None,
+            category="PROPOSAL_ACTIONS",
+            user_info={"alert_id": alert_id},
         )
         _ar_log(f"proposal-ready: APNs push sent alert_id={alert_id} window={window_index}")
     except Exception as e:
@@ -300,9 +302,11 @@ def _ar_create_proposal_window(alert_id: str, proposal: dict) -> int:
 clear
 cat {rendered_path}
 echo ""
-echo "1. Accept"
-echo "2. Reject"
-echo "3. Discuss"
+echo "╭────────────────────────────╮"
+echo "│ ❯ 1. Accept                │"
+echo "│   2. Reject                │"
+echo "│   3. Discuss               │"
+echo "╰────────────────────────────╯"
 echo ""
 read -n 1 -s choice
 echo ""
@@ -342,58 +346,100 @@ sleep 3
 
 
 def _ar_render_proposal(alert_id: str, proposal: dict) -> str:
+    """Render a proposal into human-readable text for the tmux window.
+    v2 (2026-04-18) — includes `context` block + separate `control_fix`
+    section so Tim can see both the symptom fix and the prevention work."""
+    ctx = proposal.get("context", {})
     rca = proposal.get("rca", {})
     p = proposal.get("proposal", {})
+    cf = proposal.get("control_fix", {})
+
+    def _fenced(label: str, body: str):
+        """Render a labelled code-fence block with a Claude-style border."""
+        out = [label, "┌" + "─" * 70]
+        for line in (body or "(none)").split("\n"):
+            out.append(f"│ {line}")
+        out.append("└" + "─" * 70)
+        return out
+
     lines = [
-        "═══════════════════════════════════════════════════════════",
-        f"  ALERT RESPONDER — {proposal.get('verdict', '?')}",
+        "═══════════════════════════════════════════════════════════════════════",
+        f"  ALERT RESPONDER — verdict: {proposal.get('verdict', '?')}",
         f"  {proposal.get('one_liner', '')}",
-        "═══════════════════════════════════════════════════════════",
+        "═══════════════════════════════════════════════════════════════════════",
         "",
-        f"Alert ID: {alert_id}",
+        f"Alert ID:  {alert_id}",
         f"Signature: {proposal.get('signature', '')[:16]}",
         "",
-        "── 5-LAYER RCA ─────────────────────────────────────────",
-        f"L1 What happened: {rca.get('layer1_what_happened', '')}",
+        "── CONTEXT ────────────────────────────────────────────────────────────",
+        f"What fired:         {ctx.get('what_fired', '(unspecified)')}",
+        f"Live state now:     {ctx.get('live_state_summary', '(unspecified)')}",
+        f"User impact:        {ctx.get('user_impact', '(unspecified)')}",
         "",
-        "L2 Controls that existed:",
+        "Evidence:",
     ]
+    evidence = ctx.get("evidence") or []
+    if evidence:
+        for e in evidence:
+            lines.append(f"   • {e}")
+    else:
+        lines.append("   (none captured — responder left this empty)")
+    lines.extend([
+        "",
+        "── 5-LAYER RCA ────────────────────────────────────────────────────────",
+        "",
+        "L1 — What happened:",
+        f"   {rca.get('layer1_what_happened', '(blank)')}",
+        "",
+        "L2 — Controls that should have caught this:",
+    ])
     for c in rca.get("layer2_controls_that_existed", []):
         lines.append(f"   • {c}")
     lines.append("")
-    lines.append("L3 Why each failed:")
+    lines.append("L3 — Why each control failed:")
     for f_entry in rca.get("layer3_why_each_failed", []):
         lines.append(f"   • {f_entry.get('control', '?')}")
         lines.append(f"     → {f_entry.get('why_failed', '?')}")
     lines.extend([
         "",
-        f"L4 Fix classification ({rca.get('layer4_fix_classification', {}).get('type', '?')}):",
+        f"L4 — Fix classification ({rca.get('layer4_fix_classification', {}).get('type', '?')}):",
         f"   {rca.get('layer4_fix_classification', {}).get('explanation', '')}",
         "",
-        f"L5 Control class: {rca.get('layer5_control_class', '?')}",
-        f"Matches lesson: {rca.get('matches_existing_lesson') or 'none'}",
+        f"L5 — Control class:  {rca.get('layer5_control_class', '?')}",
+        f"Matches lesson:      {rca.get('matches_existing_lesson') or 'none'}",
+        f"Recurs:              {rca.get('recurs', False)}",
         "",
-        "── PROPOSAL ────────────────────────────────────────────",
-        f"Type: {p.get('type', '?')}",
-        f"Description: {p.get('description', '')}",
-        f"Blast radius: {p.get('blast_radius', '')}",
-        f"Manual-only: {p.get('requires_manual_apply', True)}"
+        "── SYMPTOM FIX (clears this alert) ────────────────────────────────────",
+        f"Type:          {p.get('type', '?')}",
+        f"Description:   {p.get('description', '')}",
+        f"Blast radius:  {p.get('blast_radius', '')}",
+        f"Manual-only:   {p.get('requires_manual_apply', True)}"
         + (f"  (deny: {p['deny_rule_matched']})" if p.get("deny_rule_matched") else ""),
         "",
-        "Command/diff:",
     ])
-    lines.append("┌────")
-    for cmdline in (p.get("command_or_diff", "") or "(none)").split("\n"):
-        lines.append(f"│ {cmdline}")
-    lines.append("└────")
+    lines.extend(_fenced("Command/diff:", p.get("command_or_diff", "")))
     lines.extend([
         "",
         f"Rollback: {p.get('rollback', '(none)')}",
         "",
+        "── CONTROL FIX (prevents recurrence) ──────────────────────────────────",
+        f"Type:          {cf.get('type', '?')}",
+        f"Description:   {cf.get('description', '(responder did not propose a control fix)')}",
+        f"Where it lives: {cf.get('where_it_lives', '(n/a)')}",
+        f"Manual-only:   {cf.get('requires_manual_apply', True)}",
+        "",
     ])
+    if cf.get("type") != "none_possible":
+        lines.extend(_fenced("Control fix diff/command:", cf.get("command_or_diff", "")))
+        lines.extend([
+            "",
+            f"Rollback: {cf.get('rollback', '(none)')}",
+            "",
+        ])
     if proposal.get("verdict") == "ESCALATE":
-        lines.extend(["── ESCALATION REASON ───────────────────────────────────",
+        lines.extend(["── ESCALATION REASON ──────────────────────────────────────────────────",
                       proposal.get("escalation_reason", ""), ""])
+    lines.append("Tap 1 (Accept) / 2 (Reject) / 3 (Discuss) below — or answer in-place.")
     return "\n".join(lines)
 
 
@@ -480,30 +526,78 @@ def _ar_apply_action(alert_id: str, action: str, source: str):
             pass
         return jsonify({"ok": True, "action": "already_resolved"})
 
-    # Apply the command (only truly allowlisted commands will reach here in Phase 2)
+    # Apply the symptom fix (only truly allowlisted commands reach here in Phase 2)
     rc, out, err = _ar_run_allowlisted(cmd)
     applied = rc == 0
-    _ar_log(f"action: ACCEPT applied alert_id={alert_id} rc={rc}")
+    _ar_log(f"action: ACCEPT symptom-fix alert_id={alert_id} rc={rc}")
+
+    # Apply the control_fix in the same ACCEPT action when safe. The control
+    # fix closes the gap that let this alert reach Tim — applying the symptom
+    # without the control fix guarantees the next occurrence.
+    cf = proposal.get("control_fix", {}) or {}
+    cf_cmd = cf.get("command_or_diff", "") or ""
+    cf_rc = None
+    cf_out = cf_err = ""
+    cf_type = cf.get("type", "none_possible")
+    cf_manual = cf.get("requires_manual_apply", True)
+    if cf_cmd and not cf_manual and cf_type != "none_possible":
+        cf_deny = _ar_policy_deny_match(cf_cmd)
+        if cf_deny:
+            _ar_log(f"action: ACCEPT control_fix refused — deny match {cf_deny}")
+            cf_rc, cf_err = -1, f"deny_always matched: {cf_deny}"
+        else:
+            cf_rc, cf_out, cf_err = _ar_run_allowlisted(cf_cmd)
+            _ar_log(f"action: ACCEPT control_fix rc={cf_rc}")
+    else:
+        _ar_log(f"action: ACCEPT control_fix skipped (type={cf_type} manual={cf_manual})")
+
     try:
         with _AR_APPLIED_LOG.open("a") as f:
             f.write(_ar_json.dumps({
-                "alert_id": alert_id, "rc": rc, "stdout": out[-500:], "stderr": err[-500:],
+                "alert_id": alert_id,
+                "symptom": {"rc": rc, "stdout": out[-500:], "stderr": err[-500:]},
+                "control_fix": {
+                    "applied": cf_rc is not None,
+                    "rc": cf_rc,
+                    "stdout": cf_out[-500:] if cf_out else "",
+                    "stderr": cf_err[-500:] if cf_err else "",
+                    "skipped_reason": None if cf_rc is not None else (
+                        "manual" if cf_manual else ("none_possible" if cf_type == "none_possible" else "no_command")
+                    ),
+                },
                 "when": _ar_time.time(),
             }) + "\n")
     except OSError:
         pass
-    _ar_mark_state(signature, "ACCEPTED" if applied else "APPLY_FAILED",
-                   action_by=source, rc=rc)
+
+    overall_ok = applied and (cf_rc is None or cf_rc == 0)
+    _ar_mark_state(
+        signature,
+        "ACCEPTED" if overall_ok else "APPLY_FAILED",
+        action_by=source, rc=rc, cf_rc=cf_rc,
+    )
     try:
         from conversation_server import _send_push_notification
+        if overall_ok:
+            summary = f"Symptom fix OK. Control fix: "
+            summary += "applied" if cf_rc == 0 else ("skipped" if cf_rc is None else f"FAILED rc={cf_rc}")
+            title = "[Responder] Applied"
+        else:
+            title = "[Responder] Apply FAILED"
+            summary = (err or out or cf_err or cf_out or "(no output)")[:180]
         _send_push_notification(
-            title=f"[Responder] {'Applied' if applied else 'Apply FAILED'}",
-            body=(out or err or "(no output)")[:200],
+            title=title,
+            body=summary[:200],
             bundle_id="com.timtrailor.terminal",
         )
     except Exception:
         pass
-    return jsonify({"ok": applied, "rc": rc, "stdout": out[-500:], "stderr": err[-500:]})
+    return jsonify({
+        "ok": overall_ok,
+        "symptom": {"rc": rc, "stdout": out[-500:], "stderr": err[-500:]},
+        "control_fix": {"rc": cf_rc, "stdout": cf_out[-500:] if cf_out else "",
+                        "stderr": cf_err[-500:] if cf_err else ""},
+    })
 
 
 def _ar_alert_still_firing(signature: str, proposal: dict) -> bool:
