@@ -7,7 +7,7 @@ registered from conversation_server.py.
 
 Flow (see memory/topics/auto-alert-responder.md for the full spec):
   health_check.py / monitor → POST /internal/alert-fired
-    → spawn alert_responder.py, start 120s watchdog
+    → spawn alert_responder.py, start 5 min interim / 16 min escalate watchdog
     → responder investigates (5-layer RCA) → writes /tmp/proposals/<id>.json
     → responder POSTs /internal/proposal-ready/<id>
     → server creates tmux window with numbered Accept/Reject/Discuss options
@@ -44,8 +44,8 @@ _AR_PROPOSALS_DIR = _ar_Path("/tmp/proposals")
 _AR_ALERTS_DIR = _ar_Path("/tmp/alerts")
 _AR_STATE_PATH = _ar_Path("/tmp/alert_responder_state.json")
 _AR_LOG_PATH = _ar_Path("/tmp/alert_responder_server.log")
-_AR_WATCHDOG_INITIAL = 120   # seconds before interim "still investigating" push
-_AR_WATCHDOG_ESCALATE = 180  # additional seconds before ESCALATE push
+_AR_WATCHDOG_INITIAL = 300   # 5 min — interim "still investigating" heartbeat
+_AR_WATCHDOG_ESCALATE = 660  # +11 min — ESCALATE (total 16 min, 1 min buffer past alert_responder.py's 900s Claude timeout)
 _AR_APPLIED_LOG = _ar_Path("/tmp/alert_responder_applied.log")
 
 _AR_PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -113,7 +113,7 @@ def _ar_verify_token(alert_id: str, action: str, token: str) -> bool:
 
 # ── Watchdog: interim + escalate pushes if responder silent ───────────────
 def _ar_watchdog_interim(alert_id: str) -> None:
-    """Fires 120s after alert if no proposal file yet — sends 'still investigating'
+    """Fires 5 min after alert if no proposal file yet — sends 'still investigating'
     push so Tim sees something. Schedules the escalate check."""
     with _ar_watchdog_lock:
         _ar_watchdog_timers.pop(alert_id, None)
@@ -139,7 +139,7 @@ def _ar_watchdog_interim(alert_id: str) -> None:
 
 
 def _ar_watchdog_escalate(alert_id: str) -> None:
-    """Fires 300s after alert if still no proposal — responder is hung/crashed."""
+    """Fires 16 min after alert if still no proposal — responder is hung/crashed."""
     with _ar_watchdog_lock:
         _ar_watchdog_timers.pop(alert_id, None)
     proposal_path = _AR_PROPOSALS_DIR / f"{alert_id}.json"
@@ -223,7 +223,7 @@ def alert_fired():
         _ar_log(f"alert-fired: FAILED to spawn responder: {e}")
         return jsonify({"ok": False, "error": f"spawn failed: {e}"}), 500
 
-    # Watchdog timer — 120s to interim, +180s to escalate
+    # Watchdog timer — 5 min to interim, +11 min to escalate (total 16 min)
     t = _ar_threading.Timer(_AR_WATCHDOG_INITIAL, _ar_watchdog_interim, args=[alert_id])
     t.daemon = True
     with _ar_watchdog_lock:
