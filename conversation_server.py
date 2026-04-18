@@ -7204,6 +7204,18 @@ def _signal_handler(signum, frame):
     sys.exit(0)
 
 
+# Wire alert_responder blueprint handlers to the real impls. Must happen
+# AFTER _send_push_notification and _ensure_tmux_session are defined, and
+# BEFORE the first request. Done here at module-end so all functions are
+# in scope.
+from conv.alert_responder import set_server_deps as _ar_set_server_deps  # noqa: E402
+_ar_set_server_deps(
+    send_push_notification=_send_push_notification,
+    ensure_tmux_session=_ensure_tmux_session,
+    logger=_log,
+)
+
+
 if __name__ == "__main__":
     # Register signal handlers for diagnostics
     signal.signal(signal.SIGTERM, _signal_handler)
