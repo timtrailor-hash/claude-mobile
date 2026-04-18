@@ -25,18 +25,27 @@ jobs:
             LOCAL_BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
           fi
           REMOTE_BASELINE=0
-          if [ -n "$GH_TOKEN" ]; then
-            REMOTE_BASELINE=$(curl -s -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3.raw" \
-              "https://api.github.com/repos/timtrailor-hash/tim-claude-controlplane/contents/.conv_server_baseline" \
-              | tr -d '[:space:]')
-            # Guard against curl returning HTML error pages
-            if ! [[ "$REMOTE_BASELINE" =~ ^[0-9]+$ ]]; then
-              echo "NOTE: controlplane fetch returned non-numeric; ignoring."
-              REMOTE_BASELINE=0
+          # Try anonymous raw fetch first (controlplane repo is public).
+          # This works without any secret and survives token rotations.
+          REMOTE_BASELINE=$(curl -s --max-time 10 \
+            "https://raw.githubusercontent.com/timtrailor-hash/tim-claude-controlplane/main/.conv_server_baseline" \
+            | tr -d '[:space:]')
+          if ! [[ "$REMOTE_BASELINE" =~ ^[0-9]+$ ]]; then
+            echo "NOTE: anonymous raw fetch failed — trying token auth as fallback."
+            REMOTE_BASELINE=0
+            if [ -n "$GH_TOKEN" ]; then
+              REMOTE_BASELINE=$(curl -s --max-time 10 \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                "https://api.github.com/repos/timtrailor-hash/tim-claude-controlplane/contents/.conv_server_baseline" \
+                | tr -d '[:space:]')
+              if ! [[ "$REMOTE_BASELINE" =~ ^[0-9]+$ ]]; then
+                echo "NOTE: token fetch also non-numeric; falling back to embedded."
+                REMOTE_BASELINE=0
+              fi
+            else
+              echo "NOTE: CONTROLPLANE_READ_TOKEN not set; embedded baseline only."
             fi
-          else
-            echo "NOTE: CONTROLPLANE_READ_TOKEN not set; using embedded baseline only."
           fi
           BASELINE=$LOCAL_BASELINE
           if [ "$REMOTE_BASELINE" -gt "$BASELINE" ]; then BASELINE=$REMOTE_BASELINE; fi
