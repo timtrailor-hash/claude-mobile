@@ -5360,6 +5360,28 @@ def _is_prompt_chrome_line(raw: str) -> bool:
     return t in ("❯", ">")
 
 
+def _is_working_indicator(raw: str) -> bool:
+    """Signals that Claude is actively processing, not awaiting input.
+
+    When any of these are visible in the pane tail, a prompt option block
+    in scrollback is stale and must NOT be resurfaced as live buttons.
+    """
+    t = raw.strip()
+    if not t:
+        return False
+    lower = t.lower()
+    if "esc to interrupt" in lower:
+        return True
+    if "crafting" in lower:
+        return True
+    if "thinking" in lower and ("token" in lower or "thought for" in lower):
+        return True
+    for glyph in ("✢", "✶", "✽", "✳", "⚒", "✻"):
+        if glyph in t and ("token" in lower or "s ·" in lower or "s |" in lower):
+            return True
+    return False
+
+
 def _parse_prompt_option_line(raw: str):
     t = raw.strip()
     while t and t[0] in "│❯>•·":
@@ -5390,6 +5412,10 @@ def _detect_pane_prompt_options(pane_text: str):
         return []
     lines = pane_text.split("\n")
     tail = lines[-25:]
+    # Gate: if Claude is visibly working, any option lines in scrollback
+    # are stale. Suppress the buttons. See Swift mirror in SplitTerminalView.
+    if any(_is_working_indicator(line) for line in tail):
+        return []
     last_opt_idx = None
     for i in range(len(tail) - 1, -1, -1):
         raw = tail[i]
