@@ -39,6 +39,25 @@ from flask import Blueprint, jsonify, request
 
 bp = Blueprint("alert_responder", __name__)
 
+# ── Dependency injection from conversation_server ──────────────────────────
+# These are set by conversation_server at startup via set_server_deps().
+# Avoids `from conversation_server import X` at request-time, which
+# re-executes the script (since it runs as __main__) and re-triggers
+# app.register_blueprint — which Flask rejects after the first request.
+_send_push_notification = None  # type: ignore[assignment]
+_ensure_tmux_session = None  # type: ignore[assignment]
+_server_logger = None  # type: ignore[assignment]
+
+
+def set_server_deps(*, send_push_notification, ensure_tmux_session, logger):
+    """Called by conversation_server at startup, after the relevant
+    functions are defined, to wire the blueprint handlers to real impls."""
+    global _send_push_notification, _ensure_tmux_session, _server_logger
+    _send_push_notification = send_push_notification
+    _ensure_tmux_session = ensure_tmux_session
+    _server_logger = logger
+
+
 _AR_RESPONDER = "/Users/timtrailor/code/alert_responder.py"
 _AR_PROPOSALS_DIR = _ar_Path("/tmp/proposals")
 _AR_ALERTS_DIR = _ar_Path("/tmp/alerts")
@@ -62,11 +81,11 @@ def _ar_log(msg: str) -> None:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
     except OSError:
         pass
-    try:
-        from conversation_server import _log
-        _log.info("[alert-responder] %s", msg)
-    except Exception:
-        pass
+    if _server_logger is not None:
+        try:
+            _server_logger.info("[alert-responder] %s", msg)
+        except Exception:
+            pass
 
 
 def _ar_load_state() -> dict:
@@ -123,7 +142,8 @@ def _ar_watchdog_interim(alert_id: str) -> None:
         return
     _ar_log(f"watchdog-interim: {alert_id} — no proposal yet, sending interim push")
     try:
-        from conversation_server import _send_push_notification
+        if _send_push_notification is None:
+            raise RuntimeError('send_push_notification not injected')
         _send_push_notification(
             title="[Alert] Investigating…",
             body="Responder is still working. Will push again when a proposal is ready.",
@@ -156,7 +176,8 @@ def _ar_watchdog_escalate(alert_id: str) -> None:
     except Exception:
         pass
     try:
-        from conversation_server import _send_push_notification
+        if _send_push_notification is None:
+            raise RuntimeError('send_push_notification not injected')
         _send_push_notification(
             title="[Alert] Responder FAILED — manual review needed",
             body=f"No proposal produced. Original alert: {summary}",
@@ -167,6 +188,44 @@ def _ar_watchdog_escalate(alert_id: str) -> None:
 
 
 # ── /internal/alert-fired ─────────────────────────────────────────────────
+@bp.route("/internal/ci-alert", methods=["POST"])
+def ci_alert():
+    """Terminal APNs push for a persistent CI failure.
+
+    Fired by ~/code/ci_failure_poller.py (LaunchAgent, every 15 min) when
+    a watched GitHub Actions workflow has been red on main for more than
+    1 hour. Replaces the old ntfy-based ratchet-persistence-check.yml
+    workflow — consolidates all mobile alerting through the same APNs
+    pipeline the auto-alert-responder uses, so buttons / categories /
+    Live Activities all come from one place.
+
+    Payload: {repo, workflow, branch, run_url, age_min}
+    """
+    data = request.get_json(silent=True) or {}
+    repo = str(data.get("repo", "?"))
+    workflow = str(data.get("workflow", "?"))
+    branch = str(data.get("branch", "main"))
+    run_url = str(data.get("run_url", ""))
+    age_min = int(data.get("age_min", 0))
+
+    title = f"CI red: {repo} / {workflow}"
+    body = f"Failing on {branch} for {age_min}m. Tap to open the run on GitHub."
+    try:
+        if _send_push_notification is None:
+            raise RuntimeError('send_push_notification not injected')
+        _send_push_notification(
+            title=title,
+            body=body[:200],
+            bundle_id="com.timtrailor.terminal",
+            user_info={"ci_run_url": run_url, "kind": "ci-failure"},
+        )
+        _ar_log(f"ci-alert: pushed {repo}/{workflow} age={age_min}m")
+        return jsonify({"ok": True})
+    except Exception as e:
+        _ar_log(f"ci-alert: push failed {repo}/{workflow}: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @bp.route("/internal/alert-fired", methods=["POST"])
 def alert_fired():
     """Called by health_check.py and mac_mini_health_monitor.sh when a persistent
@@ -267,7 +326,8 @@ def proposal_ready(alert_id: str):
 
     title_verb = {"PROPOSAL": "Proposal ready", "ESCALATE": "Escalation"}.get(verdict, "Alert")
     try:
-        from conversation_server import _send_push_notification
+        if _send_push_notification is None:
+            raise RuntimeError('send_push_notification not injected')
         _send_push_notification(
             title=f"[Responder] {title_verb}",
             body=one_liner[:200],
@@ -289,7 +349,8 @@ def _ar_create_proposal_window(alert_id: str, proposal: dict) -> int:
     Accept/Reject/Discuss prompt. Returns the window index (1-based) or 0 on
     failure. The existing PromptOptionButtons infrastructure in TerminalApp
     renders lock-screen buttons for '1. Accept / 2. Reject / 3. Discuss' text."""
-    from conversation_server import _ensure_tmux_session
+    if _ensure_tmux_session is None:
+        raise RuntimeError('ensure_tmux_session not injected')
     _ensure_tmux_session()
     rendered = _ar_render_proposal(alert_id, proposal)
     rendered_path = _ar_Path(f"/tmp/proposals/{alert_id}_rendered.txt")
@@ -516,7 +577,8 @@ def _ar_apply_action(alert_id: str, action: str, source: str):
         _ar_mark_state(signature, "RESOLVED_NO_ACTION", action_by=source)
         _ar_log(f"action: ACCEPT — alert self-healed, no action alert_id={alert_id}")
         try:
-            from conversation_server import _send_push_notification
+            if _send_push_notification is None:
+                raise RuntimeError('send_push_notification not injected')
             _send_push_notification(
                 title="[Responder] Already resolved",
                 body="Alert cleared before fix was applied. No action taken.",
@@ -577,7 +639,8 @@ def _ar_apply_action(alert_id: str, action: str, source: str):
         action_by=source, rc=rc, cf_rc=cf_rc,
     )
     try:
-        from conversation_server import _send_push_notification
+        if _send_push_notification is None:
+            raise RuntimeError('send_push_notification not injected')
         if overall_ok:
             summary = f"Symptom fix OK. Control fix: "
             summary += "applied" if cf_rc == 0 else ("skipped" if cf_rc is None else f"FAILED rc={cf_rc}")
@@ -652,7 +715,8 @@ def _ar_run_allowlisted(command: str):
 def _ar_spawn_discuss_window(alert_id: str, proposal: dict) -> int:
     """Open a fresh tmux window with a Claude session pre-loaded with the
     proposal context so Tim can discuss it."""
-    from conversation_server import _ensure_tmux_session
+    if _ensure_tmux_session is None:
+        raise RuntimeError('ensure_tmux_session not injected')
     _ensure_tmux_session()
     context_path = _ar_Path(f"/tmp/proposals/{alert_id}_discuss_context.md")
     context = [
