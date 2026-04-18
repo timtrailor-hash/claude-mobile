@@ -2283,6 +2283,27 @@ def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
         return
     # No live activity yet — try push-to-start using ONLY the most recent
     # start token so we don't spawn duplicate activities on every turn.
+    #
+    # 2026-04-18 fix: also guard against iOS never registering the
+    # activity-token back after our event=start (e.g. app backgrounded /
+    # phone locked). Without this guard, every subsequent turn_start
+    # would see active_tokens=0 and fire another event=start, creating
+    # orphan LAs on iOS that pile up indefinitely because the server
+    # has no activity-token to push an event=end to.
+    #
+    # Track last_start_push_at on the turn_state entry. Suppress event=start
+    # if we sent one for this label within the last 30 min — matches the
+    # la-reaper threshold so orphans either get reclaimed or the entry
+    # ages out naturally.
+    with _liveactivity_turn_state_lock:
+        ts = _liveactivity_turn_state.setdefault(session_label, {})
+        last_start = ts.get("last_start_push_at", 0) or 0
+    if last_start and (time.time() - last_start) < 30 * 60:
+        _log.info("LiveActivity turn_start: suppressing event=start for "
+                  "session=%s (last start %ds ago; iOS never registered "
+                  "activity-token — probably backgrounded)",
+                  session_label, int(time.time() - last_start))
+        return
     with _liveactivity_lock:
         tokens = list(_liveactivity_start_tokens)
     if tokens:
@@ -2295,6 +2316,9 @@ def _liveactivity_on_turn_start(session_label="mobile", headline="Working…"):
                 stale_date=started_at + 15 * 60,
                 alert_title="Claude", alert_body=headline,
             )
+            with _liveactivity_turn_state_lock:
+                ts = _liveactivity_turn_state.setdefault(session_label, {})
+                ts["last_start_push_at"] = time.time()
         except Exception as exc:
             _log.error("LiveActivity start error: %s", exc, exc_info=True)
 
