@@ -49,7 +49,13 @@ def is_working_indicator(raw: str) -> bool:
 
 
 def parse_prompt_option_line(raw: str):
-    """Parse a single `N. label` prompt-option line. Returns (num, label) or None."""
+    """Parse a single `N. label` prompt-option line. Returns (num, label) or None.
+
+    Note: the caller should separately check `has_active_selector(raw)` if
+    it needs to know whether THIS option was the highlighted one. Claude
+    Code puts `❯` on exactly one option when the prompt is awaiting input
+    and leaves all options bare when the prompt has been dismissed. This
+    function strips those markers before parsing."""
     t = raw.strip()
     while t and t[0] in "│❯>•·":
         t = t[1:].strip()
@@ -70,6 +76,19 @@ def parse_prompt_option_line(raw: str):
     if len(rest) > 40:
         rest = rest[:37] + "…"
     return (num, rest)
+
+
+def has_active_selector(raw: str) -> bool:
+    """True iff the line starts (after optional box-drawing) with `❯` or `>`.
+    Claude Code uses this marker on the currently-highlighted option while
+    a prompt awaits input; dismissed prompts show every option bare."""
+    t = raw.strip()
+    # Strip one box-draw border char if present.
+    if t.startswith("│"):
+        t = t[1:].strip()
+    if not t:
+        return False
+    return t[0] in ("❯", ">")
 
 
 def detect_pane_prompt_options(pane_text: str):
@@ -96,14 +115,25 @@ def detect_pane_prompt_options(pane_text: str):
     while start_idx > 0 and parse_prompt_option_line(tail[start_idx - 1]) is not None:
         start_idx -= 1
     collected = []
+    any_active = False
     for i in range(start_idx, last_opt_idx + 1):
         parsed = parse_prompt_option_line(tail[i])
         if parsed is None:
             return []
         collected.append(parsed)
+        if has_active_selector(tail[i]):
+            any_active = True
     if len(collected) < 2:
         return []
     for idx, (num, _) in enumerate(collected):
         if num != idx + 1:
             return []
+    # Second stale-detection gate: if none of the option lines carry the
+    # active-selector marker, the prompt was already dismissed and its text
+    # is sitting in scrollback. This catches the failure mode the
+    # is_working_indicator gate misses (the tick between prompt answered
+    # and "Crafting…" appearing). Tim 2026-04-18: "popping up and then
+    # going without me pressing anything".
+    if not any_active:
+        return []
     return [{"number": n, "label": lbl} for n, lbl in collected]
