@@ -5416,6 +5416,14 @@ def _capture_pane_options_for_label(session_label: str):
             return []
         opts, reason, evidence = _detect_with_reason(r.stdout)
         _log_la_transition(session_label, opts, reason, evidence)
+        # URL watcher hook — detect new URLs in pane output and push
+        # a tappable notification. Disabled via CLAUDE_URL_PUSH=0 by
+        # default so this ships dormant until verified on device.
+        try:
+            from conv.url_watcher import process_pane as _url_process
+            _url_process(session_label, r.stdout)
+        except Exception as url_exc:
+            _log.debug("url_watcher hook skipped: %s", url_exc)
         return opts
     except Exception as exc:
         _log.warning("capture-pane for %s failed: %s", session_label, exc)
