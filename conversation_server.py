@@ -6769,10 +6769,14 @@ def system_health():
     else:
         items.append({"name": "Printer Daemon", "timestamp": None, "detail": "no status file"})
 
-    # 4. School docs backup status
+    # 4. School docs freshness — Tim's design: raw files live on the
+    # Desktop as a working copy, but the canonical store + DR recovery
+    # path is GovernorHub. We therefore do NOT back up the 1.2 GB of
+    # raw PDFs to Drive. The health signal is "governorhub-sync ran
+    # recently" (weekly on Monday 06:00), not "raw files backed up".
+    # Dashboard threshold: 8 days (matches services.yaml failure_mode).
     school_docs = Path.home() / "Desktop" / "school docs"
     if school_docs.exists():
-        # Use subprocess to count files (avoids TCC issues with rglob in launchd)
         try:
             import subprocess
             out = subprocess.check_output(
@@ -6782,27 +6786,22 @@ def system_health():
             doc_count = len(out.strip().split("\n")) if out.strip() else 0
         except Exception:
             doc_count = 0
-        # Check backup manifest for school docs — use groups_verified timestamp
-        manifest = _find(".backup_manifest.json")
-        school_in_backup = False
-        verified_ts = None
-        if manifest.exists():
-            try:
-                with open(manifest) as mf:
-                    mdata = json.load(mf)
-                school_files = {k: v for k, v in mdata.get("files", {}).items() if "school" in k.lower()}
-                school_in_backup = bool(school_files)
-                # Use groups_verified (set every backup run) instead of per-file backed_up_at
-                verified_ts = mdata.get("groups_verified", {}).get("school_docs")
-                if not verified_ts and school_files:
-                    verified_ts = max(v.get("backed_up_at", "") for v in school_files.values())
-            except Exception:
-                pass
-        detail = f"{doc_count} files, {'backed up' if school_in_backup else 'NOT backed up'}"
-        if verified_ts:
-            ts = verified_ts
+        # Primary signal: governorhub-sync log mtime (daemon touches it on
+        # every run, successful or not). Fallback: encrypted context file.
+        sync_log = Path.home() / "code" / "governorhub_sync.log"
+        enc_ctx = Path.home() / "code" / "ofsted-agent" / "combined_context.md.enc"
+        ts_source = None
+        if sync_log.exists():
+            ts_source = sync_log
+        elif enc_ctx.exists():
+            ts_source = enc_ctx
+        if ts_source is not None:
+            ts = datetime.fromtimestamp(ts_source.stat().st_mtime).isoformat()
+            detail = (f"{doc_count} files, weekly GovernorHub refresh "
+                      f"(DR: GovernorHub; no Drive backup by design)")
         else:
             ts = datetime.fromtimestamp(school_docs.stat().st_mtime).isoformat()
+            detail = f"{doc_count} files, sync log missing"
         items.append({
             "name": "School Docs",
             "timestamp": ts,
