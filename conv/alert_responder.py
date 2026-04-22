@@ -407,101 +407,75 @@ sleep 3
 
 
 def _ar_render_proposal(alert_id: str, proposal: dict) -> str:
-    """Render a proposal into human-readable text for the tmux window.
-    v2 (2026-04-18) — includes `context` block + separate `control_fix`
-    section so Tim can see both the symptom fix and the prevention work."""
-    ctx = proposal.get("context", {})
-    rca = proposal.get("rca", {})
-    p = proposal.get("proposal", {})
-    cf = proposal.get("control_fix", {})
+    """Render a proposal into a SHORT, plain-English card for Tim.
 
-    def _fenced(label: str, body: str):
-        """Render a labelled code-fence block with a Claude-style border."""
-        out = [label, "┌" + "─" * 70]
-        for line in (body or "(none)").split("\n"):
-            out.append(f"│ {line}")
-        out.append("└" + "─" * 70)
-        return out
+    v3 (2026-04-21) — replaces the old 5-layer RCA dump. Tim is non-technical;
+    the card now shows only the plain_summary block (what broke / impact /
+    proposed fix / risks) plus the action prompt. Full technical detail
+    (context, rca, proposal.command_or_diff, control_fix) stays in the JSON
+    file at /tmp/proposals/<alert_id>.json and in auto-rca-inbox.md for the
+    audit trail. If Tim wants the engineer view he can `cat` the JSON or
+    type `more` (handled by the buttons.sh runner).
+    """
+    ps = proposal.get("plain_summary") or _ar_derive_plain_summary(proposal)
+    verdict = proposal.get("verdict", "?")
 
     lines = [
         "═══════════════════════════════════════════════════════════════════════",
-        f"  ALERT RESPONDER — verdict: {proposal.get('verdict', '?')}",
-        f"  {proposal.get('one_liner', '')}",
+        f"  {verdict}",
         "═══════════════════════════════════════════════════════════════════════",
         "",
-        f"Alert ID:  {alert_id}",
-        f"Signature: {proposal.get('signature', '')[:16]}",
+        "WHAT BROKE",
+        f"  {ps.get('what_broke', '(not provided)')}",
         "",
-        "── CONTEXT ────────────────────────────────────────────────────────────",
-        f"What fired:         {ctx.get('what_fired', '(unspecified)')}",
-        f"Live state now:     {ctx.get('live_state_summary', '(unspecified)')}",
-        f"User impact:        {ctx.get('user_impact', '(unspecified)')}",
+        "WHAT YOU'LL NOTICE",
+        f"  {ps.get('what_youll_notice', '(not provided)')}",
         "",
-        "Evidence:",
     ]
-    evidence = ctx.get("evidence") or []
-    if evidence:
-        for e in evidence:
-            lines.append(f"   • {e}")
-    else:
-        lines.append("   (none captured — responder left this empty)")
-    lines.extend([
-        "",
-        "── 5-LAYER RCA ────────────────────────────────────────────────────────",
-        "",
-        "L1 — What happened:",
-        f"   {rca.get('layer1_what_happened', '(blank)')}",
-        "",
-        "L2 — Controls that should have caught this:",
-    ])
-    for c in rca.get("layer2_controls_that_existed", []):
-        lines.append(f"   • {c}")
-    lines.append("")
-    lines.append("L3 — Why each control failed:")
-    for f_entry in rca.get("layer3_why_each_failed", []):
-        lines.append(f"   • {f_entry.get('control', '?')}")
-        lines.append(f"     → {f_entry.get('why_failed', '?')}")
-    lines.extend([
-        "",
-        f"L4 — Fix classification ({rca.get('layer4_fix_classification', {}).get('type', '?')}):",
-        f"   {rca.get('layer4_fix_classification', {}).get('explanation', '')}",
-        "",
-        f"L5 — Control class:  {rca.get('layer5_control_class', '?')}",
-        f"Matches lesson:      {rca.get('matches_existing_lesson') or 'none'}",
-        f"Recurs:              {rca.get('recurs', False)}",
-        "",
-        "── SYMPTOM FIX (clears this alert) ────────────────────────────────────",
-        f"Type:          {p.get('type', '?')}",
-        f"Description:   {p.get('description', '')}",
-        f"Blast radius:  {p.get('blast_radius', '')}",
-        f"Manual-only:   {p.get('requires_manual_apply', True)}"
-        + (f"  (deny: {p['deny_rule_matched']})" if p.get("deny_rule_matched") else ""),
-        "",
-    ])
-    lines.extend(_fenced("Command/diff:", p.get("command_or_diff", "")))
-    lines.extend([
-        "",
-        f"Rollback: {p.get('rollback', '(none)')}",
-        "",
-        "── CONTROL FIX (prevents recurrence) ──────────────────────────────────",
-        f"Type:          {cf.get('type', '?')}",
-        f"Description:   {cf.get('description', '(responder did not propose a control fix)')}",
-        f"Where it lives: {cf.get('where_it_lives', '(n/a)')}",
-        f"Manual-only:   {cf.get('requires_manual_apply', True)}",
-        "",
-    ])
-    if cf.get("type") != "none_possible":
-        lines.extend(_fenced("Control fix diff/command:", cf.get("command_or_diff", "")))
+
+    if verdict == "ESCALATE":
         lines.extend([
-            "",
-            f"Rollback: {cf.get('rollback', '(none)')}",
+            "WHY I'M ESCALATING (not safe to fix automatically)",
+            f"  {proposal.get('escalation_reason', '(not provided)')}",
             "",
         ])
-    if proposal.get("verdict") == "ESCALATE":
-        lines.extend(["── ESCALATION REASON ──────────────────────────────────────────────────",
-                      proposal.get("escalation_reason", ""), ""])
-    lines.append("Tap 1 (Accept) / 2 (Reject) / 3 (Discuss) below — or answer in-place.")
+    elif verdict == "PROPOSAL":
+        lines.extend([
+            "WHAT I WANT TO DO",
+            f"  {ps.get('what_i_want_to_do', '(not provided)')}",
+            "",
+            "RISK IF YOU SAY YES",
+            f"  {ps.get('risk_if_you_say_yes', '(not provided)')}",
+            "",
+            "RISK IF YOU SAY NO",
+            f"  {ps.get('risk_if_you_say_no', '(not provided)')}",
+            "",
+        ])
+
+    lines.extend([
+        "───────────────────────────────────────────────────────────────────────",
+        f"Reference: {alert_id}  (full technical detail in /tmp/proposals/{alert_id}.json)",
+        "",
+    ])
     return "\n".join(lines)
+
+
+def _ar_derive_plain_summary(proposal: dict) -> dict:
+    """Backwards-compat shim for proposals produced before plain_summary was
+    added to the schema. Pulls the closest-equivalent fields out of the v2
+    structure so older proposals still render without crashing. The text
+    will still sound technical — only newly-generated proposals get true
+    plain English from Claude."""
+    ctx = proposal.get("context", {}) or {}
+    p = proposal.get("proposal", {}) or {}
+    one_liner = proposal.get("one_liner", "")
+    return {
+        "what_broke": ctx.get("what_fired") or one_liner or "(no summary available)",
+        "what_youll_notice": ctx.get("user_impact") or "(no impact statement)",
+        "what_i_want_to_do": p.get("description") or "(no proposal)",
+        "risk_if_you_say_yes": p.get("blast_radius") or "(not stated)",
+        "risk_if_you_say_no": "Alert is likely to keep firing until the underlying cause is fixed.",
+    }
 
 
 # ── /internal/proposal-action/<alert_id>/<action> ─────────────────────────

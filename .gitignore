@@ -16,3 +16,7 @@ conversation_server.py.bak
 google_auth_phone.py
 google_auth_refresh.py
 _quarantine_*/
+
+# Token backup files from rescope operations (contain live OAuth secrets)
+*.pre-rescope
+google_token.json.pre-rescope
