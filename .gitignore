@@ -1,11 +1,15 @@
 uploads/
 google_credentials.json
-google_token.json
-google_token.json.bak
-google_token_work.json
+# Google auth token files — match any suffix variant (.bak, .pre-rescope,
+# .pre-scopeN, .old, dated suffixes, etc). A past Claude helper wrote a
+# .pre-rescope backup on 2026-04-21 that the specific-name rules below
+# would not have caught; broaden to catch any future suffix.
+google_token*
+google_credentials*
 imap_accounts.json
 slack_config.json
 credentials.py
+credentials.py.*
 wrapper.log
 .work_state.json
 __pycache__/
@@ -16,7 +20,3 @@ conversation_server.py.bak
 google_auth_phone.py
 google_auth_refresh.py
 _quarantine_*/
-
-# Token backup files from rescope operations (contain live OAuth secrets)
-*.pre-rescope
-google_token.json.pre-rescope
