@@ -181,3 +181,104 @@ def reset(session_label: Optional[str] = None) -> None:
             _states.clear()
         else:
             _states.pop(session_label, None)
+
+
+# ── Window-keyed JSONL-based prompt tracker ──────────────────────────────────
+#
+# Separate lightweight tracker for the iOS Terminal app's HTTP-polling
+# path (/tmux-windows). Unlike observe()/current_prompt() above (which
+# consume pane text), this one is driven by the JSONL-based pendingApproval
+# signal in conversation_server._detect_pending_approval. Key = tmux
+# window index (int).
+
+import threading as _threading
+import time as _time
+
+_window_prompt_ids: dict[int, dict] = {}
+_window_prompt_lock = _threading.Lock()
+
+
+def bump_window_prompt_id(window_idx: int, pending: bool) -> tuple[int, bool]:
+    """Bump the id on a false→true pendingApproval transition.
+    Returns (current_id, transitioned). Caller decides how to use the id
+    (e.g. attach to the /tmux-windows response for the iOS approval bar)."""
+    with _window_prompt_lock:
+        entry = _window_prompt_ids.get(window_idx)
+        if entry is None:
+            entry = {"id": 0, "opened_at": 0.0, "pending": False}
+            _window_prompt_ids[window_idx] = entry
+        transitioned = pending and not entry["pending"]
+        if transitioned:
+            entry["id"] += 1
+            entry["opened_at"] = _time.time()
+        entry["pending"] = pending
+        return entry["id"], transitioned
+
+
+def current_window_prompt_id(window_idx: int) -> int:
+    """The id of the currently-open prompt for this window, or 0 if
+    no prompt is active. Used as the stale-guard key on /tmux-send-key."""
+    with _window_prompt_lock:
+        entry = _window_prompt_ids.get(window_idx)
+        if not entry or not entry["pending"]:
+            return 0
+        return int(entry["id"])
+
+
+def replay_active_prompts(send_fn) -> int:
+    """For each session with a live pane-text prompt, call send_fn with
+    a ws-ready dict. Returns the number of replays sent. Used on
+    WebSocket connect so a reconnecting client can resurrect its bar
+    without waiting for the next pane-capture tick."""
+    sent = 0
+    with _state_lock:
+        labels = [lbl for lbl, st in _states.items() if st.last_options]
+    for session_label in labels:
+        active = current_prompt(session_label)
+        if active is None:
+            continue
+        try:
+            send_fn({
+                "type": "prompt_state",
+                "event": active["type"],
+                "session_label": active["session_label"],
+                "prompt_id": active["prompt_id"],
+                "options": active["options"],
+                "timestamp": active["timestamp"],
+            })
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+def validate_tap(window_idx: int, key: str, client_prompt_id) -> tuple[bool, dict]:
+    """Stale-guard for /tmux-send-key. Caller passes the raw request
+    fields; returns (ok, response_dict). When ok is False the response
+    dict carries the error payload ready for jsonify+409 return.
+    Single-digit keys validate against current_window_prompt_id; other
+    keystrokes pass through unchecked. Callers without a promptId
+    opt out of the guard entirely (legacy behaviour preserved)."""
+    if client_prompt_id is None:
+        return True, {}
+    if not (len(key) == 1 and key.isdigit()):
+        return True, {}
+    current_id = current_window_prompt_id(window_idx)
+    if current_id == 0:
+        return False, {
+            "ok": False,
+            "error": "no pending prompt for this window",
+            "reason": "stale",
+        }
+    try:
+        client_id = int(client_prompt_id)
+    except (TypeError, ValueError):
+        return False, {"ok": False, "error": "promptId must be int"}
+    if client_id != current_id:
+        return False, {
+            "ok": False,
+            "error": f"stale prompt: client={client_id} current={current_id}",
+            "reason": "stale",
+            "currentPromptId": current_id,
+        }
+    return True, {}

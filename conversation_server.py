@@ -2701,6 +2701,13 @@ def websocket_handler(ws):
                 except Exception:
                     pass
 
+    # Replay active prompt_state so reconnecting clients see their bar.
+    try:
+        from conv.prompt_state import replay_active_prompts as _ps_replay
+        _ps_replay(lambda d: ws.send(json.dumps(d)))
+    except Exception as _ps_exc:
+        _log.debug("prompt_state replay skipped: %s", _ps_exc)
+
     # Track what we've sent so the sender thread knows where the file cursor is
     sender_state = {
         "session_id": None,
@@ -5424,6 +5431,23 @@ def _capture_pane_options_for_label(session_label: str):
             _url_process(session_label, r.stdout)
         except Exception as url_exc:
             _log.debug("url_watcher hook skipped: %s", url_exc)
+        # Prompt-state hook — emit structured opened/closed events so
+        # the iOS approval bar can track live vs dismissed prompts
+        # without parsing pane text. Events broadcast via WebSocket
+        # in the {"type": "prompt_state", "event": "prompt_opened" | "prompt_closed"} shape.
+        try:
+            from conv.prompt_state import observe as _ps_observe
+            for ev in _ps_observe(session_label, r.stdout):
+                _broadcast_ws({
+                    "type": "prompt_state",
+                    "event": ev.type,
+                    "session_label": ev.session_label,
+                    "prompt_id": ev.prompt_id,
+                    "options": ev.options,
+                    "timestamp": ev.timestamp,
+                })
+        except Exception as ps_exc:
+            _log.debug("prompt_state hook skipped: %s", ps_exc)
         return opts
     except Exception as exc:
         _log.warning("capture-pane for %s failed: %s", session_label, exc)
@@ -6012,6 +6036,14 @@ def la_state_debug():
         return jsonify({"error": str(e)}), 500
 
 
+# Prompt-freshness tracker for the iOS approval bar (module-level state
+# lives in conv.prompt_state to keep conversation_server.py lean).
+from conv.prompt_state import (  # noqa: E402
+    bump_window_prompt_id as _bump_prompt_id_if_new,
+    current_window_prompt_id as _current_prompt_id_for_window,
+)
+
+
 @app.route("/tmux-windows")
 def tmux_windows():
     """List tmux windows for the tab bar in the Terminal iOS app."""
@@ -6056,8 +6088,12 @@ def tmux_windows():
                     except Exception:
                         pass
                 approval = _detect_pending_approval(jsonl_path) if jsonl_path else {"pending": False}
+                window_idx = int(parts[0])
+                prompt_id, _ = _bump_prompt_id_if_new(
+                    window_idx, approval.get("pending", False)
+                )
                 windows.append({
-                    "index": int(parts[0]),
+                    "index": window_idx,
                     "name": parts[1],
                     "active": parts[2] == "1",
                     "command": parts[3] if len(parts) > 3 else "",
@@ -6067,6 +6103,7 @@ def tmux_windows():
                     "elapsed": elapsed,
                     "pendingApproval": approval.get("pending", False),
                     "pendingToolName": approval.get("tool_name", ""),
+                    "promptId": prompt_id if approval.get("pending", False) else 0,
                 })
         return jsonify({"windows": windows})
     except Exception as e:
@@ -6295,14 +6332,31 @@ def tmux_send_key():
     uses paste-buffer) and /tmux-send-enter (which adds Home+End+Enter),
     this sends a bare key via `tmux send-keys` — exactly what Claude Code's
     single-keystroke prompt handlers (permission prompts + session feedback
-    survey) expect. No paste wrapping, no Enter."""
+    survey) expect. No paste wrapping, no Enter.
+
+    Stale-guard (2026-04-22): if the request carries a `promptId` the
+    server only forwards the key when that id matches the window's
+    currently-active prompt. This prevents the "digit-lands-in-text-buffer"
+    pollution Tim hit when a stale approval button was tapped after the
+    prompt had already been answered or dismissed. Clients that don't
+    send promptId get the legacy behaviour (no guard)."""
     import subprocess as _sp
     data = request.get_json() or {}
-    window = data.get("window", 1)
+    try:
+        window = int(data.get("window", 1))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "window must be int"}), 400
     key = str(data.get("key", ""))
     session = data.get("session", "mobile")
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
+
+    # Stale-guard for single-digit approval taps. See conv.prompt_state.
+    from conv.prompt_state import validate_tap as _validate_tap
+    ok, errpayload = _validate_tap(window, key, data.get("promptId"))
+    if not ok:
+        return jsonify(errpayload), 409 if errpayload.get("reason") == "stale" else 400
+
     target = f"{session}:{window}"
     try:
         _sp.run(
