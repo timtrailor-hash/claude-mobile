@@ -5457,9 +5457,8 @@ def _capture_pane_options_for_label(session_label: str):
 
 @app.route("/internal/prompt-choice", methods=["POST"])
 def prompt_choice():
-    """Receive a numbered-choice tap from the Live Activity's
-    PromptChoiceIntent and forward it to the right tmux pane. No
-    localhost restriction — widget runs on the phone via Tailscale."""
+    """Live Activity tap → tmux pane. Stale-guard via prompt_state when
+    the client supplies promptId (legacy clients get legacy behaviour)."""
     try:
         data = request.get_json(silent=True) or {}
     except Exception:
@@ -5477,8 +5476,12 @@ def prompt_choice():
     target = _tmux_target_for_label(session_label)
     if ":" not in target:
         return jsonify({"ok": False, "error": "non-mobile label"}), 400
-    _log.info("[prompt-choice] label=%s target=%s number=%s",
-              session_label, target, number)
+    from conv.prompt_state import validate_tap_for_label as _vtl
+    ok, err = _vtl(session_label, number, data.get("promptId"))
+    if not ok:
+        return jsonify(err), 409 if err.get("reason") == "stale" else 400
+    _log.info("[prompt-choice] label=%s target=%s number=%s pid=%s",
+              session_label, target, number, data.get("promptId"))
     import subprocess as _sp
     try:
         _sp.run(

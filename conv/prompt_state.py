@@ -282,3 +282,21 @@ def validate_tap(window_idx: int, key: str, client_prompt_id) -> tuple[bool, dic
             "currentPromptId": current_id,
         }
     return True, {}
+
+
+def validate_tap_for_label(session_label: str, number: int, client_prompt_id) -> tuple[bool, dict]:
+    """Stale-guard for /internal/prompt-choice.
+
+    The Live Activity path uses session_label (e.g. "mobile-3") rather
+    than raw window index. Translate, then delegate to validate_tap.
+    Guard is opt-in: legacy clients that don't send promptId still work.
+    """
+    if client_prompt_id is None:
+        return True, {}
+    # session_label shape: "mobile-<N>" — extract N
+    if not session_label.startswith("mobile-"):
+        return True, {}  # non-mobile labels skip the guard
+    suffix = session_label[len("mobile-"):]
+    if not suffix.isdigit():
+        return True, {}
+    return validate_tap(int(suffix), str(number), client_prompt_id)
