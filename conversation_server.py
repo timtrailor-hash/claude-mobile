@@ -76,6 +76,15 @@ from conv.push import (  # noqa: E402, F401
     _summarise_for_push,
 )
 
+# slice 1h: task_status / heartbeat endpoint extracted.
+from conv.task_status import (  # noqa: E402, F401
+    bp as _task_status_bp,
+    _task_status,
+    _task_status_lock,
+    _update_task_status,
+)
+app.register_blueprint(_task_status_bp)
+
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
 # Key: request_id, Value: threading.Event + response dict
@@ -998,50 +1007,6 @@ def printer_alert_endpoint():
     _log.warning("External printer alert: %s", msg)
     return jsonify({"ok": True})
 
-
-# ── Task status / heartbeat endpoint ──────────────────────────────────
-_task_status = {
-    "description": None,      # Current task description
-    "started_at": None,       # ISO timestamp when task started
-    "last_activity": None,    # ISO timestamp of last event
-    "alive": False,           # Is Claude subprocess running?
-    "progress_pct": None,     # Optional 0-100 percent
-    "event_count": 0,         # Total events emitted
-}
-_task_status_lock = threading.Lock()
-
-
-def _update_task_status(**kwargs):
-    """Update task status fields. Call this when Claude emits events."""
-    with _task_status_lock:
-        _task_status["last_activity"] = datetime.now().isoformat()
-        _task_status["alive"] = True
-        for k, v in kwargs.items():
-            if k in _task_status:
-                _task_status[k] = v
-
-
-@app.route("/task-status")
-def task_status_endpoint():
-    """Heartbeat endpoint — shows current task progress for iOS status indicator."""
-    with _task_status_lock:
-        status = dict(_task_status)
-    # Calculate elapsed time
-    if status.get("started_at"):
-        try:
-            started = datetime.fromisoformat(status["started_at"])
-            elapsed = (datetime.now() - started).total_seconds()
-            status["elapsed_seconds"] = int(elapsed)
-        except Exception:
-            pass
-    # Check if subprocess is actually still running
-    with _lock:
-        proc = _session.get("proc")
-        if proc is not None:
-            status["alive"] = proc.poll() is None
-        else:
-            status["alive"] = False
-    return jsonify(status)
 
 # ── WebSocket endpoint ──────────────────────────────────────────────
 # Provides real-time bidirectional communication for native iOS app.
