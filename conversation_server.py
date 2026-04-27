@@ -72,6 +72,10 @@ app.register_blueprint(_printer_bp)
 app.register_blueprint(_printer_control_bp)
 app.register_blueprint(_printer_status_bp)
 
+# slice 1L: file upload (POST /upload).
+from conv.uploads import bp as _uploads_bp  # noqa: E402, F401
+app.register_blueprint(_uploads_bp)
+
 # slice 1g: push notifications (APNs HTTP/2 + JWT) extracted.
 from conv.push import (  # noqa: E402, F401
     _send_push_notification,
@@ -2121,35 +2125,6 @@ def websocket_handler(ws):
             _ws_clients.pop(client_id, None)
 
         _log.info("WS client %s disconnected", client_id)
-
-
-# ── File upload (for native app image attachments) ──
-
-@app.route("/upload", methods=["POST"])
-def upload_file():
-    """Accept file upload from native app, return server path."""
-    import tempfile
-    upload_dir = os.path.join(tempfile.gettempdir(), "claude_uploads")
-    os.makedirs(upload_dir, exist_ok=True)
-
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-
-    f = request.files["file"]
-    if not f.filename:
-        return jsonify({"error": "Empty filename"}), 400
-
-    # Save with a unique name to avoid collisions
-    import uuid
-    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".heic", ".heif"}
-    ext = os.path.splitext(f.filename)[1].lower() or ".jpg"
-    if ext not in ALLOWED_EXTENSIONS:
-        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
-    saved_name = f"{uuid.uuid4().hex}{ext}"
-    saved_path = os.path.join(upload_dir, saved_name)
-    f.save(saved_path)
-
-    return jsonify({"path": saved_path, "filename": f.filename})
 
 
 # ── Printer state monitor + notifications ──
