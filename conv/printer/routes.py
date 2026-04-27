@@ -27,6 +27,7 @@ import urllib.request
 from flask import Blueprint, jsonify, request
 
 from conv.app import _log, _printer_registry, is_dry_run
+from conv.websocket import _broadcast_ws
 
 bp = Blueprint("printer", __name__)
 
@@ -216,3 +217,24 @@ def printer_resume_from_layer():
             "auto_started": auto_start,
         }
     )
+
+
+@bp.route("/printer-alert", methods=["POST"])
+def printer_alert_endpoint():
+    """Receive external alerts (e.g. UPS watchdog) and broadcast to iOS app."""
+    data = request.get_json(force=True)
+    msg = data.get("message", "Unknown alert")
+    level = data.get("level", "warning")
+    if is_dry_run("PRINTER"):
+        _log.info("[DRY RUN] printer_alert_endpoint level=%s msg=%s", level, msg[:120])
+        return jsonify({"ok": True, "dry_run": True})
+    _broadcast_ws(
+        {
+            "type": "printer_alert",
+            "printer": "system",
+            "event": f"ups_{level}",
+            "message": msg,
+        }
+    )
+    _log.warning("External printer alert: %s", msg)
+    return jsonify({"ok": True})
