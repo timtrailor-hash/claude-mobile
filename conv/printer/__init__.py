@@ -17,6 +17,7 @@ NOT in this slice (deferred):
 from .bambu import _send_bambu_mqtt  # noqa: F401
 from .moonraker import _send_moonraker_gcode  # noqa: F401
 from .routes import bp  # noqa: F401
+from .control import bp as bp_control  # noqa: F401
 from .safety import (  # noqa: F401
     _ALWAYS_ALLOWED,
     _DANGEROUS_WHILE_PRINTING,
