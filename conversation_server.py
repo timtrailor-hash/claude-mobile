@@ -5647,8 +5647,10 @@ def claude_hook():
                          transcript[:200])
 
     # Only the mobile tmux session is wired to the Live Activity flow for now.
-    if tmux_session and tmux_session != "mobile":
-        return jsonify({"ok": True, "ignored": f"non-mobile session {tmux_session}"})
+    # Empty-string tmux_session means the hook ran outside tmux — also ignore,
+    # otherwise it falls through to the LA path with a default "mobile" label.
+    if not tmux_session or tmux_session != "mobile":
+        return jsonify({"ok": True, "ignored": f"non-mobile session {tmux_session!r}"})
 
     # Build the per-tab LA label. Falls back to the tmux-session-wide
     # "mobile" label if we don't know the window index (shouldn't happen
