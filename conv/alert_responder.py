@@ -357,9 +357,12 @@ def _ar_create_proposal_window(alert_id: str, proposal: dict) -> int:
     rendered_path.write_text(rendered)
 
     runner_path = _ar_Path(f"/tmp/proposals/{alert_id}_buttons.sh")
+    resp_file = f"/tmp/proposals/{alert_id}_response.json"
     runner_path.write_text(f"""#!/bin/bash
 # Proposal action runner for alert_id={alert_id}. Displays the rendered
-# proposal, reads a single key, POSTs to /internal/proposal-action.
+# proposal, reads a single key, POSTs /internal/proposal-action, then
+# stays open until Tim closes the tab — he needs to see whether the
+# action actually landed.
 clear
 cat {rendered_path}
 echo ""
@@ -369,20 +372,57 @@ echo "│   2. Reject                │"
 echo "│   3. Discuss               │"
 echo "╰────────────────────────────╯"
 echo ""
-read -n 1 -s choice
+while true; do
+  read -n 1 -s choice
+  case "$choice" in
+    1) ACTION=accept; break ;;
+    2) ACTION=reject; break ;;
+    3) ACTION=discuss; break ;;
+    *) echo ""; echo "Press 1, 2, or 3." ;;
+  esac
+done
 echo ""
-case "$choice" in
-  1) ACTION=accept ;;
-  2) ACTION=reject ;;
-  3) ACTION=discuss ;;
-  *) echo "Invalid choice — closing."; sleep 1; exit 1 ;;
+echo "You chose: $ACTION — calling responder..."
+echo ""
+RESP_FILE="{resp_file}"
+HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{{http_code}}' \\
+    -X POST "http://127.0.0.1:8081/internal/proposal-action/{alert_id}/$ACTION" \\
+    -H 'Content-Type: application/json' -d '{{"source":"in-app"}}' || echo '000')
+echo "HTTP $HTTP_CODE"
+echo ""
+if [ -s "$RESP_FILE" ]; then
+  python3 -m json.tool < "$RESP_FILE" 2>/dev/null || cat "$RESP_FILE"
+else
+  echo "(no response body — server may be down)"
+fi
+echo ""
+case "$ACTION" in
+  accept)
+    if [ "$HTTP_CODE" = "200" ]; then
+      echo "✓ Accepted. Apply outcome shown above."
+    else
+      echo "✗ Accept refused (HTTP $HTTP_CODE). Reason above."
+      echo "  Likely Phase 1 manual-only — copy command_or_diff from"
+      echo "  /tmp/proposals/{alert_id}.json and run by hand."
+    fi
+    ;;
+  reject)
+    [ "$HTTP_CODE" = "200" ] && echo "✓ Rejected. Alert dismissed." || echo "✗ Reject failed."
+    ;;
+  discuss)
+    if [ "$HTTP_CODE" = "200" ]; then
+      WIN=$(python3 -c "import json,sys; print(json.load(open('$RESP_FILE')).get('window_index',''))" 2>/dev/null)
+      echo "✓ Discussion tab opened (window $WIN). Switch with Ctrl-b $WIN."
+    else
+      echo "✗ Discuss spawn failed."
+    fi
+    ;;
 esac
-echo "You chose: $ACTION"
-curl -sS -X POST "http://127.0.0.1:8081/internal/proposal-action/{alert_id}/$ACTION" \\
-  -H 'Content-Type: application/json' -d '{{"source":"in-app"}}' || true
 echo ""
-echo "Done. Closing window in 3s."
-sleep 3
+echo "───────────────────────────────────────"
+echo "This tab stays open. Close it manually when done."
+echo "(Press Ctrl-D or type 'exit' to close.)"
+exec bash
 """)
     runner_path.chmod(0o755)
 
