@@ -25,6 +25,8 @@ from conv.app import (  # noqa: F401
     WORK_DIR, SESSIONS_DIR, _TMP_LOG_DIR, MCP_CONFIG,
     env_for_claude_cli, _printer_registry, AUTH_TOKEN,
     check_auth,  # re-exported for backward compat with existing tests
+    # slice 1b: staging support
+    is_dry_run, boot_banner, assert_staging_safe, CONV_PORT, CONV_MODE,
 )
 from flask import Response, jsonify, request
 from conv.alert_responder import bp as _alert_responder_bp  # noqa: E402
@@ -428,7 +430,7 @@ def _ensure_subprocess(resume_session_id=None):
         EDIT_AND_WEB_TOOLS = "Read Write Edit Glob Grep WebFetch WebSearch Task"
 
         cmd = [
-            "claude", "-p",
+            os.environ.get("CONV_CLAUDE_BIN", "claude"), "-p",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--model", "claude-opus-4-6",
@@ -1002,6 +1004,9 @@ def _validate_gcode_safety(script, state):
 
 def _send_moonraker_gcode(printer, script):
     """Send a gcode script to Moonraker. Returns (ok, result_or_error)."""
+    if is_dry_run("PRINTER"):
+        _log.info("[DRY RUN] _send_moonraker_gcode printer=%s script=%s", printer.id, script[:80])
+        return True, {"dry_run": True, "printer": printer.id, "script_preview": script[:80]}
     try:
         payload = json.dumps({"script": script}).encode()
         req = urllib.request.Request(
@@ -1020,6 +1025,9 @@ def _send_moonraker_gcode(printer, script):
 
 def _send_bambu_mqtt(printer, payload_dict):
     """Send a command to Bambu printer via MQTT. Returns (ok, error_or_none)."""
+    if is_dry_run("PRINTER"):
+        _log.info("[DRY RUN] _send_bambu_mqtt printer=%s payload=%s", printer.id, str(payload_dict)[:120])
+        return True, None
     import ssl
     try:
         import paho.mqtt.client as mqtt
@@ -1088,6 +1096,9 @@ def printer_alert_endpoint():
     data = request.get_json(force=True)
     msg = data.get("message", "Unknown alert")
     level = data.get("level", "warning")
+    if is_dry_run("PRINTER"):
+        _log.info("[DRY RUN] printer_alert_endpoint level=%s msg=%s", level, msg[:120])
+        return jsonify({"ok": True, "dry_run": True})
     _broadcast_ws({
         "type": "printer_alert",
         "printer": "system",
@@ -1177,6 +1188,9 @@ def printer_resume_from_layer():
     body = request.get_json(silent=True) or {}
     layer = body.get("layer", "auto")
     auto_start = body.get("start", False)
+    if is_dry_run("PRINTER"):
+        _log.info("[DRY RUN] printer_resume_from_layer layer=%s auto_start=%s", layer, auto_start)
+        return jsonify({"ok": True, "dry_run": True, "planned_layer": layer})
 
     # Get filename from body or checkpoint
     filename = body.get("filename", "")
@@ -1506,7 +1520,7 @@ def terminal_auth_complete():
 
 # ── Google Docs export ─────────────────────────────────────────────
 
-GOOGLE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "google_token.json")
+GOOGLE_TOKEN_FILE = os.environ.get("CONV_GOOGLE_TOKEN_PATH") or os.path.join(os.path.dirname(__file__), "google_token.json")
 
 # Import canonical scopes from credentials.py — single source of truth
 # NEVER define scopes locally; NEVER write token back (token_refresh.py owns that)
@@ -1868,6 +1882,12 @@ def _push_liveactivity(token, *, event, content_state,
         raise ValueError(f"invalid event: {event}")
     if event == "start" and attributes is None:
         raise ValueError("attributes required for start event")
+    if is_dry_run("APNS"):
+        _log.info("[DRY RUN] _push_liveactivity event=%s token=%s", event, str(token)[:16])
+        # Return string '200' to match the real-path contract — _push_liveactivity
+        # parses status from curl stdout's last line (always a string). Callers
+        # compare status_code == '200' (e.g. lines 1940, 1950, 2584, 2586).
+        return "200", {"dry_run": True}
 
     import subprocess as _sp
     import time as _time
@@ -3846,6 +3866,8 @@ def _check_obico_for_printer(printer):
 
 def _check_bambu_camera_ai(printer_data):
     """Analyse Bambu camera image with Claude Haiku for failure detection."""
+    if is_dry_run("PRINTER"):
+        return  # staging: no Anthropic API spend, no spurious iOS alerts
     bambu_printers = _printer_registry.list_bambu()
     if not bambu_printers:
         return
@@ -4063,10 +4085,12 @@ def _broadcast_ws(event_dict):
 
 def _check_printer_state():
     """Check for printer state changes and watch triggers. Runs every 30s."""
-    status_file = "/tmp/printer_status/status.json"
+    status_file = os.environ.get("CONV_PRINTER_STATUS_FILE", "/tmp/printer_status/status.json")
     while True:
         try:
             time.sleep(30)
+            if is_dry_run("PRINTER"):
+                continue  # staging: do not broadcast printer state changes to iOS
             if not os.path.exists(status_file):
                 continue
 
@@ -4152,6 +4176,8 @@ def _check_printer_alert_file():
     On first call after server start, we seek to the end of the file so we
     only broadcast alerts that arrive AFTER the server starts — not old ones.
     """
+    if is_dry_run("PRINTER"):
+        return  # staging: do not broadcast printer alerts from prod alert file
     if not os.path.exists(_PRINTER_ALERT_FILE):
         return
 
@@ -7322,6 +7348,12 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGHUP, _signal_handler)
 
+    # plan §5.3 + §11.3: validate staging paths and emit banner BEFORE
+    # any background thread starts. If staging is misconfigured we abort
+    # before printer monitor or watcher threads can touch live state.
+    assert_staging_safe()
+    boot_banner()
+
     _log.info("Conversation server starting (PID %d)", os.getpid())
 
     # Start printer state monitor in background
@@ -7347,4 +7379,4 @@ if __name__ == "__main__":
     _start_mobile_session_watcher()
     _log.info("Mobile session watcher thread started")
 
-    app.run(host="0.0.0.0", port=8081, threaded=True)
+    app.run(host="0.0.0.0", port=CONV_PORT, threaded=True)
