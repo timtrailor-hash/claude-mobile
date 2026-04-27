@@ -85,6 +85,10 @@ from conv.task_status import (  # noqa: E402, F401
 )
 app.register_blueprint(_task_status_bp)
 
+# slice 1i: PWA static files (/app, /manifest.json, /sw.js, /offline, icons).
+from conv.pwa import bp as _pwa_bp  # noqa: E402, F401
+app.register_blueprint(_pwa_bp)
+
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
 # Key: request_id, Value: threading.Event + response dict
@@ -2140,59 +2144,6 @@ def websocket_handler(ws):
             _ws_clients.pop(client_id, None)
 
         _log.info("WS client %s disconnected", client_id)
-
-
-# ── PWA static files ──────────────────────────────────────────────
-STATIC_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "static")
-
-
-@app.route("/app")
-def pwa_app():
-    with open(os.path.join(STATIC_DIR, "app.html")) as f:
-        return Response(f.read(), content_type="text/html")
-
-
-@app.route("/manifest.json")
-def pwa_manifest():
-    with open(os.path.join(STATIC_DIR, "manifest.json")) as f:
-        return Response(f.read(), content_type="application/manifest+json")
-
-
-@app.route("/sw.js")
-def pwa_sw():
-    with open(os.path.join(STATIC_DIR, "sw.js")) as f:
-        return Response(f.read(), content_type="application/javascript")
-
-
-@app.route("/offline")
-def pwa_offline():
-    return Response(
-        "<html><body style='background:#1a1a2e;color:#e0e0e0;text-align:center;"
-        "padding:40px;font-family:-apple-system,sans-serif'>"
-        "<h2>Offline</h2><p>Reconnecting...</p></body></html>",
-        content_type="text/html")
-
-
-@app.route("/icon-192.png")
-def pwa_icon_192():
-    return _generate_icon(192)
-
-
-@app.route("/icon-512.png")
-def pwa_icon_512():
-    return _generate_icon(512)
-
-
-def _generate_icon(size):
-    """Generate a simple SVG-based PNG-substitute icon on the fly."""
-    # Return an SVG with the right content-type — browsers accept this for icons
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">
-  <rect width="{size}" height="{size}" rx="{size//6}" fill="#16213e"/>
-  <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle"
-        font-family="-apple-system,sans-serif" font-size="{size//3}" font-weight="600"
-        fill="#c9a96e">CC</text>
-</svg>'''
-    return Response(svg, content_type="image/svg+xml")
 
 
 # ── File upload (for native app image attachments) ──
