@@ -89,6 +89,18 @@ app.register_blueprint(_task_status_bp)
 from conv.pwa import bp as _pwa_bp  # noqa: E402, F401
 app.register_blueprint(_pwa_bp)
 
+# slice 1j: WebSocket helpers (_ws_clients state, _broadcast_ws, _notify_smart).
+# websocket_handler stays in this module — it owns subprocess lifecycle and
+# state coupling that needs more care than this slice attempts.
+from conv.websocket import (  # noqa: E402, F401
+    _ws_clients,
+    _ws_clients_lock,
+    _broadcast_ws,
+    _notify_smart,
+    _CRITICAL_EVENTS,
+    _CRITICAL_STATE_MESSAGES,
+)
+
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
 # Key: request_id, Value: threading.Event + response dict
@@ -1026,9 +1038,6 @@ def printer_alert_endpoint():
 #     {"type": "ws_error", "content": "..."}     — server-side errors
 #     {"type": "session_started", "session_id": "...", "pid": N}
 
-_ws_clients = {}  # {client_id: ws_object}
-_ws_clients_lock = threading.Lock()
-
 # --- APNs Push Notification Support (multi-app) ---
 # Extracted 2026-04-18 to conv/apns_tokens.py (Phase 3 step 2).
 # The `store` dict and load/save helpers are imported as their legacy names
@@ -1772,24 +1781,6 @@ def _liveactivity_on_turn_error(session_label, error_text):
                       captured_gen, rec.get("generation"))
     if started:
         timer.start()
-
-
-def _notify_smart(title, message):
-    """Smart notification: WebSocket if app is connected, else APNs + email + Slack."""
-    with _ws_clients_lock:
-        has_clients = len(_ws_clients) > 0
-
-    if has_clients:
-        # App is connected — it will show a local notification
-        _broadcast_ws({"type": "push_message", "content": f"{title}: {message}"})
-        _log.info("Smart notify via WebSocket: %s", title)
-    else:
-        # App is offline — use push + email + Slack
-        _log.info("Smart notify via APNs/email/Slack (no WS clients): %s", title)
-        threading.Thread(target=_send_push_notification, args=(title, message, "com.timtrailor.terminal"), daemon=True).start()
-        # threading.Thread(target=_notify_email, args=(title, message), daemon=True).start()  # disabled — push only
-        # threading.Thread(target=_notify_slack, args=(f"{title}: {message}",), daemon=True).start()  # disabled — push only
-
 
 
 
@@ -2572,64 +2563,6 @@ def _notify_email(subject, message):
 
 
 # Events that should trigger multi-channel alerts (Slack + email + push)
-_CRITICAL_EVENTS = {
-    "firmware_error", "state_change",
-    "config_corruption", "ups_warning", "ups_critical",
-}
-# Only certain state changes are critical
-_CRITICAL_STATE_MESSAGES = {"error", "cancelled", "complete", "paused"}
-
-
-def _broadcast_ws(event_dict):
-    """Send event to all connected WebSocket clients.
-
-    Critical alerts (errors, failures, UPS) are also sent via Slack + email.
-    """
-    msg = json.dumps(event_dict)
-    with _ws_clients_lock:
-        dead = []
-        for cid, ws_obj in _ws_clients.items():
-            try:
-                ws_obj.send(msg)
-            except Exception:
-                dead.append(cid)
-        for cid in dead:
-            _ws_clients.pop(cid, None)
-    _log.info("Broadcast: %s", event_dict.get('message', ''))
-
-    # Multi-channel alerting for critical events
-    event_type = event_dict.get("event", "")
-    alert_msg = event_dict.get("message", "")
-    is_critical = event_type in _CRITICAL_EVENTS
-
-    # For state_change events, only alert on critical transitions
-    if event_type == "state_change":
-        new_state = event_dict.get("new_state", "").lower()
-        is_critical = any(kw in new_state for kw in _CRITICAL_STATE_MESSAGES)
-
-    if is_critical and alert_msg:
-        # FIRST CHOICE: push to PrinterPilot and ClaudeControl (native iOS push)
-        push_title = event_dict.get("printer", "Printer")
-        threading.Thread(
-            target=_send_push_notification,
-            args=(push_title, alert_msg, "com.timtrailor.printerpilot"),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_send_push_notification,
-            args=(push_title, alert_msg, "com.timtrailor.claudecontrol"),
-            daemon=True,
-        ).start()
-        # BACKUP: Slack + email so alerts still arrive if push fails
-        threading.Thread(
-            target=_notify_slack, args=(alert_msg,), daemon=True
-        ).start()
-        threading.Thread(
-            target=_notify_email,
-            args=(f"[Printer] {alert_msg[:60]}", alert_msg),
-            daemon=True,
-        ).start()
-
 
 def _check_printer_state():
     """Check for printer state changes and watch triggers. Runs every 30s."""
