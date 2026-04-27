@@ -4,6 +4,7 @@ Slice 1a — the basic harness. More fixtures (mocked APNs, mocked Moonraker,
 fake Claude subprocess, temp Google token) come in slice 1b once the daemon
 gains the dry-run env var support those fixtures depend on.
 """
+
 from __future__ import annotations
 
 import os
@@ -16,14 +17,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def conv_server_path(repo_root: Path) -> Path:
-    return repo_root / 'conversation_server.py'
+    return repo_root / "conversation_server.py"
 
 
 @pytest.fixture

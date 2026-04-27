@@ -16,12 +16,19 @@ module, and reports every Name lookup inside a function or method that:
   - is NOT a Python builtin
   - is NOT defined in any enclosing function scope
 
+Type annotations on parameters and return types are checked too — they are
+evaluated at function definition time in Python < 3.12 unless the file has
+`from __future__ import annotations`. To suppress annotation findings for
+types that need not be imported at runtime, either add the future import or
+use string literals.
+
 Exit code: 0 = clean, 1 = unresolved names, 2 = parse error.
 
 Usage: python3 scripts/find_unqualified_globals.py <dir-or-file>
 
 This is the §4.2 grep gate from the decomposition plan.
 """
+
 from __future__ import annotations
 
 import ast
@@ -31,9 +38,22 @@ from pathlib import Path
 from typing import Iterable
 
 BUILTINS = set(dir(builtins)) | {
-    "__name__", "__file__", "__doc__", "__package__",
-    "__loader__", "__spec__", "__builtins__",
+    "__name__",
+    "__file__",
+    "__doc__",
+    "__package__",
+    "__loader__",
+    "__spec__",
+    "__builtins__",
 }
+
+
+class ParseError(Exception):
+    """Raised by analyze() when the input file cannot be AST-parsed.
+
+    Library function MUST NOT call sys.exit — that kills the test harness
+    silently (Pattern 3). main() catches ParseError and exits properly.
+    """
 
 
 def _extract_target_names(target: ast.AST) -> set[str]:
@@ -123,7 +143,9 @@ def collect_function_locals(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set
                 # Nested function name binds in our scope; do not enter body.
                 yield child
                 continue
-            if isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            if isinstance(
+                child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ):
                 # Comprehensions have their own scope — skip entirely
                 continue
             yield child
@@ -216,10 +238,17 @@ class FunctionScopeAnalyzer(ast.NodeVisitor):
         self._comp_depth -= 1
         self._scope_stack.pop()
 
-    def visit_ListComp(self, node): self._visit_comp(node)
-    def visit_SetComp(self, node): self._visit_comp(node)
-    def visit_DictComp(self, node): self._visit_comp(node)
-    def visit_GeneratorExp(self, node): self._visit_comp(node)
+    def visit_ListComp(self, node):
+        self._visit_comp(node)
+
+    def visit_SetComp(self, node):
+        self._visit_comp(node)
+
+    def visit_DictComp(self, node):
+        self._visit_comp(node)
+
+    def visit_GeneratorExp(self, node):
+        self._visit_comp(node)
 
     def visit_Name(self, node):
         if not isinstance(node.ctx, ast.Load):
@@ -254,8 +283,7 @@ def analyze(path: Path) -> list[tuple[Path, int, str, str]]:
     try:
         tree = ast.parse(src, filename=str(path))
     except SyntaxError as e:
-        print(f"PARSE ERROR in {path}: {e}", file=sys.stderr)
-        sys.exit(2)
+        raise ParseError(f"{path}: {e}") from e
     module_names = collect_module_level_names(tree)
     analyzer = FunctionScopeAnalyzer(module_names, path)
     analyzer.visit(tree)
@@ -277,12 +305,18 @@ def main(argv: list[str]) -> int:
     for f in files:
         if "__pycache__" in f.parts:
             continue
-        all_findings.extend(analyze(f))
+        try:
+            all_findings.extend(analyze(f))
+        except ParseError as e:
+            print(f"PARSE ERROR: {e}", file=sys.stderr)
+            return 2
     if not all_findings:
         print(f"OK: no unqualified globals in {target}")
         return 0
     print(f"FAIL: {len(all_findings)} unqualified global reference(s) in {target}")
-    print("Each must be either (1) explicitly imported from conv.app or slice-local state.py,")
+    print(
+        "Each must be either (1) explicitly imported from conv.app or slice-local state.py,"
+    )
     print("or (2) a stdlib import, or (3) a function-local variable.")
     print()
     for fp, line, func, name in all_findings:

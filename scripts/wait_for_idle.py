@@ -15,6 +15,7 @@ Usage:
 
 This is the §5.4 drain step from the decomposition plan.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,11 +29,25 @@ import urllib.request
 def is_idle(port: int, timeout_s: float = 2.0) -> tuple[bool, str]:
     url = f"http://localhost:{port}/status"
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as r:
+        with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected
+            url, timeout=timeout_s
+        ) as r:
+            # URL is f'http://localhost:{port}/status'; port is argparse type=int.
+            # Local dev tool, no attacker model.
             data = json.loads(r.read())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
         return False, f"unreachable: {e}"
-    alive = bool(data.get("alive"))
+    if not isinstance(data, dict):
+        return False, f"malformed response (not a dict): {type(data).__name__}"
+    if "alive" not in data:
+        # Fail-closed: a daemon that does not report 'alive' is not 'known idle'.
+        # The drain step gates a launchctl kickstart of an in-flight subprocess,
+        # so unknown state must NOT unlock the kickstart.
+        return (
+            False,
+            f"malformed response (missing 'alive'): keys={sorted(data.keys())}",
+        )
+    alive = bool(data["alive"])
     status = str(data.get("status") or "").lower()
     if status == "idle" or alive is False:
         return True, f"idle (status={status} alive={alive})"
