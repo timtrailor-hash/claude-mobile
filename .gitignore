@@ -1,4 +1,4 @@
-uploads/
+/uploads/
 google_credentials.json
 # Google auth token files — match any suffix variant (.bak, .pre-rescope,
 # .pre-scopeN, .old, dated suffixes, etc). A past Claude helper wrote a
