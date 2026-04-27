@@ -20,3 +20,8 @@ conversation_server.py.bak
 google_auth_phone.py
 google_auth_refresh.py
 _quarantine_*/
+
+# Baseline capture (generated, not committed)
+tests/fixtures/iphone_request_baseline_*.log
+tests/fixtures/baseline_capture.pid
+tests/fixtures/baseline_capture_meta.log
