@@ -75,6 +75,7 @@ from conv.push import (  # noqa: E402, F401
     _send_push_notification,
     _summarise_for_push,
 )
+from conv.push.notify import _APNS_HOST  # noqa: E402, F401  # used by _push_liveactivity
 
 # slice 1h: task_status / heartbeat endpoint extracted.
 from conv.task_status import (  # noqa: E402, F401
