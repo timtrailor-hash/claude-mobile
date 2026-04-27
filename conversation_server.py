@@ -59,6 +59,7 @@ app.register_blueprint(_terminal_bp)
 from conv.printer import (  # noqa: E402, F401
     bp as _printer_bp,
     bp_control as _printer_control_bp,
+    bp_status as _printer_status_bp,
     _get_print_state,
     _resolve_printer,
     _send_moonraker_gcode,
@@ -69,6 +70,7 @@ from conv.printer import (  # noqa: E402, F401
 )
 app.register_blueprint(_printer_bp)
 app.register_blueprint(_printer_control_bp)
+app.register_blueprint(_printer_status_bp)
 
 # slice 1g: push notifications (APNs HTTP/2 + JWT) extracted.
 from conv.push import (  # noqa: E402, F401
@@ -1006,23 +1008,6 @@ def health():
     })
 
 
-@app.route("/printer-alert", methods=["POST"])
-def printer_alert_endpoint():
-    """Receive external alerts (e.g. UPS watchdog) and broadcast to iOS app."""
-    data = request.get_json(force=True)
-    msg = data.get("message", "Unknown alert")
-    level = data.get("level", "warning")
-    if is_dry_run("PRINTER"):
-        _log.info("[DRY RUN] printer_alert_endpoint level=%s msg=%s", level, msg[:120])
-        return jsonify({"ok": True, "dry_run": True})
-    _broadcast_ws({
-        "type": "printer_alert",
-        "printer": "system",
-        "event": f"ups_{level}",
-        "message": msg,
-    })
-    _log.warning("External printer alert: %s", msg)
-    return jsonify({"ok": True})
 
 
 # ── WebSocket endpoint ──────────────────────────────────────────────
@@ -2165,177 +2150,6 @@ def upload_file():
     f.save(saved_path)
 
     return jsonify({"path": saved_path, "filename": f.filename})
-
-
-# ── Printer status + images (so native app doesn't need wrapper) ──
-
-@app.route("/printers")
-def list_printers():
-    """List all configured printers from registry."""
-    return jsonify({"printers": _printer_registry.to_dict()})
-
-
-@app.route("/printer-status")
-def printer_status():
-    """Serve cached printer status from daemon output."""
-    status_file = os.path.join(_printer_registry.status_dir, "status.json")
-    try:
-        with open(status_file) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return jsonify({"sv08": {"error": "Daemon not running"},
-                        "a1": {"error": "Daemon not running"}})
-    except Exception as e:
-        return jsonify({"sv08": {"error": str(e)},
-                        "a1": {"error": str(e)}})
-
-    result = {"sv08": {}, "a1": {}}
-
-    # Use registry to iterate printers, build response with legacy keys
-    for printer in _printer_registry.list_enabled():
-        legacy_key = _printer_registry.legacy_key(printer.id)
-        printer_data = data.get("printers", {}).get(legacy_key, {})
-
-        if printer_data.get("online"):
-            pd = dict(printer_data)
-            if printer.is_klipper and "state" in pd:
-                pd["state"] = (pd["state"] or "unknown").capitalize()
-            elif printer.is_bambu:
-                pd.setdefault("layer", pd.pop("layer_num", None))
-                pd.setdefault("total_layers", pd.pop("total_layer_num", None))
-                speed_names = printer.speed_levels
-                sl = pd.get("speed_level")
-                pd["speed"] = speed_names.get(str(sl), "?") if sl else "?"
-            # Use legacy response keys for backward compat
-            resp_key = "sv08" if legacy_key == "sovol" else "a1" if legacy_key == "bambu" else printer.id
-            result[resp_key] = pd
-        else:
-            resp_key = "sv08" if legacy_key == "sovol" else "a1" if legacy_key == "bambu" else printer.id
-            result[resp_key] = {"error": printer_data.get("error", "Offline")}
-
-    result["daemon_timestamp"] = data.get("timestamp", "")
-
-    # Overlay live auto_speed state (daemon cache may be stale between polls)
-    try:
-        auto_speed_file = os.path.join(_printer_registry.status_dir, "auto_speed.json")
-        with open(auto_speed_file) as asf:
-            auto_cfg = json.load(asf)
-        if "sv08" in result and isinstance(result["sv08"], dict) and "error" not in result["sv08"]:
-            result["sv08"]["auto_speed_enabled"] = auto_cfg.get("enabled", False)
-            result["sv08"]["auto_speed_mode"] = auto_cfg.get("mode", "optimal")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
-    return jsonify(result)
-
-
-@app.route("/printer-speed-auto", methods=["POST"])
-def printer_speed_auto():
-    """Toggle auto-speed on/off for the Sovol SV08.
-
-    Accepts JSON: {"enabled": true/false}
-    Writes to /tmp/printer_status/auto_speed.json (same file gcode_profile.py uses).
-    """
-    body = request.get_json(silent=True) or {}
-    enabled = body.get("enabled")
-    if enabled is None:
-        return jsonify({"ok": False, "error": "Missing 'enabled' field"}), 400
-
-    auto_speed_file = "/tmp/printer_status/auto_speed.json"
-    try:
-        with open(auto_speed_file) as f:
-            cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cfg = {"enabled": False, "mode": "optimal", "min_speed_pct": 80,
-               "max_speed_pct": 200, "skip_first_layers": 2}
-
-    cfg["enabled"] = bool(enabled)
-    with open(auto_speed_file, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-    _log.info("printer-speed-auto: set enabled=%s", enabled)
-    return jsonify({"ok": True, "enabled": cfg["enabled"]})
-
-
-@app.route("/printer-speed-set", methods=["POST"])
-def printer_speed_set():
-    """Set manual speed factor on the Sovol SV08 via Moonraker M220 gcode.
-
-    Accepts JSON: {"speed_pct": 150}
-    Sends M220 S<pct> to Moonraker API.
-    """
-    import urllib.request
-    import urllib.parse
-
-    body = request.get_json(silent=True) or {}
-    speed_pct = body.get("speed_pct")
-    if speed_pct is None:
-        return jsonify({"ok": False, "error": "Missing 'speed_pct' field"}), 400
-
-    speed_pct = int(speed_pct)
-    if not (10 <= speed_pct <= 300):
-        return jsonify({"ok": False, "error": "speed_pct must be 10-300"}), 400
-
-    # Get Klipper printer from registry (default to first klipper printer)
-    printer_id = (request.get_json(silent=True) or {}).get("printer_id")
-    try:
-        printer = _printer_registry.get(printer_id) if printer_id else _printer_registry.list_klipper()[0]
-        moonraker = printer.moonraker_url
-    except (KeyError, IndexError):
-        return jsonify({"ok": False, "error": "No klipper printer found"}), 404
-    cmd = f"M220 S{speed_pct}"
-    enc = urllib.parse.quote(cmd)
-    url = f"{moonraker}/printer/gcode/script?script={enc}"
-
-    try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            result = json.loads(r.read())
-        ok = result.get("result") == "ok"
-    except Exception as e:
-        _log.error("printer-speed-set: Moonraker error: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    _log.info("printer-speed-set: M220 S%d -> ok=%s", speed_pct, ok)
-    return jsonify({"ok": ok, "speed_pct": speed_pct})
-
-
-@app.route("/printer-image/<name>")
-def printer_image(name):
-    """Serve camera snapshots and thumbnails."""
-    if name not in _printer_registry.image_whitelist():
-        return "Not found", 404
-    img_dir = _printer_registry.status_dir
-    path = os.path.join(img_dir, name)
-    if not os.path.exists(path):
-        return "Not found", 404
-    import mimetypes
-    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    with open(path, "rb") as f:
-        return Response(f.read(), content_type=mime)
-
-
-@app.route("/file")
-def serve_file():
-    """Serve files that Claude has read (images only, restricted directories)."""
-    import mimetypes
-    fpath = request.args.get("path", "")
-    if not fpath:
-        return "Missing path", 400
-    # Resolve to absolute, block path traversal
-    fpath = os.path.realpath(fpath)
-    # Only allow image files
-    if not any(fpath.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
-        return "Not an image file", 403
-    # Only allow files under known safe directories
-    # Resolve prefixes too — macOS /tmp is a symlink to /private/tmp
-    safe_prefixes = [os.path.realpath("/tmp/") + "/", os.path.realpath(os.path.expanduser("~/Documents/")) + "/"]
-    if not any(fpath.startswith(p) for p in safe_prefixes):
-        return "Access denied", 403
-    if not os.path.exists(fpath):
-        return "Not found", 404
-    mime = mimetypes.guess_type(fpath)[0] or "application/octet-stream"
-    with open(fpath, "rb") as f:
-        return Response(f.read(), content_type=mime)
 
 
 # ── Printer state monitor + notifications ──
