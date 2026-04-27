@@ -9,52 +9,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve baseline (max of embedded + controlplane)
-        env:
-          GH_TOKEN: ${{ secrets.CONTROLPLANE_READ_TOKEN }}
+      - name: Resolve baseline (embedded only — slice 1b plan §11.2)
         run: |
-          # Take the HIGHER of the embedded baseline (lives in this repo's PR)
-          # and the controlplane baseline (authoritative upstream). This stops
-          # cross-repo PR sequencing from false-failing: if a feature PR here
-          # bumps its embedded baseline and the paired controlplane baseline
-          # PR hasn't merged yet, we still pass. We only ever ALLOW MORE —
-          # the lower value continues to gate against real regressions once
-          # the paired PR lands.
-          LOCAL_BASELINE=0
-          if [ -f .conv_server_baseline ]; then
-            LOCAL_BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
-          fi
-          REMOTE_BASELINE=0
-          # Try anonymous raw fetch first (controlplane repo is public).
-          # This works without any secret and survives token rotations.
-          REMOTE_BASELINE=$(curl -s --max-time 10 \
-            "https://raw.githubusercontent.com/timtrailor-hash/tim-claude-controlplane/main/.conv_server_baseline" \
-            | tr -d '[:space:]')
-          if ! [[ "$REMOTE_BASELINE" =~ ^[0-9]+$ ]]; then
-            echo "NOTE: anonymous raw fetch failed — trying token auth as fallback."
-            REMOTE_BASELINE=0
-            if [ -n "$GH_TOKEN" ]; then
-              REMOTE_BASELINE=$(curl -s --max-time 10 \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Accept: application/vnd.github.v3.raw" \
-                "https://api.github.com/repos/timtrailor-hash/tim-claude-controlplane/contents/.conv_server_baseline" \
-                | tr -d '[:space:]')
-              if ! [[ "$REMOTE_BASELINE" =~ ^[0-9]+$ ]]; then
-                echo "NOTE: token fetch also non-numeric; falling back to embedded."
-                REMOTE_BASELINE=0
-              fi
-            else
-              echo "NOTE: CONTROLPLANE_READ_TOKEN not set; embedded baseline only."
-            fi
-          fi
-          BASELINE=$LOCAL_BASELINE
-          if [ "$REMOTE_BASELINE" -gt "$BASELINE" ]; then BASELINE=$REMOTE_BASELINE; fi
-          if [ "$BASELINE" -eq 0 ]; then
-            echo "FAIL: no baseline available (embedded=$LOCAL_BASELINE remote=$REMOTE_BASELINE)"
+          # Embedded baseline is the sole source of truth.
+          # Cross-repo controlplane mirror DROPPED 2026-04-27 after the
+          # 09:55 BST false-fail incident (controlplane baseline lagged
+          # the embedded one by 3 minutes; ratchet flagged the gap).
+          # Plan §11.2 makes the embedded baseline authoritative.
+          if [ ! -f .conv_server_baseline ]; then
+            echo "FAIL: .conv_server_baseline missing"
             exit 1
           fi
-          echo "$BASELINE" > .conv_server_baseline
-          echo "Resolved baseline: $BASELINE (embedded=$LOCAL_BASELINE remote=$REMOTE_BASELINE)"
+          BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
+          if ! [[ "$BASELINE" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: embedded baseline non-numeric: $BASELINE"
+            exit 1
+          fi
+          echo "Resolved baseline: $BASELINE (embedded)"
+
       - name: Enforce ratchet
         run: |
           BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
