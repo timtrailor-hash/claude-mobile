@@ -2375,18 +2375,28 @@ def _check_printer_state():
                 pdata = printers_data.get(legacy_key, {})
                 current_state = (pdata.get("state") or "unknown").lower()
                 old_state = _prev_printer_state.get(printer.id)
+                # Defence-in-depth: advance prev_state BEFORE broadcasting so that
+                # if _broadcast_ws raises, the same transition does not refire on
+                # every 30s poll. Bug 2026-04-28: slice 1j's lazy import re-executed
+                # conversation_server.py and Flask refused register_blueprint.
+                _prev_printer_state[printer.id] = current_state
                 if old_state and old_state != current_state:
                     msg = _describe_state_change(printer.name, old_state, current_state, pdata)
                     if msg:
-                        _broadcast_ws({
-                            "type": "printer_alert",
-                            "printer": printer.id,
-                            "event": "state_change",
-                            "old_state": old_state,
-                            "new_state": current_state,
-                            "message": msg,
-                        })
-                _prev_printer_state[printer.id] = current_state
+                        try:
+                            _broadcast_ws({
+                                "type": "printer_alert",
+                                "printer": printer.id,
+                                "event": "state_change",
+                                "old_state": old_state,
+                                "new_state": current_state,
+                                "message": msg,
+                            })
+                        except Exception as bx:
+                            _log.warning(
+                                "State monitor: _broadcast_ws raised for %s %s->%s: %s",
+                                printer.id, old_state, current_state, bx,
+                            )
 
             # Check custom watches
             with _printer_watches_lock:

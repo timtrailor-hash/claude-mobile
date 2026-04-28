@@ -78,19 +78,42 @@ def _broadcast_ws(event_dict: dict) -> None:
         # BACKUP: Slack + email so alerts still arrive if push fails.
         # Lazy import — _notify_slack/_notify_email still live in conversation_server.py
         # and importing them at module-load time would create a cycle.
-        try:
-            from conversation_server import _notify_email, _notify_slack
+        # Lazy lookup of legacy notify helpers without triggering an import.
+        # The daemon runs as __main__; `from conversation_server import ...` would
+        # re-execute conversation_server.py, re-running its app.register_blueprint
+        # calls. Flask refuses post-first-request, raising AssertionError. The
+        # raised error used to propagate to _check_printer_state, blocking the
+        # _prev_printer_state advance and causing every 30s poll to re-fire the
+        # same state transition. (Bug 2026-04-28.)
+        import sys as _sys
 
-            threading.Thread(
-                target=_notify_slack, args=(alert_msg,), daemon=True
-            ).start()
-            threading.Thread(
-                target=_notify_email,
-                args=(f"[Printer] {alert_msg[:60]}", alert_msg),
-                daemon=True,
-            ).start()
-        except ImportError as exc:
-            _log.warning("_broadcast_ws: critical-alert backup import failed: %s", exc)
+        _ns = _ne = None
+        for _modname in ("__main__", "conversation_server"):
+            _mod = _sys.modules.get(_modname)
+            if _mod is None:
+                continue
+            _candidate_ns = getattr(_mod, "_notify_slack", None)
+            _candidate_ne = getattr(_mod, "_notify_email", None)
+            if callable(_candidate_ns) and callable(_candidate_ne):
+                _ns = _candidate_ns
+                _ne = _candidate_ne
+                break
+        if _ns is not None:
+            try:
+                threading.Thread(target=_ns, args=(alert_msg,), daemon=True).start()
+                threading.Thread(
+                    target=_ne,
+                    args=(f"[Printer] {alert_msg[:60]}", alert_msg),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                _log.warning("_broadcast_ws: critical-alert backup failed: %s", exc)
+        else:
+            _log.warning(
+                "_broadcast_ws: _notify_slack/_notify_email not in sys.modules; "
+                "critical-alert backup channels skipped (msg=%s)",
+                alert_msg[:80],
+            )
 
 
 def _notify_smart(title: str, message: str) -> None:
