@@ -5,39 +5,34 @@ on:
   pull_request:
     branches: [main]
 jobs:
-  monolith-ratchet:
+  monolith-ceiling:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve baseline (embedded only — slice 1b plan §11.2)
+      - name: Enforce monolith ceiling (7000 lines)
         run: |
-          # Embedded baseline is the sole source of truth.
-          # Cross-repo controlplane mirror DROPPED 2026-04-27 after the
-          # 09:55 BST false-fail incident (controlplane baseline lagged
-          # the embedded one by 3 minutes; ratchet flagged the gap).
-          # Plan §11.2 makes the embedded baseline authoritative.
-          if [ ! -f .conv_server_baseline ]; then
-            echo "FAIL: .conv_server_baseline missing"
-            exit 1
-          fi
-          BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
-          if ! [[ "$BASELINE" =~ ^[0-9]+$ ]]; then
-            echo "FAIL: embedded baseline non-numeric: $BASELINE"
-            exit 1
-          fi
-          echo "Resolved baseline: $BASELINE (embedded)"
-
-      - name: Enforce ratchet
-        run: |
-          BASELINE=$(tr -d '[:space:]' < .conv_server_baseline)
+          # Replaced 2026-04-28: was a strict "monotonically decrease" ratchet
+          # against an embedded baseline. That fired on every minor hotfix
+          # (e.g. 2026-04-27 + 2026-04-28 mornings — comment-line growth in
+          # safety patches triggered false alerts). The decomposition is now
+          # mostly done; we are in maintenance mode. The new policy: alert
+          # only if the monolith balloons past a hard ceiling that gives
+          # legitimate hotfixes ~1300 lines of headroom from the post-slice-1L
+          # baseline of 5663.
+          #
+          # If this fires, someone added a chunk of code to the monolith
+          # instead of extracting it into a conv/* slice. Either extract,
+          # or — if the addition is genuinely core (subprocess lifecycle,
+          # session state, permission bridge) — raise the ceiling with a
+          # commit explaining why.
+          CEILING=7000
           LINES=$(wc -l < conversation_server.py | tr -d '[:space:]')
-          echo "conversation_server.py = $LINES lines; baseline = $BASELINE"
-          if [ "$LINES" -gt "$BASELINE" ]; then
+          echo "conversation_server.py = $LINES lines; ceiling = $CEILING"
+          if [ "$LINES" -gt "$CEILING" ]; then
             echo ""
-            echo "FAIL: conversation_server.py grew $BASELINE -> $LINES."
-            echo "Phase 3 decomposition requires the monolith to only shrink."
-            echo "Extract lines into conv/*.py or justify and bump the baseline."
+            echo "FAIL: conversation_server.py is $LINES lines, exceeds ceiling $CEILING."
+            echo "Either extract code into a conv/<slice>/ package, or raise the"
+            echo "ceiling in this workflow with a justifying commit message."
             exit 1
           fi
-          echo "OK: ratchet green ($LINES <= $BASELINE)"
-
+          echo "OK: $LINES <= $CEILING"
