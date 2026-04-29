@@ -63,16 +63,16 @@ def _broadcast_ws(event_dict: dict) -> None:
         is_critical = any(kw in new_state for kw in _CRITICAL_STATE_MESSAGES)
 
     if is_critical and alert_msg:
-        # FIRST CHOICE: push to PrinterPilot and ClaudeControl (native iOS push).
+        # Push to PrinterPilot (the dedicated 3D-printer surface). Previously
+        # this also fanned out to ClaudeControl, producing TWO push notifications
+        # per critical printer event (one state change -> two banners on the
+        # lock screen). 2026-04-29: dropped the ClaudeControl push because Tim
+        # was getting double notifications on every print start/cancel/complete.
+        # ClaudeControl is for general Claude/system control, not printer alerts.
         push_title = event_dict.get("printer", "Printer")
         threading.Thread(
             target=_send_push_notification,
             args=(push_title, alert_msg, "com.timtrailor.printerpilot"),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_send_push_notification,
-            args=(push_title, alert_msg, "com.timtrailor.claudecontrol"),
             daemon=True,
         ).start()
         # BACKUP: Slack + email so alerts still arrive if push fails.
