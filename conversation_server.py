@@ -2130,6 +2130,11 @@ def websocket_handler(ws):
 # ── Printer state monitor + notifications ──
 
 _prev_printer_state = {p.id: None for p in _printer_registry.list_enabled()}
+# Tracks whether the printer was online on the most recent poll. State-change
+# detection is suppressed when either side of the comparison is offline,
+# because the printer's reported state.field is unreliable across a network
+# flap (incident 2026-04-29 20:51). None means 'never seen online'.
+_prev_printer_online = {p.id: None for p in _printer_registry.list_enabled()}
 _ai_check_counter = [0]  # Mutable so nested function can modify
 _last_obico_alert_ts = [None]  # Track last Obico alert to avoid duplicates
 _last_bambu_ai_alert = [0]  # Timestamp of last Bambu AI alert (cooldown)
@@ -2375,11 +2380,19 @@ def _check_printer_state():
                 pdata = printers_data.get(legacy_key, {})
                 current_state = (pdata.get("state") or "unknown").lower()
                 old_state = _prev_printer_state.get(printer.id)
-                # Defence-in-depth: advance prev_state BEFORE broadcasting so that
-                # if _broadcast_ws raises, the same transition does not refire on
-                # every 30s poll. Bug 2026-04-28: slice 1j's lazy import re-executed
-                # conversation_server.py and Flask refused register_blueprint.
+                old_online = _prev_printer_online.get(printer.id)
+                current_online = bool(pdata.get("online"))
+                # Advance both prev flags BEFORE broadcasting (defence-in-depth
+                # against broadcast errors — bug 2026-04-28).
                 _prev_printer_state[printer.id] = current_state
+                _prev_printer_online[printer.id] = current_online
+                # Suppress state-change detection across a connection flap.
+                # status.json briefly flickers cancelled/unknown/etc. when the
+                # printer is offline or just reconnected; the connection-lost
+                # broadcast covers the user-visible signal already.
+                # Incident 2026-04-29 20:51: spurious 'Print cancelled' push.
+                if not (current_online and old_online):
+                    continue
                 if old_state and old_state != current_state:
                     msg = _describe_state_change(printer.name, old_state, current_state, pdata)
                     if msg:
@@ -2498,26 +2511,59 @@ def _check_printer_alert_file():
         _log.warning("Alert file check error: %s", e)
 
 
+# Klipper / Snapmaker print_stats.state values we treat as 'no print active'.
+# Used to validate state-transition messages in _describe_state_change so a
+# spurious mid-flap state read (e.g. unknown -> cancelled) does not trigger a
+# 'Print cancelled' push when no print was actually running.
+_NOT_PRINTING_STATES = ("standby", "ready", "complete", "cancelled", "idle")
+
+
 def _describe_state_change(name, old, new, data):
-    """Generate human-readable notification for state transitions."""
+    """Generate human-readable notification for state transitions.
+
+    Each rule requires BOTH the new state AND the old state to be valid for
+    the transition. Without the old-state check, a mid-flap read like
+    unknown -> cancelled would emit 'Print cancelled' even though no print
+    was running. Real transitions out of an active print always come from
+    'printing' or 'paused'.
+    """
     new_l = new.lower()
     old_l = old.lower()
     filename = data.get("filename", "")
     short_name = filename[:40] + "..." if len(filename) > 40 else filename
 
-    if "print" in new_l and "print" not in old_l:
+    # Print started: NOT-printing -> printing. Reject 'unknown -> printing'
+    # (that's a reconnection artifact, not a real start).
+    if new_l == "printing" and old_l in _NOT_PRINTING_STATES:
         return f"{name}: Print started — {short_name}" if short_name else f"{name}: Print started"
-    if new_l in ("complete", "standby", "ready") and "print" in old_l:
+
+    # Print complete: printing -> {complete, standby, ready}.
+    if new_l in ("complete", "standby", "ready") and old_l == "printing":
         return f"{name}: Print complete!"
-    if "paus" in new_l and "print" in old_l:
+
+    # Print paused: printing -> paused.
+    if new_l == "paused" and old_l == "printing":
         return f"{name}: Print paused"
-    if "print" in new_l and "paus" in old_l:
+
+    # Print resumed: paused -> printing.
+    if new_l == "printing" and old_l == "paused":
         return f"{name}: Print resumed"
-    if "error" in new_l or "fault" in new_l:
-        return f"{name}: Error detected!"
-    if "cancel" in new_l:
+
+    # Print cancelled: only fires from an active print state. Without this
+    # constraint, unknown -> cancelled (a network-flap artifact) emitted a
+    # spurious 'Print cancelled' push (incident 2026-04-29 20:51).
+    if new_l == "cancelled" and old_l in ("printing", "paused"):
         return f"{name}: Print cancelled"
-    # Only notify on meaningful transitions
+
+    # Error: any state -> error/fault. Always notify because errors are
+    # equally interesting regardless of whether a print was active.
+    if ("error" in new_l or "fault" in new_l) and not (
+        "error" in old_l or "fault" in old_l
+    ):
+        return f"{name}: Error detected!"
+
+    # Anything else (e.g. flap-induced unknown <-> cancelled, or transitions
+    # we don't have a notification for) is silent.
     return None
 
 
