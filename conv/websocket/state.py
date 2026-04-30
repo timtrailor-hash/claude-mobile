@@ -15,3 +15,9 @@ import threading
 
 _ws_clients: dict = {}  # {client_id: ws_object}
 _ws_clients_lock = threading.Lock()
+
+
+# Sliding window of recent connection timestamps for thread_health diagnostics.
+# Kept as a list (not deque) because /health prunes it via slice assignment.
+_ws_connect_lock = threading.Lock()
+_ws_connect_times: list = []

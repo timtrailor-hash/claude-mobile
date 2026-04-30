@@ -143,6 +143,9 @@ from conv.live_activity import (  # noqa: E402, F401
     _swift_date,
 )
 
+# slice 1O: WebSocket handler — @sock.route('/ws') registers on import.
+import conv.websocket.handler as _ws_handler  # noqa: E402, F401
+
 # slice 1g: push notifications (APNs HTTP/2 + JWT) extracted.
 from conv.push import (  # noqa: E402, F401
     _send_push_notification,
@@ -174,6 +177,7 @@ from conv.websocket import (  # noqa: E402, F401
     _CRITICAL_EVENTS,
     _CRITICAL_STATE_MESSAGES,
 )
+from conv.websocket.state import _ws_connect_lock, _ws_connect_times  # noqa: E402, F401
 
 # ── Permission bridge ──
 # Pending permission requests from MCP approval server.
@@ -992,8 +996,6 @@ def last_response():
 
 _start_time = time.time()
 # Track WS reconnects (rolling 5-min window)
-_ws_connect_times = []  # timestamps of WS connections
-_ws_connect_lock = threading.Lock()
 # Track last Claude CLI error
 _last_claude_error = {"message": "", "timestamp": None}
 _last_claude_error_lock = threading.Lock()
@@ -1111,358 +1113,6 @@ def _save_apns_tokens():
     from conv.apns_tokens import save
     save(_apns_device_tokens)
 
-
-@sock.route("/ws")
-def websocket_handler(ws):
-    """WebSocket endpoint — real-time bidirectional Claude communication.
-
-    On connect, sends catch-up events for the current session.
-    Then streams new events in real-time as they arrive.
-    Accepts commands (message, resume, cancel, new_session) from the client.
-    """
-    client_id = str(uuid.uuid4())[:8]
-    _log.info("WS client %s connected", client_id)
-
-    with _ws_connect_lock:
-        _ws_connect_times.append(time.time())
-
-    with _ws_clients_lock:
-        _ws_clients[client_id] = ws
-
-    # Check auth for non-localhost WebSocket clients
-    if ws.environ.get('REMOTE_ADDR') not in ('127.0.0.1', '::1'):
-        token_param = request.args.get('token', '')
-        if AUTH_TOKEN and token_param != AUTH_TOKEN:
-            try:
-                ws.send(json.dumps({"type": "ws_error", "content": "Unauthorized \u2014 check auth token in Settings"}))
-                ws.close()
-            except Exception:
-                pass
-            return
-
-    # Send immediate welcome so iOS app knows connection is live
-    try:
-        ws.send(json.dumps({"type": "pong"}))
-    except Exception:
-        pass
-
-    # Re-broadcast any pending permission requests so the new client can respond.
-    # This handles the case where a WebSocket disconnects while a permission prompt
-    # is waiting — without this, the prompt is lost and times out (auto-denied).
-    with _permission_lock:
-        for req_id, req in _permission_requests.items():
-            if req.get("response") is None:  # Still waiting
-                data = req.get("data", {})
-                try:
-                    ws.send(json.dumps({
-                        "type": "permission_request",
-                        "request_id": req_id,
-                        "tool_name": data.get("tool_name", ""),
-                        "input": data.get("input", {}),
-                        "summary": data.get("summary", "Use a tool"),
-                    }))
-                except Exception:
-                    pass
-
-    # Replay active prompt_state so reconnecting clients see their bar.
-    try:
-        from conv.prompt_state import replay_active_prompts as _ps_replay
-        _ps_replay(lambda d: ws.send(json.dumps(d)))
-    except Exception as _ps_exc:
-        _log.debug("prompt_state replay skipped: %s", _ps_exc)
-
-    # Track what we've sent so the sender thread knows where the file cursor is
-    sender_state = {
-        "session_id": None,
-        "events_file": None,
-        "offset": 0,
-        "stop": False,
-    }
-    sender_state_lock = threading.Lock()
-
-    def _ws_send(data):
-        """Send JSON to client, silently ignore if connection is dead."""
-        try:
-            ws.send(json.dumps(data))
-        except Exception:
-            sender_state["stop"] = True
-
-    def _sender_loop():
-        """Background thread: tails events.jsonl, sends to WS client.
-
-        Uses _event_condition to wake up immediately when new events arrive
-        instead of polling with sleep. Falls back to 0.5s timeout to handle
-        edge cases (missed signals, session changes).
-        """
-        while not sender_state["stop"]:
-            with sender_state_lock:
-                sid = sender_state["session_id"]
-                ef = sender_state["events_file"]
-                offset = sender_state["offset"]
-
-            if not sid or not ef or not os.path.exists(ef):
-                # No active session to stream — wait for one
-                with _event_condition:
-                    _event_condition.wait(timeout=1.0)
-                # Check if session has started since we last looked
-                with _lock:
-                    current_sid = _session.get("id")
-                    current_ef = _session.get("events_file")
-                if current_sid and current_ef:
-                    with sender_state_lock:
-                        if sender_state["session_id"] != current_sid:
-                            sender_state["session_id"] = current_sid
-                            sender_state["events_file"] = current_ef
-                            sender_state["offset"] = 0
-                continue
-
-            # Read events from file starting at our offset
-            line_num = 0
-            done = False
-            try:
-                with open(ef, "rb") as f:
-                    raw_buffer = b""
-                    while not sender_state["stop"] and not done:
-                        chunk = f.read(8192)
-                        if chunk:
-                            raw_buffer += chunk
-
-                        while b"\n" in raw_buffer:
-                            line_bytes, raw_buffer = raw_buffer.split(b"\n", 1)
-                            line = line_bytes.decode("utf-8", errors="replace").strip()
-                            if not line:
-                                continue
-
-                            if line_num >= offset:
-                                try:
-                                    ev = json.loads(line)
-                                    ev["offset"] = line_num
-                                    _ws_send(ev)
-                                    if ev.get("type") == "done":
-                                        done = True
-                                        break
-                                except json.JSONDecodeError:
-                                    pass
-                            line_num += 1
-
-                        if done or sender_state["stop"]:
-                            break
-
-                        if not chunk:
-                            # No new data — update our offset and wait
-                            with sender_state_lock:
-                                sender_state["offset"] = line_num
-
-                            # Check if session has changed
-                            with _lock:
-                                current_sid = _session.get("id")
-                                current_ef = _session.get("events_file")
-
-                            if current_sid != sid:
-                                # Session changed — switch to new one
-                                with sender_state_lock:
-                                    sender_state["session_id"] = current_sid
-                                    sender_state["events_file"] = current_ef
-                                    sender_state["offset"] = 0
-                                break
-
-                            # Wait for _append_event to signal new data
-                            with _event_condition:
-                                _event_condition.wait(timeout=0.5)
-
-            except Exception as e:
-                _ws_send({"type": "ws_error", "content": str(e)})
-
-            # Update offset after finishing a file read pass
-            with sender_state_lock:
-                sender_state["offset"] = line_num
-
-            if done:
-                # Session complete — wait for next session to start
-                with _event_condition:
-                    _event_condition.wait(timeout=1.0)
-                # Check for new session
-                with _lock:
-                    current_sid = _session.get("id")
-                    current_ef = _session.get("events_file")
-                with sender_state_lock:
-                    if current_sid != sender_state["session_id"]:
-                        sender_state["session_id"] = current_sid
-                        sender_state["events_file"] = current_ef
-                        sender_state["offset"] = 0
-
-    # NOTE: Protocol-level pings are handled by simple-websocket's _thread
-    # via SOCK_SERVER_OPTIONS ping_interval=25. No custom keepalive needed.
-
-    # Start sender thread
-    sender = threading.Thread(target=_sender_loop, daemon=True)
-    sender.start()
-
-    # Seed sender with current session (catch-up)
-    with _lock:
-        current_sid = _session.get("id")
-        current_ef = _session.get("events_file")
-    if current_sid and current_ef:
-        with sender_state_lock:
-            sender_state["session_id"] = current_sid
-            sender_state["events_file"] = current_ef
-            sender_state["offset"] = 0
-
-    # Receive loop — handle incoming messages from client
-    try:
-        while True:
-            raw = ws.receive(timeout=None)
-            if raw is None:
-                break
-
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                _ws_send({"type": "ws_error", "content": "Invalid JSON"})
-                continue
-
-            msg_type = msg.get("type", "")
-
-            if msg_type == "message":
-                text = msg.get("text", "").strip()
-                if not text:
-                    _ws_send({"type": "ws_error", "content": "Empty message"})
-                    continue
-
-                image_paths = msg.get("image_paths", [])
-                client_sid = msg.get("session_id")
-
-                result, error = _start_session(text, image_paths, client_sid)
-                if error:
-                    _ws_send({"type": "ws_error", "content": error})
-                else:
-                    _ws_send({"type": "session_started",
-                              "session_id": result["session_id"],
-                              "pid": result["pid"]})
-                    # Point sender at the new session
-                    with sender_state_lock:
-                        sender_state["session_id"] = result["session_id"]
-                        sender_state["events_file"] = _events_path(result["session_id"])
-                        sender_state["offset"] = 0
-                    # Wake sender
-                    with _event_condition:
-                        _event_condition.notify_all()
-
-            elif msg_type == "resume":
-                resume_sid = msg.get("session_id", "").strip()
-                if resume_sid:
-                    _log.info("WS resume: killing subprocess and restarting with --resume %s", resume_sid)
-                    if _ensure_subprocess(resume_session_id=resume_sid):
-                        with _lock:
-                            _session["claude_sid"] = resume_sid
-                        _ws_send({"type": "resumed", "session_id": resume_sid})
-                    else:
-                        _ws_send({"type": "ws_error",
-                                  "content": "Failed to restart Claude with --resume"})
-                else:
-                    _ws_send({"type": "ws_error",
-                              "content": "Missing session_id for resume"})
-
-            elif msg_type == "cancel":
-                with _lock:
-                    proc = _session.get("proc")
-                    if proc and proc.poll() is None:
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                        except Exception:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-                        _session["status"] = "completed"
-                        _session["proc"] = None
-                        _session["stdin_pipe"] = None
-                        _ws_send({"type": "cancelled"})
-                    else:
-                        _ws_send({"type": "ws_error",
-                                  "content": "No active process"})
-
-            elif msg_type == "new_session":
-                # Kill persistent subprocess so next message starts fresh
-                _kill_subprocess()
-                with _lock:
-                    _session["claude_sid"] = None
-                _ws_send({"type": "new_session_ok"})
-
-            elif msg_type == "permission_response":
-                # User approved/denied a permission request from their phone
-                req_id = msg.get("request_id", "")
-                allow = msg.get("allow", False)
-                with _permission_lock:
-                    pending = _permission_requests.get(req_id)
-                if pending:
-                    pending["response"] = {
-                        "allow": allow,
-                        "message": msg.get("message", ""),
-                        "updatedInput": msg.get("updatedInput"),
-                    }
-                    pending["event"].set()  # Wake the long-poll
-                    _ws_send({"type": "permission_acknowledged",
-                              "request_id": req_id})
-                else:
-                    # Stale request (already handled or timed out) — not an error
-                    _log.info("Permission %s: stale (already handled/expired), ignoring", req_id)
-                    _ws_send({"type": "permission_acknowledged",
-                              "request_id": req_id,
-                              "stale": True})
-
-            elif msg_type == "set_permission_level":
-                # iOS Settings changed the permission level
-                global _permission_level
-                new_level = msg.get("level", "moderate")
-                if new_level not in ("approve_all", "terminal_only", "terminal_and_web", "most_actions"):
-                    _ws_send({"type": "ws_error",
-                              "content": f"Invalid permission level: {new_level}"})
-                    continue
-
-                old_level = _permission_level
-                _permission_level = new_level
-                _log.info("Permission level changed: %s → %s", old_level, new_level)
-
-                # Kill subprocess so next message spawns with new mode
-                if old_level != new_level:
-                    with _lock:
-                        proc = _session.get("proc")
-                        if proc and proc.poll() is None:
-                            try:
-                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                            except Exception:
-                                try:
-                                    proc.terminate()
-                                except Exception:
-                                    pass
-                        _session["proc"] = None
-                        _session["stdin_pipe"] = None
-                        _session["pid"] = None
-
-                _ws_send({"type": "permission_level_set", "level": new_level})
-
-            elif msg_type == "ping":
-                _ws_send({"type": "pong"})
-
-            else:
-                _ws_send({"type": "ws_error",
-                          "content": f"Unknown message type: {msg_type}"})
-
-    except Exception as e:
-        # Log ALL disconnect reasons for debugging
-        _log.warning("WS client %s exception: %s: %s", client_id, type(e).__name__, e)
-
-    finally:
-        sender_state["stop"] = True
-        # Wake sender so it exits promptly
-        with _event_condition:
-            _event_condition.notify_all()
-
-        with _ws_clients_lock:
-            _ws_clients.pop(client_id, None)
-
-        _log.info("WS client %s disconnected", client_id)
 
 
 # ── Printer state monitor + notifications ──
@@ -4393,6 +4043,31 @@ _ar_set_server_deps(
     send_push_notification=_send_push_notification,
     ensure_tmux_session=_ensure_tmux_session,
     logger=_log,
+)
+
+
+# Wire websocket_handler (slice 1O) to its monolith dependencies.
+# Must happen AFTER _start_session, _ensure_subprocess, _kill_subprocess,
+# _events_path, _permission_lock, _permission_requests are defined.
+from conv.websocket.handler import set_server_deps as _ws_handler_set_deps  # noqa: E402
+def _ws_handler_get_permission_level():
+    return _permission_level
+
+
+def _ws_handler_set_permission_level(value):
+    global _permission_level
+    _permission_level = value
+
+
+_ws_handler_set_deps(
+    start_session=_start_session,
+    ensure_subprocess=_ensure_subprocess,
+    kill_subprocess=_kill_subprocess,
+    events_path=_events_path,
+    permission_lock=_permission_lock,
+    permission_requests=_permission_requests,
+    get_permission_level=_ws_handler_get_permission_level,
+    set_permission_level=_ws_handler_set_permission_level,
 )
 
 
